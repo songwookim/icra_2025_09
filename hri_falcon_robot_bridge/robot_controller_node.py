@@ -14,7 +14,8 @@ except Exception:
 
 # Placeholder imports for the user's controller
 try:
-    from hri_falcon_robot_bridge.dynamixel_control import DynamixelControl  # user-provided module
+    # from hri_falcon_robot_bridge.dynamixel_control import DynamixelControl  # user-provided module
+    from dynamixel_control import DynamixelControl  # user-provided module
 except Exception as e:
     print(f"Failed to import DynamixelControl: {e}")
     DynamixelControl = None
@@ -27,7 +28,7 @@ class RobotControllerNode(Node):
         self.config = self.load_config()
 
         # Parameters with config fallback
-        default_ids = list(self.config.dynamixel.ids) if self.config else [10, 20, 30]
+        default_ids = list(self.config.dynamixel.ids) if self.config else [12, 22, 32]
         default_mode = int(self.config.dynamixel.control_modes.default_mode) if self.config else 3
 
         self.declare_parameter('ids', default_ids)
@@ -157,7 +158,7 @@ class RobotControllerNode(Node):
                 delta = 100.0
             elif delta < -100.0:
                 delta = -100.0
-            target = float(base[i]) + delta
+            target = float(base[i]) - delta
             # Clip to configured limits
             target = max(float(self.clip_min[i]), min(float(self.clip_max[i]), target))
             cmd.append(int(round(target)))
