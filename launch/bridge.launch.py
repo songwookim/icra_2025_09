@@ -19,6 +19,13 @@ def generate_launch_description():
     falcon_init_stable_eps = DeclareLaunchArgument('falcon_init_stable_eps', default_value='5')
     falcon_init_stable_count = DeclareLaunchArgument('falcon_init_stable_count', default_value='0')
 
+    # Declare launch arguments for force_sensor_node parameters
+    force_publish_rate = DeclareLaunchArgument('force_publish_rate_hz', default_value='200.0')
+    force_use_mock = DeclareLaunchArgument('force_use_mock', default_value='true')
+    force_config_path = DeclareLaunchArgument('force_config_path', default_value='config.yaml')
+    force_num_sensors = DeclareLaunchArgument('force_num_sensors', default_value='3')
+    force_use_temp = DeclareLaunchArgument('force_use_temp_controller', default_value='false')
+
     return LaunchDescription([
         falcon_force_scale,
         falcon_publish_rate,
@@ -32,6 +39,11 @@ def generate_launch_description():
         falcon_init_max_loops,
         falcon_init_stable_eps,
         falcon_init_stable_count,
+        force_publish_rate,
+        force_use_mock,
+        force_config_path,
+        force_num_sensors,
+        force_use_temp,
         # Node 1: Force sensor publisher
         Node(
             package='hri_falcon_robot_bridge',
@@ -39,9 +51,11 @@ def generate_launch_description():
             name='force_sensor_node',
             output='screen',
             parameters=[
-                {'publish_rate_hz': 200.0},
-                {'use_mock': True},                 # set False when real controller is available
-                {'config_path': 'config.yaml'},
+                {'publish_rate_hz': LaunchConfiguration('force_publish_rate_hz')},
+                {'use_mock': LaunchConfiguration('force_use_mock')},
+                {'config_path': LaunchConfiguration('force_config_path')},
+                {'num_sensors': LaunchConfiguration('force_num_sensors')},
+                {'use_temp_controller': LaunchConfiguration('force_use_temp_controller')},
             ],
         ),
         # Node 3: Falcon bridge (C++)

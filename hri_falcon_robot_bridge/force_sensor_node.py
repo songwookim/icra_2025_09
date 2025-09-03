@@ -12,15 +12,17 @@ try:
 except Exception:
     OmegaConf = None  # type: ignore
 
-try:
-    import numpy as np  # type: ignore
-except Exception:
-    np = None  # type: ignore
+# numpy is a required dependency for this node; already imported above.
 
 try:
-    from mms101_controller import MMS101Controller  # placeholder import
+    from mms101_controller import MMS101Controller  # original controller
 except Exception:
     MMS101Controller = None  # type: ignore
+
+try:
+    from mms101_controller_temp import MMS101Controller as TempMMS101Controller  # temp EMA controller
+except Exception:
+    TempMMS101Controller = None  # type: ignore
 
 
 class ForceSensorNode(Node):
@@ -29,18 +31,23 @@ class ForceSensorNode(Node):
         # Publishers
         self.pub_array = self.create_publisher(Float64MultiArray, '/force_sensor/wrench_array', 10)
         self.pub_legacy = self.create_publisher(WrenchStamped, '/force_sensor/wrench', 10)  # first sensor only
+
         # Parameters
         self.declare_parameter('publish_rate_hz', 200.0)
-        self.declare_parameter('use_mock', True)
+        self.declare_parameter('use_mock', False)
         self.declare_parameter('config_path', 'config.yaml')
         self.declare_parameter('num_sensors', 3)
+        self.declare_parameter('use_temp_controller', True)
+
         self.rate = self.get_parameter('publish_rate_hz').get_parameter_value().double_value
         self.use_mock = self.get_parameter('use_mock').get_parameter_value().bool_value
         cfg_path = self.get_parameter('config_path').get_parameter_value().string_value
         self.num_sensors = int(self.get_parameter('num_sensors').get_parameter_value().integer_value)
+        use_temp = self.get_parameter('use_temp_controller').get_parameter_value().bool_value
+
         # Controller
         self.controller = None
-        if not self.use_mock and MMS101Controller is not None:
+        if not self.use_mock:
             cfg = None
             if OmegaConf is not None:
                 try:
@@ -48,14 +55,21 @@ class ForceSensorNode(Node):
                 except Exception as e:
                     self.get_logger().warn(f'Failed to load config via OmegaConf: {e}')
             try:
-                self.controller = MMS101Controller(cfg)
+                if use_temp and TempMMS101Controller is not None:
+                    self.controller = TempMMS101Controller(cfg)
+                    self.get_logger().info('Using Temp MMS101Controller (EMA baseline).')
+                elif MMS101Controller is not None:
+                    self.controller = MMS101Controller(cfg)
+                    self.get_logger().info('Using Original MMS101Controller.')
+                else:
+                    raise RuntimeError('No MMS101Controller implementation available')
             except Exception as e:
-                self.get_logger().error(f'Failed to init MMS101Controller: {e}')
+                self.get_logger().error(f'Failed to init controller: {e}')
                 self.use_mock = True
         else:
-            if not self.use_mock:
-                self.get_logger().warn('MMS101Controller not found. Falling back to mock.')
+            self.get_logger().warn('Using mock force data.')
             self.use_mock = True
+
         # Per-sensor publishers (/force_sensor/s{i}/wrench)
         self.pub_sensors = [
             self.create_publisher(WrenchStamped, f'/force_sensor/s{idx+1}/wrench', 10)
@@ -92,7 +106,7 @@ class ForceSensorNode(Node):
             if self.controller is None:
                 raise RuntimeError('Controller not initialized')
             raw = self.controller.run(self.i)
-
+            
             rows: List[List[float]] = []
             arr = np.array(raw)
             if arr.ndim == 2 and arr.shape[1] >= 6:
@@ -112,11 +126,13 @@ class ForceSensorNode(Node):
 
             values = [tuple(r[:6]) for r in rows]  # type: ignore
             self.last_values_list = values
-            
-            if (self.i % 50) == 0:
-                print(f"\n\n Controller values1: {[f'{v:.2f}' for v in values[0]]} sum : {sum(values[0]):.2f} \n")
-                print(f"Controller values2: {[f'{v:.2f}' for v in values[1]]} sum : {sum(values[1]):.2f} \n")
-                print(f"Controller values3: {[f'{v:.2f}' for v in values[2]]} sum : {sum(values[2]):.2f} \n\n")
+
+            if (self.i % 50) == 0 and len(values) > 0:
+                # Print up to first 3 sensors safely
+                for idx in range(min(3, len(values))):
+                    v = values[idx]
+                    print(f"Controller values{idx+1}: {[f'{x:.2f}' for x in v]} sum : {sum(v):.2f}")
+                print()
             return values
         except Exception as e:
             if (self.i % 200) == 0:

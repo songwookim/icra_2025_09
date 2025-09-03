@@ -298,10 +298,10 @@ private:
     
     // Optional: Log encoder values periodically (like falcon_test.cpp printf)
     static int counter = 0;
-    if (++counter % 50 == 0) {  // Log every 5 seconds at 200Hz
-      RCLCPP_INFO(get_logger(), "Enc1: %5d | Enc2: %5d | Enc3: %5d | Forces: [%d, %d, %d]", 
-                  enc[0], enc[1], enc[2], last_cmd_[0], last_cmd_[1], last_cmd_[2]);
-    }
+    // if (++counter % 50 == 0) {  // Log every 5 seconds at 200Hz
+    //   RCLCPP_INFO(get_logger(), "\n\n Enc1: %5d | Enc2: %5d | Enc3: %5d | Forces: [%d, %d, %d]", 
+    //               enc[0], enc[1], enc[2], last_cmd_[0], last_cmd_[1], last_cmd_[2]);
+    // }
   }
 
   // Helper: scale, clamp, and send forces to device; update last_cmd_
@@ -319,7 +319,7 @@ private:
     static int force_log_counter = 0;
     if (++force_log_counter % 50 == 0) {
       RCLCPP_INFO(get_logger(), "Force command: [%d, %d, %d]", v0, v1, v2);
-      RCLCPP_INFO(get_logger(), "Sensor command: [%lf, %lf, %lf] \n\n", sensor1_sum, sensor2_sum, sensor3_sum);
+      RCLCPP_INFO(get_logger(), "Sensor command: [%lf, %lf, %lf]", sensor1_sum, sensor2_sum, sensor3_sum);
     }
   }
 
@@ -404,7 +404,7 @@ private:
   double init_kp_ {100.0};
   double init_kd_ {0.1};
   int init_force_limit_ {1000};
-  int init_max_loops_ {20000};
+  int init_max_loops_ {5000};
   int init_stable_eps_ {5};
   int init_stable_count_req_ {0};
 

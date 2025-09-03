@@ -10,6 +10,7 @@ find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 # Set libnifalcon paths (local build)
 set(LIBNIFALCON_ROOT_DIR "/home/songwoo/Desktop/work_dir/libnifalcon")
@@ -60,7 +61,23 @@ install(PROGRAMS
   hri_falcon_robot_bridge/force_sensor_node.py
   hri_falcon_robot_bridge/haptic_robot_controller.py
   hri_falcon_robot_bridge/continuous_force_test_node.py
+  hri_falcon_robot_bridge/hand_tracker_node.py
+  hri_falcon_robot_bridge/robot_controller_node.py
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# Optional: install a .py-less alias so users can run `ros2 run ... hand_tracker_node`
+install(PROGRAMS
+  hri_falcon_robot_bridge/hand_tracker_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME hand_tracker_node
+)
+
+# Optional: alias for robot_controller_node without .py
+install(PROGRAMS
+  hri_falcon_robot_bridge/robot_controller_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME robot_controller_node
 )
 
 # --- Launch ---
