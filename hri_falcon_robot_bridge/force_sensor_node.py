@@ -18,6 +18,7 @@ try:
     from mms101_controller import MMS101Controller  # original controller
 except Exception:
     MMS101Controller = None  # type: ignore
+    
 
 try:
     from mms101_controller_temp import MMS101Controller as TempMMS101Controller  # temp EMA controller
@@ -157,6 +158,7 @@ class ForceSensorNode(Node):
         arr_msg.layout.dim = [d0, d1]
         arr_msg.data = [float(x) for row in values for x in row]
         self.pub_array.publish(arr_msg)
+        self.get_logger().info(f'sensor data : {arr_msg}')
 
         # Publish first sensor on legacy topic for compatibility
         if values:
