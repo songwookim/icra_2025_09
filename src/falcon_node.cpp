@@ -32,15 +32,15 @@ using namespace std::chrono_literals;
  */
 class FalconNode : public rclcpp::Node {
 public:
-  FalconNode() : Node("falcon_node"), falcon_initialized_(false) {
+  FalconNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
+    : Node("falcon_node", options), falcon_initialized_(false) {
     // Parameters
   force_scale_ = this->declare_parameter<double>("force_scale", 0.0); // maps N to Falcon units (int16)
     if (force_scale_ == 0.0) {
       RCLCPP_WARN(get_logger(), "force_scale=0.0 => Falcon에 힘이 항상 0으로 적용됩니다. 파라미터 조정 필요.");
     }
   io_rate_hz_ = this->declare_parameter<double>("io_rate_hz", 1000.0); // 장치 IO 폴링 주파수 (Hz)
-  // frame_id 파라미터 및 publish 관련 요소 제거됨
-    falcon_id_ = this->declare_parameter<int>("falcon_id", 0); // which falcon to use (0-based)
+  // 단일 Falcon 전제: falcon_id 파라미터 제거 (항상 0번 장치 사용)
 
     // Initial posture parameters
     init_posture_enable_ = this->declare_parameter<bool>("init_posture_enable", true);
@@ -132,18 +132,13 @@ private:
       return;
     }
     
-    if (falcon_id_ >= (int)num_falcons) {
-      RCLCPP_ERROR(get_logger(), "Requested falcon ID %d, but only %d falcons available", falcon_id_, num_falcons);
+    // 단일 Falcon 사용: 0번만 시도
+    RCLCPP_INFO(get_logger(), "Opening falcon 0 (single-device mode)");
+    if (!device_.open(0)) {
+      RCLCPP_ERROR(get_logger(), "Cannot open falcon 0");
       return;
     }
-    
-    // Open the specified falcon
-    RCLCPP_INFO(get_logger(), "Opening falcon %d", falcon_id_);
-    if (!device_.open(falcon_id_)) {
-      RCLCPP_ERROR(get_logger(), "Cannot open falcon %d", falcon_id_);
-      return;
-    }
-    RCLCPP_INFO(get_logger(), "Opened falcon %d", falcon_id_);
+    RCLCPP_INFO(get_logger(), "Opened falcon 0");
     
     // Load firmware if needed
     if (!device_.isFirmwareLoaded()) {
@@ -254,9 +249,9 @@ private:
            
   // compact log
     static int counter = 0;
-    if (++counter % 50 == 0) {
-      RCLCPP_INFO(get_logger(), "Sensor sums | s1: %.3f, s2: %.3f, s3: %.3f", sensor1_sum, sensor2_sum, sensor3_sum);
-    }
+    // if (++counter % 50 == 0) {
+    //   RCLCPP_INFO(get_logger(), "Sensor sums | s1: %.3f, s2: %.3f, s3: %.3f", sensor1_sum, sensor2_sum, sensor3_sum);
+    // }
 
   // 최신 값 저장 (타이머에서 적용)
   last_sensor_sums_[0] = sensor1_sum;
@@ -314,7 +309,7 @@ private:
     // RCLCPP_INFO(get_logger(), "Force command: [%d, %d, %d]", v0, v1, v2);
     last_cmd_ = {v0, v1, v2};   
     static int force_log_counter = 0;
-    if (++force_log_counter % 1 == 0) {
+    if (++force_log_counter % 100 == 0) {
       RCLCPP_INFO(get_logger(), "Force command: [%d, %d, %d]", v0, v1, v2);
       RCLCPP_INFO(get_logger(), "Sensor command: [%lf, %lf, %lf]", sensor1_sum, sensor2_sum, sensor3_sum);
     }
@@ -426,7 +421,6 @@ private:
   bool safe_mode_ {true};
   bool csv_enable_ {true};
   std::string csv_dir_;
-  int falcon_id_;
   // Init posture params
   bool init_posture_enable_ {true};
   std::array<int,3> init_target_enc_ {-500,-500,-500};
@@ -459,8 +453,37 @@ private:
 };
 
 int main(int argc, char** argv) {
+  // 1) 사용자 정의 CLI 파싱 (ROS2 초기화 이전) -- 예: --force_scale=0.001 --safe_mode / --no-safe_mode
+  double cli_force_scale = 0.0; bool has_force_scale = false;
+  bool cli_safe_mode = true;    bool has_safe_mode = false;
+  for (int i = 1; i < argc; ++i) {
+    std::string a(argv[i]);
+    auto parse_val = [&](const std::string & s, const std::string & key){
+      if (s.rfind(key, 0) == 0 && s.size() > key.size()) {
+        try { cli_force_scale = std::stod(s.substr(key.size())); has_force_scale = true; } catch(...) {}
+        return true;
+      }
+      return false;
+    };
+    if (parse_val(a, "--force_scale=" ) || parse_val(a, "--force-scale=")) continue;
+    if (a == "--safe_mode" || a == "--safe-mode") { cli_safe_mode = true; has_safe_mode = true; continue; }
+    if (a == "--no_safe_mode" || a == "--no-safe-mode") { cli_safe_mode = false; has_safe_mode = true; continue; }
+  }
+
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<FalconNode>());
+  rclcpp::NodeOptions opts;
+  // 2) 파라미터 오버라이드 (ros2 run ... --ros-args -p force_scale:=... 와 동일 효과)
+  if (has_force_scale) opts.append_parameter_override("force_scale", cli_force_scale);
+  if (has_safe_mode)  opts.append_parameter_override("safe_mode", cli_safe_mode);
+
+  auto node = std::make_shared<FalconNode>(opts);
+  RCLCPP_INFO(node->get_logger(), "CLI overrides -> force_scale:%s safe_mode:%s", 
+              has_force_scale ? std::to_string(cli_force_scale).c_str() : "(param/default)",
+              has_safe_mode  ? (cli_safe_mode ? "true" : "false") : "(param/default)");
+  RCLCPP_INFO(node->get_logger(), "사용 예:");
+  RCLCPP_INFO(node->get_logger(), "  ros2 run hri_falcon_robot_bridge falcon_node -- --force_scale=0.001 --no-safe_mode");
+  RCLCPP_INFO(node->get_logger(), "  또는 ROS 파라미터 방식: --ros-args -p force_scale:=0.001 -p safe_mode:=false");
+  rclcpp::spin(node);
   rclcpp::shutdown();
   return 0;
 }
