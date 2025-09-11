@@ -64,6 +64,7 @@ install(PROGRAMS
   hri_falcon_robot_bridge/hand_tracker_node.py
   hri_falcon_robot_bridge/robot_controller_node.py
   hri_falcon_robot_bridge/ball_tracker_node.py
+  hri_falcon_robot_bridge/emg_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -86,6 +87,13 @@ install(PROGRAMS
   hri_falcon_robot_bridge/ball_tracker_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME ball_tracker_node
+)
+
+# Optional: alias for emg_node without .py
+install(PROGRAMS
+  hri_falcon_robot_bridge/emg_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME emg_node
 )
 
 # --- Launch ---

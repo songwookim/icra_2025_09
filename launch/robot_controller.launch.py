@@ -29,20 +29,6 @@ def generate_launch_description():
 		default_value='/home/songwoo/Desktop/work_dir/realsense_hand_retargetting/universal_robots_ur5e_with_dclaw/dclaw/dclaw3xh.xml',
 		description='Path to MuJoCo DClaw model xml')
 
-	controller = Node(
-		package='hri_falcon_robot_bridge',
-		executable='robot_controller_node',
-		name='robot_controller_node',
-		output='screen',
-		parameters=[
-			{'hand_units_topic': '/hand_tracker/targets_units'},
-			{'hand_enable_topic': '/hand_tracker/enable'},
-			{'keyboard_toggle_enable': True},
-			{'keyboard_toggle_key': 'h'},
-			{'test_mode': LaunchConfiguration('test_mode')},
-		],
-	)
-
 	tracker = Node(
 		package='hri_falcon_robot_bridge',
 		executable='hand_tracker_node',
@@ -59,7 +45,7 @@ def generate_launch_description():
 		],
 	)
 
-	group = GroupAction(actions=[controller, tracker])
+	group = GroupAction(actions=[tracker])
 
 	return LaunchDescription([
 		run_tracker,

@@ -79,21 +79,5 @@ def generate_launch_description():
                 {'init_stable_eps': LaunchConfiguration('falcon_init_stable_eps')},
                 {'init_stable_count': LaunchConfiguration('falcon_init_stable_count')},
             ],
-        ),
-        # Node 2: Robot controller (Python)
-        Node(
-            package='hri_falcon_robot_bridge',
-            executable='robot_controller_node.py',
-            name='robot_controller_node',
-            output='screen',
-            parameters=[
-                {'ids': [10, 20, 30]},
-                {'mode': 3},
-                {'scale': [1.0, 1.0, 1.0]},        # tune mapping here
-                {'offset': [1000, 1000, 1000]},
-                {'clip_min': [0, 0, 0]},
-                {'clip_max': [4095, 4095, 4095]},
-                {'use_encoders': True},            # True: use encoders; False: use position
-            ],
-        ),
+    ),
     ])

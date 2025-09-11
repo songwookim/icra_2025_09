@@ -36,19 +36,6 @@ def generate_launch_description():
         }]
     )
     
-    # Haptic Robot Controller (main integration node)
-    haptic_controller = Node(
-        package='hri_falcon_robot_bridge',
-        executable='haptic_robot_controller.py',
-        name='haptic_robot_controller',
-        output='screen',
-        parameters=[{
-            'force_scale': 33.3,
-            'max_falcon_force': 1000.0,
-            'update_rate': 20.0,
-            'max_position_change': 50.0
-        }]
-    )
     
     # Continuous Force Test Node (instead of real force sensor)
     force_test_node = Node(
@@ -64,12 +51,6 @@ def generate_launch_description():
         
         # Start falcon node first
         falcon_node,
-        
-        # Start haptic controller with delay
-        TimerAction(
-            period=3.0,
-            actions=[haptic_controller]
-        ),
         
         # Start force test with additional delay
         TimerAction(

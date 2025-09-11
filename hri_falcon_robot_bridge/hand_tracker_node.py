@@ -351,7 +351,7 @@ class HandTrackerNode(Node):
             try:
                 if not self.log_angles_csv_path:
                     ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                    self.log_angles_csv_path = str(pathlib.Path.cwd() / f"{ts}_handangles.csv")
+                    self.log_angles_csv_path = str(pathlib.Path.cwd() / f"outpus/handangles/{ts}_handangles.csv")
                 p = pathlib.Path(self.log_angles_csv_path)
                 p.parent.mkdir(parents=True, exist_ok=True)
                 need_header = (not p.exists()) or p.stat().st_size == 0
@@ -368,6 +368,26 @@ class HandTrackerNode(Node):
             except Exception as e:
                 self.get_logger().error(f"CSV 파일 열기 실패: {e}")
                 self.log_angles_csv_enable = False
+
+    def _print_keyboard_help(self) -> None:
+        try:
+            self.get_logger().info(
+                "\n"
+                "[Keyboard 단축키]\n"
+                "  q : 종료 (quit)\n"
+                "  r : (시각화) 엄지 보정 토글\n"
+                "  s : CSV 로깅 토글 (시작/정지)\n"
+                "  h : 로봇으로 units Publish 토글 (ON/OFF)\n"
+                "  c : 현재 손 자세를 zero 기준으로 설정\n"
+                "  j : 현재 smoothed qpos 출력\n"
+                "  t : 엄지 부호 패턴 순환\n"
+                "  x : global_qpos_sign 반전(+/-)\n"
+                "  a : 맵 모드 정보 (signed_angle)\n"
+                "  g : qpos_gain 순환\n"
+                "  참고: 키 입력은 OpenCV 창이 포커스일 때만 동작합니다.\n"
+            )
+        except Exception:
+            pass
 
     def deproject(self, px, py, depth_img):
         if px < 0 or px >= depth_img.shape[1] or py < 0 or py >= depth_img.shape[0]:
@@ -792,6 +812,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = HandTrackerNode()
     node.get_logger().info('Hand tracker node started')
+    node._print_keyboard_help()
     try:
         node.run()
     except KeyboardInterrupt:

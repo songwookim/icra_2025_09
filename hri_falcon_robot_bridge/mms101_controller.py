@@ -179,25 +179,29 @@ class MMS101Controller:
             # print(f" is? : {self.contact_flag}" )
             # if self.contact_flag != True:  
             #     # 튀는 값 필터링
+            
             if period < 5000:
+                if period % 500 == 0:
+                    print(f"filtering" )
                 self.sums += mms101data
                 self.n_samples += 1      
-                if self.n_samples > 300: 
-                    self.offset = self.sums / self.n_samples  # Calculate the average offset
-                    self.n_samples = 0  # Reset the number of samples
-                    self.sums = 0
+                # if self.n_samples > 300: 
+                    # self.n_samples = 0  # Reset the number of samples
+                    # self.sums = 0
+                self.offset = self.sums / self.n_samples  # Calculate the average offset
+                return np.zeros_like(sensed_data)
             else :
                 if self.contact_flag == 0:
                     self.sums += mms101data
                     self.n_samples += 1  
-                if self.contact_flag == 0 :
                     if self.n_samples > 300: 
                         self.offset = self.sums / self.n_samples  # Calculate the average offset
                         self.n_samples = 0  # Reset the number of samples
                         self.sums = 0
+                return sensed_data        
             # print(sensed_data)
 
-            return sensed_data        
+            
             
             
 

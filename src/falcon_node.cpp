@@ -7,12 +7,13 @@
 #include <iostream>
 #include <array>
 #include <thread>
-
+#include <stdlib.h>
+#include <fstream>
+#include <iomanip>
+#include <ctime>
 // ROS2 includes
 #include "rclcpp/rclcpp.hpp"
-#include "std_msgs/msg/int32_multi_array.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
-#include "geometry_msgs/msg/vector3_stamped.hpp"
 #include "geometry_msgs/msg/wrench_stamped.hpp"
 
 // libnifalcon includes (conditional)
@@ -26,18 +27,20 @@ using namespace std::chrono_literals;
 
 /*
  * This node wraps a Novint Falcon via libnifalcon.
- * It subscribes to /force_sensor/wrench and sets Falcon motor forces,
- * and publishes /falcon/encoders (Int32MultiArray) and /falcon/position (Vector3Stamped).
+ * Force 입력 토픽(/force_sensor/wrench, /force_sensor/wrench_array)을 받아
+ * Novint Falcon 장치에 힘을 적용한다. (모든 publish 기능 제거됨)
  */
 class FalconNode : public rclcpp::Node {
 public:
   FalconNode() : Node("falcon_node"), falcon_initialized_(false) {
     // Parameters
-    force_scale_ = this->declare_parameter<double>("force_scale", 1500.0); // maps N to Falcon units (int16)
-    publish_rate_hz_ = this->declare_parameter<double>("publish_rate_hz", 200.0);
-    frame_id_ = this->declare_parameter<std::string>("frame_id", "falcon_base");
+  force_scale_ = this->declare_parameter<double>("force_scale", 0.0); // maps N to Falcon units (int16)
+    if (force_scale_ == 0.0) {
+      RCLCPP_WARN(get_logger(), "force_scale=0.0 => Falcon에 힘이 항상 0으로 적용됩니다. 파라미터 조정 필요.");
+    }
+  io_rate_hz_ = this->declare_parameter<double>("io_rate_hz", 1000.0); // 장치 IO 폴링 주파수 (Hz)
+  // frame_id 파라미터 및 publish 관련 요소 제거됨
     falcon_id_ = this->declare_parameter<int>("falcon_id", 0); // which falcon to use (0-based)
-    force_sensor_index_ = this->declare_parameter<int>("force_sensor_index", 0); // which row from array topic
 
     // Initial posture parameters
     init_posture_enable_ = this->declare_parameter<bool>("init_posture_enable", true);
@@ -52,32 +55,44 @@ public:
     init_stable_eps_ = this->declare_parameter<int>("init_stable_eps", 5);
     init_stable_count_req_ = this->declare_parameter<int>("init_stable_count", 0); // 0: don't wait for stability
 
-    // Interfaces
-    sub_force_ = this->create_subscription<geometry_msgs::msg::WrenchStamped>(
-      "/force_sensor/wrench", 10,
-      std::bind(&FalconNode::on_force, this, std::placeholders::_1));
-
     // Also support the combined array topic: layout [sensor, axis] (axis = fx,fy,fz,tx,ty,tz)
     sub_force_array_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
       "/force_sensor/wrench_array", 10,
       std::bind(&FalconNode::on_force_array, this, std::placeholders::_1));
 
-    pub_enc_ = this->create_publisher<std_msgs::msg::Int32MultiArray>("/falcon/encoders", 10);
-    pub_pos_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/falcon/position", 10);
+    // Force 적용 주기 (구독 수신 즉시 적용 대신 주기적으로 적용 가능)
+    force_process_rate_hz_ = this->declare_parameter<double>("force_process_rate_hz", 200.0);
+  // Safe mode & CSV params
+  safe_mode_ = this->declare_parameter<bool>("safe_mode", true);
+  csv_enable_ = this->declare_parameter<bool>("csv_enable", true);
+  csv_dir_ = this->declare_parameter<std::string>("csv_dir", "");
 
     // Device init
     init_device();
 
-    // Timer loop to read device and publish
+    // (publish 제거) force 콜백 외에도 장치 주기 IO가 필요하므로 고주기 폴링 타이머 추가
     if (falcon_initialized_) {
-      auto period = std::chrono::duration<double>(1.0 / publish_rate_hz_);
-      timer_ = this->create_wall_timer(
+      if (io_rate_hz_ < 1.0) io_rate_hz_ = 1.0;
+      auto period = std::chrono::duration<double>(1.0 / io_rate_hz_);
+      io_timer_ = this->create_wall_timer(
         std::chrono::duration_cast<std::chrono::nanoseconds>(period),
-        std::bind(&FalconNode::on_timer, this));
+        std::bind(&FalconNode::on_io_timer, this));
+      // Force 처리 타이머
+      if (force_process_rate_hz_ < 1.0) force_process_rate_hz_ = 1.0;
+      auto fperiod = std::chrono::duration<double>(1.0 / force_process_rate_hz_);
+      force_timer_ = this->create_wall_timer(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(fperiod),
+        std::bind(&FalconNode::on_force_timer, this));
+      RCLCPP_INFO(get_logger(), "Falcon IO polling timer started at %.1f Hz", io_rate_hz_);
+      RCLCPP_INFO(get_logger(), "Falcon force process timer started at %.1f Hz", force_process_rate_hz_);
     }
   }
 
   ~FalconNode() override {
+    if (csv_file_.is_open()) {
+      csv_file_.flush();
+      csv_file_.close();
+    }
     if (falcon_initialized_) {
       // Set forces to zero and close device
       if (firmware_) {
@@ -155,7 +170,7 @@ private:
     
     // Wait for homing with proper timeout and status checking
     int homing_timeout = 0;
-    const int max_homing_attempts = 5000; // Increase timeout
+    const int max_homing_attempts = 10000; // Increase timeout
     
     while (!firmware_->isHomed() && homing_timeout < max_homing_attempts) {
       if (!device_.runIOLoop()) {
@@ -205,19 +220,13 @@ private:
     }
   }
 
-  void on_force(const geometry_msgs::msg::WrenchStamped::SharedPtr msg) {
-    if (!is_ready()) {
-      return;
-    }
-  // Do not apply forces here; only on_force_array should drive the device.
-  (void)msg; // unused
-  }
-
   void on_force_array(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
-    if (!is_ready()) {
-      return;
+    // Copy data so we can transform it
+    auto data = msg->data;
+    // Make all entries absolute values
+    for (auto &v : data) {
+      v = std::abs(v);
     }
-    const auto &data = msg->data;
     if (data.size() < 6) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "wrench_array too small: %zu", data.size());
       return;
@@ -229,79 +238,62 @@ private:
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "wrench_array sensors computed as 0");
       return;
     }
-    int idx = force_sensor_index_;
-    if (idx < 0) idx = 0;
+    int idx = 0;
     if (idx >= sensors) idx = sensors - 1;
     const size_t off = static_cast<size_t>(idx * row_len);
+
+    if (!is_ready()) {
+      return; // only logging when device not ready
+    }
     double sensor1_sum = data[off + 0] + data[off + 1] + data[off + 2] +
                           data[off + 3] + data[off + 4] + data[off + 5];
-    double sensor2_sum = data[off + 6] + data[off + 7] + data[off + 8] +
-                          data[off + 9] + data[off + 10] + data[off + 11];
-    double sensor3_sum = data[off + 12] + data[off + 13] + data[off + 14] +
-                          data[off + 15] + data[off + 16] + data[off + 17];
-    // static int counter = 0;
-    // if (++counter % 50 == 0) { // Log every 50 messages
-    //   RCLCPP_INFO(get_logger(), "\n\n Sensor1 command: [%lf, %lf, %lf, %lf, %lf, %lf] // sum : %lf", data[off + 0], data[off + 1], data[off + 2], data[off + 3], data[off + 4], data[off + 5], sensor1_sum);
-    //   RCLCPP_INFO(get_logger(), "Sensor2 command: [%lf, %lf, %lf, %lf, %lf, %lf] // sum : %lf", data[off + 6], data[off + 7], data[off + 8], data[off + 9], data[off + 10], data[off + 11], sensor2_sum);
-    //   RCLCPP_INFO(get_logger(), "Sensor3 command: [%lf, %lf, %lf, %lf, %lf, %lf] // sum : %lf \n\n", data[off + 12], data[off + 13], data[off + 14], data[off + 15], data[off + 16], data[off + 17], sensor3_sum);
-    // }
+    size_t off2 = static_cast<size_t>((idx + 1) * row_len);
+    size_t off3 = static_cast<size_t>((idx + 2) * row_len);
+    double sensor2_sum = data[off2 + 0] + data[off2 + 1] + data[off2 + 2] + data[off2 + 3] + data[off2 + 4] + data[off2 + 5];
+    double sensor3_sum = data[off3 + 0] + data[off3 + 1] + data[off3 + 2] + data[off3 + 3] + data[off3 + 4] + data[off3 + 5];
+           
+  // compact log
+    static int counter = 0;
+    if (++counter % 50 == 0) {
+      RCLCPP_INFO(get_logger(), "Sensor sums | s1: %.3f, s2: %.3f, s3: %.3f", sensor1_sum, sensor2_sum, sensor3_sum);
+    }
 
-    apply_force_xyz(sensor1_sum, sensor2_sum, sensor3_sum);
+  // 최신 값 저장 (타이머에서 적용)
+  last_sensor_sums_[0] = sensor1_sum;
+  last_sensor_sums_[1] = sensor2_sum;
+  last_sensor_sums_[2] = sensor3_sum;
+  have_force_ = true;
   }
 
-  void on_timer() {
-    if (!is_ready()) {
-      return;
+  // on_timer 제거됨 (publish 기능 삭제). 필요시 별도 주기 작업 구현 가능.
+  void on_io_timer() {
+    if (!is_ready()) return;
+    if (!device_.runIOLoop()) return;
+    // LED 간단 주기 토글 (너무 잦은 변경 방지 위해 카운터)
+    static int cyc = 0;
+    if (++cyc % static_cast<int>(io_rate_hz_) == 0) { // 1초마다
+      int state = (cyc / static_cast<int>(io_rate_hz_)) % 2;
+      firmware_->setLEDStatus(state ? 1 : 2);
     }
-    // Run IO loop to communicate with device (matching falcon_test.cpp pattern)
-    if (!device_.runIOLoop()) {
-      return; // Skip this cycle if communication failed
+  }
+
+  void on_force_timer() {
+    if (!is_ready()) return;
+    if (!have_force_) return; // 아직 데이터 없음
+    apply_force_xyz(last_sensor_sums_[0], last_sensor_sums_[1], last_sensor_sums_[2]);
+    // CSV logging with shared ROS time tick
+    if (csv_enable_) {
+      if (!csv_initialized_) init_csv();
+      if (csv_file_.is_open()) {
+        double t_sec = this->now().seconds();
+        csv_file_ << std::fixed << std::setprecision(6)
+                  << t_sec << ',' << force_counter_ << ','
+                  << last_sensor_sums_[0] << ',' << last_sensor_sums_[1] << ',' << last_sensor_sums_[2] << ','
+                  << last_cmd_[0] << ',' << last_cmd_[1] << ',' << last_cmd_[2] << '\n';
+        if ((force_counter_ % 200) == 0) csv_file_.flush();
+      }
     }
-    
-    // Read encoder values (like in falcon_test.cpp)
-    auto encoder_values = firmware_->getEncoderValues();
-    std::array<int, 3> enc = {encoder_values[0], encoder_values[1], encoder_values[2]};
-    
-    // Get position (you can implement kinematics here)
-    // For now, we'll use a simple mapping from encoders to position
-    // This matches the pattern from falcon_test.cpp where encoders are the primary data
-    std::array<double, 3> pos = {
-      enc[0] * 0.0001,  // Simple scaling - similar to test output format
-      enc[1] * 0.0001,
-      enc[2] * 0.0001
-    };
-    
-    // Optional: Update LED status periodically (like falcon_test.cpp)
-    static int led_counter = 0;
-    if (++led_counter % 1000 == 0) {  // Change LED every 5 seconds at 200Hz
-      int led_state = (led_counter / 1000) % 4; // Cycle through 4 states
-      if (led_state == 0) firmware_->setLEDStatus(0);      // All off
-      else if (led_state == 1) firmware_->setLEDStatus(1); // LED 1
-      else if (led_state == 2) firmware_->setLEDStatus(2); // LED 2  
-      else firmware_->setLEDStatus(4);                     // LED 3
-    }
-
-
-    // Publish encoders
-    std_msgs::msg::Int32MultiArray enc_msg;
-    enc_msg.data = {enc[0], enc[1], enc[2]};
-    pub_enc_->publish(enc_msg);
-
-    // Publish position
-    geometry_msgs::msg::Vector3Stamped p;
-    p.header.stamp = now();
-    p.header.frame_id = frame_id_;
-    p.vector.x = pos[0];
-    p.vector.y = pos[1];
-    p.vector.z = pos[2];
-    pub_pos_->publish(p);
-    
-    // Optional: Log encoder values periodically (like falcon_test.cpp printf)
-    static int counter = 0;
-    // if (++counter % 50 == 0) {  // Log every 5 seconds at 200Hz
-    //   RCLCPP_INFO(get_logger(), "\n\n Enc1: %5d | Enc2: %5d | Enc3: %5d | Forces: [%d, %d, %d]", 
-    //               enc[0], enc[1], enc[2], last_cmd_[0], last_cmd_[1], last_cmd_[2]);
-    // }
+    ++force_counter_;
   }
 
   // Helper: scale, clamp, and send forces to device; update last_cmd_
@@ -309,18 +301,56 @@ private:
     int v0 = static_cast<int>(std::round(sensor1_sum * force_scale_));
     int v1 = static_cast<int>(std::round(sensor2_sum * force_scale_));
     int v2 = static_cast<int>(std::round(sensor3_sum * force_scale_));
-    int limit = 2000;
+    int limit = 1000;
     v0 = std::max(-limit, std::min(limit, v0));
     v1 = std::max(-limit, std::min(limit, v1));
     v2 = std::max(-limit, std::min(limit, v2));
-
-    firmware_->setForces({v0, v1, v2});
-    last_cmd_ = {v0, v1, v2};
+    if (safe_mode_) {
+      v0 = v1 = v2 = 0;
+    }
+  firmware_->setForces({v0, v1, v2});
+  // publish 제거로 인해 주기 IOLoop 호출이 사라졌으므로 즉시 IO 수행
+  device_.runIOLoop();
+    // RCLCPP_INFO(get_logger(), "Force command: [%d, %d, %d]", v0, v1, v2);
+    last_cmd_ = {v0, v1, v2};   
     static int force_log_counter = 0;
-    if (++force_log_counter % 50 == 0) {
+    if (++force_log_counter % 1 == 0) {
       RCLCPP_INFO(get_logger(), "Force command: [%d, %d, %d]", v0, v1, v2);
       RCLCPP_INFO(get_logger(), "Sensor command: [%lf, %lf, %lf]", sensor1_sum, sensor2_sum, sensor3_sum);
     }
+    // firmware_->setForces(f_enc);
+  }
+
+  void init_csv() {
+    if (!csv_enable_ || csv_initialized_) return;
+    std::string base_dir;
+    if (!csv_dir_.empty()) {
+      base_dir = csv_dir_;
+    } else {
+      auto t = std::time(nullptr);
+      std::tm tm_buf{};
+      localtime_r(&t, &tm_buf);
+      char date_buf[16];
+      std::strftime(date_buf, sizeof(date_buf), "%Y%m%d", &tm_buf);
+      base_dir = std::string("outputs/falcon/") + date_buf;
+    }
+    std::string mkdir_cmd = std::string("mkdir -p ") + base_dir;
+    int ret = std::system(mkdir_cmd.c_str()); (void)ret;
+    auto t = std::time(nullptr);
+    std::tm tm_buf{};
+    localtime_r(&t, &tm_buf);
+    char ts_buf[32];
+    std::strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm_buf);
+    std::string path = base_dir + "/falcon_" + ts_buf + ".csv";
+    csv_file_.open(path, std::ios::out | std::ios::trunc);
+    if (!csv_file_.is_open()) {
+      RCLCPP_ERROR(get_logger(), "CSV open 실패: %s", path.c_str());
+      csv_enable_ = false;
+      return;
+    }
+    csv_file_ << "t_sec,i,s1_sum,s2_sum,s3_sum,fx_cmd,fy_cmd,fz_cmd\n";
+    csv_initialized_ = true;
+    RCLCPP_INFO(get_logger(), "Falcon CSV logging -> %s", path.c_str());
   }
 
   // Drive Falcon to initial encoder target using a simple PD in encoder space
@@ -358,23 +388,20 @@ private:
       // PD control in encoder space → firmware force per axis
       std::array<int,3> f_enc = {0,0,0};
       for (int i = 0; i < 3; ++i) {
-        double err = static_cast<double>(init_target_enc_[i] - enc[i]);
+        double err = static_cast<double>(init_target_enc_[i] - enc[i]); // 1: songwoo : target
         double u = init_kp_ * err - init_kd_ * vel[i];
         // Clamp
         if (u > init_force_limit_) u = init_force_limit_;
         if (u < -init_force_limit_) u = -init_force_limit_;
         f_enc[i] = static_cast<int>(-u);
       }
-
-      firmware_->setForces(f_enc);
-      last_cmd_ = f_enc;
-
-      if ((loops % 200) == 0) {
-        RCLCPP_INFO(get_logger(), "Init loop %u | Enc: %6d %6d %6d | Target: %6d %6d %6d | Force: %5d %5d %5d",
-                    loops, enc[0], enc[1], enc[2],
-                    init_target_enc_[0], init_target_enc_[1], init_target_enc_[2],
-                    f_enc[0], f_enc[1], f_enc[2]);
+      bool safe_mode = true;
+      if (safe_mode) {
+        firmware_->setForces({0,0,0});
+      } else {
+        firmware_->setForces(f_enc);
       }
+      last_cmd_ = f_enc;
 
       bool ok = (std::abs(init_target_enc_[0] - enc[0]) <= init_stable_eps_) &&
                  (std::abs(init_target_enc_[1] - enc[1]) <= init_stable_eps_) &&
@@ -394,10 +421,12 @@ private:
 
   // Params
   double force_scale_;
-  double publish_rate_hz_;
-  std::string frame_id_;
+  double io_rate_hz_ {1000.0};
+  double force_process_rate_hz_ {200.0};
+  bool safe_mode_ {true};
+  bool csv_enable_ {true};
+  std::string csv_dir_;
   int falcon_id_;
-  int force_sensor_index_;
   // Init posture params
   bool init_posture_enable_ {true};
   std::array<int,3> init_target_enc_ {-500,-500,-500};
@@ -409,16 +438,21 @@ private:
   int init_stable_count_req_ {0};
 
   // ROS interfaces
-  rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr sub_force_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_force_array_;
-  rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr pub_enc_;
-  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pos_;
-  rclcpp::TimerBase::SharedPtr timer_;
+  // 퍼블리셔 제거됨
+  // 주기 IO 타이머
+  rclcpp::TimerBase::SharedPtr io_timer_;
+  rclcpp::TimerBase::SharedPtr force_timer_;
 
   // Falcon device
   FalconDevice device_;
   std::shared_ptr<FalconFirmware> firmware_;
   bool falcon_initialized_;
+  std::array<double,3> last_sensor_sums_ {0.0,0.0,0.0};
+  bool have_force_ {false};
+  std::ofstream csv_file_;
+  bool csv_initialized_ {false};
+  size_t force_counter_ {0};
 
   // State
   std::array<int,3> last_cmd_ {0,0,0};

@@ -5,7 +5,7 @@ from __future__ import annotations
 Robot Controller Node (units-only from hand_tracker) with optional CSV logging.
 
 - Subscribes: Int32MultiArray (9) on /hand_tracker/targets_units
-- Commands: Dynamixel via DynamixelControl if available and test_mode=False; otherwise dry-run logs
+- Commands: Dynamixel via DynamixelControl if available and safe_mode=False; otherwise dry-run logs
 - Initial posture: fixed initial_val applied once at startup and used as baseline when disabled
 """
 
@@ -42,7 +42,11 @@ class RobotControllerNode(Node):
         super().__init__('robot_controller_node')
 
         # 설정 로드
-        self.config = config if config is not None else self._load_config()
+        self.config = self._load_config()
+        if self.config is None:
+            self.get_logger().error("설정 로드 실패 -> 종료")
+            rclpy.shutdown()
+            sys.exit(1)
         cfg_dyn = getattr(self.config, 'dynamixel', None) if self.config is not None else None
         default_ids = list(getattr(cfg_dyn, 'ids', [11, 12, 21, 22, 31, 32]))
         default_mode = int(getattr(getattr(cfg_dyn, 'control_modes', {}), 'default_mode', 3))
@@ -61,7 +65,7 @@ class RobotControllerNode(Node):
         ])
         self.declare_parameter('hand_units_topic', '/hand_tracker/targets_units')
         self.declare_parameter('max_step_units', 20.0)
-        self.declare_parameter('test_mode', False)
+        self.declare_parameter('safe_mode', True)
         self.declare_parameter('hand_enabled', True)
         self.declare_parameter('hand_enable_topic', '/hand_tracker/enable')
         self.declare_parameter('hand_disable_behavior', 'hold')  # hold | baseline
@@ -92,7 +96,7 @@ class RobotControllerNode(Node):
         self.hand_joint_order = [str(x).lower() for x in (self.get_parameter('hand_joint_order').value or [])]
         self.hand_units_topic = str(self.get_parameter('hand_units_topic').value or '/hand_tracker/targets_units')
         self.max_step_units = float(self.get_parameter('max_step_units').value or 20.0)
-        self.test_mode = bool(self.get_parameter('test_mode').value)
+        self.safe_mode = bool(self.get_parameter('safe_mode').value)
         he_val = self.get_parameter('hand_enabled').value
         self.hand_enabled = bool(he_val) if he_val is not None else True
         self.hand_enable_topic = str(self.get_parameter('hand_enable_topic').value or '/hand_tracker/enable')
@@ -118,7 +122,7 @@ class RobotControllerNode(Node):
         else:
             self.get_logger().warn('dynamixel 설정 없음 -> Dry-run')
 
-        self.get_logger().info(f"[SETUP] src=hand(units) test={self.test_mode} ids={self.ids}")
+        self.get_logger().info(f"[SETUP] src=hand(units) test={self.safe_mode} ids={self.ids}")
 
         # 내부 상태 & CSV
         self._filt_deg = {}
@@ -188,8 +192,6 @@ class RobotControllerNode(Node):
 
     # ============================== Utils
     def _load_config(self) -> Optional['DictConfig']:  # type: ignore[name-defined]
-        if OmegaConf is None:
-            return None
         try:
             pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             cfg_path = os.path.join(pkg_dir, 'resource', 'robot_parameter', 'config.yaml')
@@ -199,7 +201,6 @@ class RobotControllerNode(Node):
                 return cfg
         except Exception as e:
             self.get_logger().warn(f"Config load 실패: {e}")
-        return None
 
     # ============================== Hand Units (Int32MultiArray, 9 elems)
     def on_units_targets(self, msg: Int32MultiArray):
@@ -267,12 +268,15 @@ class RobotControllerNode(Node):
         targets = self._safe_step_limit(targets)
         self._last_targets = list(targets)
         self.get_logger().debug('final ' + ', '.join(f"ID{self.ids[i]}={targets[i]}" for i in range(len(targets))))
-        if self.test_mode or self.controller is None:
-            self.get_logger().info(f"[DRY hand] {targets} test={self.test_mode})")
+        if self.controller is None:
+            self.get_logger().info(f"robot is not connected -> dry-run {targets}")
             return
         try:  # pragma: no cover
-            # self.controller.set_joint_positions(targets)
-            self.get_logger().info(f"[Safe Mode] {targets} ")
+            if self.safe_mode:
+                self.get_logger().info(f"[Safe Mode] {targets} ")
+                return
+            else :
+                self.controller.set_joint_positions(targets)
         except Exception as e:
             self.get_logger().error(f"set_joint_positions 실패: {e}")
 
@@ -325,13 +329,6 @@ def _run(node: RobotControllerNode):
         node.destroy_node()
         rclpy.shutdown()
 
-
-def _hydra_task(cfg: 'DictConfig'):  # type: ignore
-    rclpy.init()
-    node = RobotControllerNode(cfg)
-    _run(node)
-
-
 def main():  # ROS only / hydra 우회
     rclpy.init()
     node = RobotControllerNode()
@@ -339,10 +336,4 @@ def main():  # ROS only / hydra 우회
 
 
 if __name__ == '__main__':
-    use_hydra = hydra is not None and DictConfig is not None and '--ros-args' not in sys.argv
-    if use_hydra:
-        cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'resource', 'robot_parameter')
-        hydra_app = hydra.main(version_base=None, config_path=cfg_path, config_name='config')(_hydra_task)  # type: ignore
-        hydra_app()
-    else:
-        main()
+    main()
