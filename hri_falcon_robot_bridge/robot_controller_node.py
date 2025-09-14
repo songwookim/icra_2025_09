@@ -18,7 +18,7 @@ from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32MultiArray, Bool, String
+from std_msgs.msg import Int32MultiArray
 
 try:
     from .dynamixel_control import DynamixelControl  # type: ignore
@@ -60,20 +60,19 @@ class RobotControllerNode(Node):
         self.declare_parameter('clip_max', [4095, 4095, 4095])
         self.declare_parameter('hand_joint_order', [
             'thumb_cmc','thumb_mcp','thumb_ip',
-            'index_mcp','index_pip','index_dip',
+            'index_mcp','index_hpip','index_dip',
             'middle_mcp','middle_pip','middle_dip'
         ])
         self.declare_parameter('hand_units_topic', '/hand_tracker/targets_units')
         self.declare_parameter('max_step_units', 20.0)
         self.declare_parameter('safe_mode', True)
-        self.declare_parameter('hand_enabled', True)
-        self.declare_parameter('hand_enable_topic', '/hand_tracker/enable')
-        self.declare_parameter('hand_disable_behavior', 'hold')  # hold | baseline
-        self.declare_parameter('keyboard_toggle_enable', True)
-        self.declare_parameter('keyboard_toggle_key', 'h')
+        # hand enable/disable parameters removed (always enabled)
         self.declare_parameter('log_hand_csv_enable', True)
         self.declare_parameter('log_hand_csv_path', '')
-        self.declare_parameter('initial_val', [1240, 2187, 2103, 1240, 2187, 2103, 1240, 2187, 2103])
+        # initial_val_default = [1240, 2187, 2103, 1240, 2187, 2103, 1240, 2187, 2103]
+        initial_val_default = [1154, 2019, 1940, 1043, 2101, 1803, 1138, 2048, 1801]
+        self.declare_parameter('initial_val', initial_val_default)
+        
 
         # 유틸
         def _fit_len(arr, n: int, fill):
@@ -97,12 +96,8 @@ class RobotControllerNode(Node):
         self.hand_units_topic = str(self.get_parameter('hand_units_topic').value or '/hand_tracker/targets_units')
         self.max_step_units = float(self.get_parameter('max_step_units').value or 20.0)
         self.safe_mode = bool(self.get_parameter('safe_mode').value)
-        he_val = self.get_parameter('hand_enabled').value
-        self.hand_enabled = bool(he_val) if he_val is not None else True
-        self.hand_enable_topic = str(self.get_parameter('hand_enable_topic').value or '/hand_tracker/enable')
-        self.hand_disable_behavior = str(self.get_parameter('hand_disable_behavior').value or 'hold').lower()
-        self.keyboard_toggle_enable = bool(self.get_parameter('keyboard_toggle_enable').value)
-        self.keyboard_toggle_key = str(self.get_parameter('keyboard_toggle_key').value or 'h')
+        # hand enable/disable logic removed -> always enabled
+        self.hand_enabled = True
         self.log_hand_csv_enable = bool(self.get_parameter('log_hand_csv_enable').value)
         self.log_hand_csv_path = str(self.get_parameter('log_hand_csv_path').value or '')
         init_param = list(self.get_parameter('initial_val').value or [1240, 2187, 2103, 1240, 2187, 2103, 1240, 2187, 2103])
@@ -125,10 +120,10 @@ class RobotControllerNode(Node):
         self.get_logger().info(f"[SETUP] src=hand(units) test={self.safe_mode} ids={self.ids}")
 
         # 내부 상태 & CSV
-        self._filt_deg = {}
+    # removed _filt_deg (was only used for disable behavior)
         self._last_targets: Optional[List[int]] = None
         self.base_positions = list(self.initial_val)
-        self._keyboard_thread = None
+        # keyboard toggle removed
         self._hand_csv_fp = None
         self._hand_csv_writer = None
         self._last_joint_debug = None
@@ -156,23 +151,7 @@ class RobotControllerNode(Node):
         # 구독 설정
         self.sub_units = self.create_subscription(Int32MultiArray, self.hand_units_topic, self.on_units_targets, 10)
         self.get_logger().info(f"Input source: {self.hand_units_topic} (units)")
-        if self.hand_enable_topic:
-            self.sub_enable = self.create_subscription(Bool, self.hand_enable_topic, self.on_hand_enable, 10)
-            self.get_logger().info(f"Hand enable topic: {self.hand_enable_topic} (start={self.hand_enabled})")
-        self.sub_key = self.create_subscription(String, '/hand_tracker/key', self.on_key_event, 10)
-
-        # 키보드 토글
-        if self.keyboard_toggle_enable:
-            try:  # pragma: no cover
-                import threading
-                if sys.stdin.isatty():
-                    self._keyboard_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
-                    self._keyboard_thread.start()
-                    self.get_logger().info(f"Press '{self.keyboard_toggle_key}' to toggle hand input.")
-                else:
-                    self.get_logger().warn('STDIN TTY 아님 -> 키보드 토글 비활성')
-            except Exception as e:
-                self.get_logger().warn(f"Keyboard thread 실패: {e}")
+        # enable topic removed (always enabled)
 
         # 시작 시 초기 포즈로 세팅(한 번)
         try:
@@ -181,14 +160,7 @@ class RobotControllerNode(Node):
         except Exception as e:
             self.get_logger().warn(f"초기 포즈 적용 실패: {e}")
 
-    # ============================== Key events from tracker
-    def on_key_event(self, msg: String):
-        ch = (msg.data or '').strip()[:1]
-        if not ch:
-            return
-        if ch == self.keyboard_toggle_key:
-            self._set_hand_enabled(not self.hand_enabled, source='tracker_key')
-            return
+    # keyboard toggle feature removed
 
     # ============================== Utils
     def _load_config(self) -> Optional['DictConfig']:  # type: ignore[name-defined]
@@ -205,6 +177,9 @@ class RobotControllerNode(Node):
     # ============================== Hand Units (Int32MultiArray, 9 elems)
     def on_units_targets(self, msg: Int32MultiArray):
         data = list(msg.data or [])
+        data[0] = data[0] - 1000  # thumb_cmc offset 
+        data[3] = data[3] - 1000  # thumb_cmc offset 
+        data[6] = data[6] - 1000  # thumb_cmc offset 
         # 데이터가 아직 없고 첫 호출이면 초기 포즈 적용 후 종료
         if not data and self._last_targets is None:
             self.get_logger().info("No data yet -> apply initial posture once")
@@ -213,18 +188,12 @@ class RobotControllerNode(Node):
         # base는 설정된 초기 포즈 사용
         base = [float(v) for v in (self.base_positions or self.initial_val)]
         # decide commanded targets depending on enabled state
-        if not self.hand_enabled:
-            if self.hand_disable_behavior == 'hold' and self._last_targets is not None:
-                final_targets = list(self._last_targets)
-            else:  # baseline -> initial 포즈 유지
-                final_targets = [self._clip_target(i, base[i]) for i in range(len(self.ids))]
-        else:
-            # build targets aligned to motor ids length
-            n = min(len(self.ids), len(data))
-            clipped = [self._clip_target(i, float(int(data[i]))) for i in range(n)]
-            for i in range(n, len(self.ids)):
-                clipped.append(self._clip_target(i, base[i]))
-            final_targets = clipped
+        # build targets aligned to motor ids length (always enabled)
+        n = min(len(self.ids), len(data))
+        clipped = [self._clip_target(i, float(int(data[i]))) for i in range(n)]
+        for i in range(n, len(self.ids)):
+            clipped.append(self._clip_target(i, base[i]))
+        final_targets = clipped
         # send to motors (or dry-run); step-limit is applied inside
         self._send_targets(final_targets)
         # CSV logging: record final commanded target_units per joint order; raw_deg empty
@@ -276,44 +245,15 @@ class RobotControllerNode(Node):
                 self.get_logger().info(f"[Safe Mode] {targets} ")
                 return
             else :
+                self.get_logger().info(f"[Safe Mode] {targets} ")
                 self.controller.set_joint_positions(targets)
+                
         except Exception as e:
             self.get_logger().error(f"set_joint_positions 실패: {e}")
 
-    # ============================== Enable control
-    def on_hand_enable(self, msg: Bool):
-        self._set_hand_enabled(bool(msg.data), source='topic')
+    # enable/disable control removed (always enabled)
 
-    def _set_hand_enabled(self, enabled: bool, source: str = 'unknown'):
-        old = self.hand_enabled
-        self.hand_enabled = bool(enabled)
-        if old != self.hand_enabled:
-            self.get_logger().info(f"hand_enabled {old}->{self.hand_enabled} (source={source})")
-            if not self.hand_enabled and self.hand_disable_behavior == 'baseline':
-                self._filt_deg = {}
-
-    # ============================== Keyboard loop
-    def _keyboard_loop(self):  # pragma: no cover
-        import select, termios, tty
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while rclpy.ok():
-                r, _, _ = select.select([fd], [], [], 0.2)
-                if fd in r:
-                    ch = sys.stdin.read(1)
-                    if ch == self.keyboard_toggle_key:
-                        self._set_hand_enabled(not self.hand_enabled, source='keyboard')
-                    elif ch in ('q','\u0003'):
-                        pass
-        except Exception as e:
-            self.get_logger().warn(f"keyboard loop error: {e}")
-        finally:
-            try:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            except Exception:
-                pass
+    # _keyboard_loop removed
 
 
 # ============================== Entrypoints

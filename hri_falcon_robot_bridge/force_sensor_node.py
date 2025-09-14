@@ -98,10 +98,12 @@ class ForceSensorNode(Node):
         # Returns list of (fx, fy, fz, tx, ty, tz) length == num_sensors
         if self.use_mock:
             import math
-            t = self.i * 0.01
+            # Mock data for testing
+            # t 값의 증가량을 줄여서 mock 데이터의 변화 주기를 늦춤 (0.0005 -> 0.0001)
+            t = self.i * 0.0001
             values: List[Tuple[float, float, float, float, float, float]] = []
             for s in range(self.num_sensors):
-                phase = s * 0.3
+                phase = s * 0.1
                 values.append((
                     2 * math.sin(t + phase),
                     0 * math.cos(0.5 * t + phase),

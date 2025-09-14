@@ -198,13 +198,13 @@ class HandTrackerNode(Node):
         self.declare_parameter('fps', 30)
         self.declare_parameter('min_detection_confidence', 0.6)
         self.declare_parameter('min_tracking_confidence', 0.6)
-        self.declare_parameter('publish_joint_state', True)
+        self.declare_parameter('publish_joint_state', False)
         self.declare_parameter('log_joint_state', False)
         self.declare_parameter('publish_empty_when_no_hand', True)
         # GUI 창 표시 여부 (Qt 문제 회피용). False면 imshow/waitKey 사용 안 함.
-        self.declare_parameter('enable_cv_window', False)
+        self.declare_parameter('enable_cv_window', True)
         # 로봇으로 units Publish on/off (키보드로 토글 가능)
-        self.declare_parameter('units_publish_enabled', True)
+        self.declare_parameter('units_publish_enabled', False)
         # CSV
         self.declare_parameter('log_angles_csv_enable', False)
         self.declare_parameter('log_angles_csv_path', '')
@@ -272,8 +272,8 @@ class HandTrackerNode(Node):
 
         # qpos mapping config
         self.joint_orientation = {
-            'THUMB': [1, 1, 1],
-            'INDEX': [1, 1, 1],
+            'THUMB': [-1, -1, -1],
+            'INDEX': [-1, -1, -1],
             'MIDDLE': [-1, -1, -1],
         }
         self.global_qpos_sign = -1
@@ -647,6 +647,18 @@ class HandTrackerNode(Node):
                                 self._csv_fp.flush()
                         except Exception as e:
                             self.get_logger().warn(f"CSV 로그 실패(손 없음): {e}")
+
+                # ---- Overlay: units_publish_enabled 상태 표시 (항상 표시) ----
+                try:
+                    status_txt = f"UNITS PUBLISH: {'ON' if self.units_publish_enabled else 'OFF'}"
+                    color_on = (0, 200, 0)
+                    color_off = (0, 0, 255)
+                    color = color_on if self.units_publish_enabled else color_off
+                    # 그림자(검정) + 본문(색) 두 번 그려 가독성 향상
+                    cv2.putText(img, status_txt, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2, cv2.LINE_AA)
+                    cv2.putText(img, status_txt, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+                except Exception:
+                    pass
 
                 key = 255
                 if self.enable_cv_window:
