@@ -32,25 +32,35 @@ using namespace std::chrono_literals;
  */
 class FalconNode : public rclcpp::Node {
 public:
-  FalconNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
-    : Node("falcon_node", options), falcon_initialized_(false) {
+  FalconNode() : Node("falcon_node"), falcon_initialized_(false) {
     // Parameters
-  force_scale_ = this->declare_parameter<double>("force_scale", 0.0); // maps N to Falcon units (int16)
+    // force_scale 파라미터: 사용자가 force_scale:=0 (정수) 형태로 넣으면 타입 mismatch 예외 발생하므로
+    // double 선언 시 실패하면 int로 재시도 후 double로 변환
+    try {
+      force_scale_ = this->declare_parameter<double>("force_scale", 0.0); // maps N to Falcon units (int16)
+    } catch (const rclcpp::exceptions::InvalidParameterTypeException & ex) {
+      // 정수로 override된 경우 여기로 옴 → int로 다시 선언 후 변환
+      int tmp = this->declare_parameter<int>("force_scale", 0);
+      force_scale_ = static_cast<double>(tmp);
+      RCLCPP_WARN(get_logger(), "force_scale 파라미터가 정수로 전달되어(double 기대) 자동 변환되었습니다: %d -> %.3f", tmp, force_scale_);
+    }
     if (force_scale_ == 0.0) {
       RCLCPP_WARN(get_logger(), "force_scale=0.0 => Falcon에 힘이 항상 0으로 적용됩니다. 파라미터 조정 필요.");
     }
   io_rate_hz_ = this->declare_parameter<double>("io_rate_hz", 1000.0); // 장치 IO 폴링 주파수 (Hz)
   // 단일 Falcon 전제: falcon_id 파라미터 제거 (항상 0번 장치 사용)
 
-    // Initial posture parameters
+    // Initial posture parameters (vector parameter 제거: 개별 int 파라미터로 단순화)
     init_posture_enable_ = this->declare_parameter<bool>("init_posture_enable", true);
-    auto init_target = this->declare_parameter<std::vector<int>>("init_enc_target", std::vector<int>{-500, -500, -500});
-    if (init_target.size() >= 3) {
-      init_target_enc_ = {init_target[0], init_target[1], init_target[2]};
-    }
+    int init_enc_x = this->declare_parameter<int>("init_enc_target_x", -500);
+    int init_enc_y = this->declare_parameter<int>("init_enc_target_y", -500);
+    int init_enc_z = this->declare_parameter<int>("init_enc_target_z", -500);
+    init_target_enc_[0] = init_enc_x;
+    init_target_enc_[1] = init_enc_y;
+    init_target_enc_[2] = init_enc_z;
     init_kp_ = this->declare_parameter<double>("init_kp", 100.0);
     init_kd_ = this->declare_parameter<double>("init_kd", 0.1);
-    init_force_limit_ = this->declare_parameter<int>("init_force_limit", 1000);
+    init_force_limit_ = this->declare_parameter<int>("init_force_limit", 2000);
     init_max_loops_ = this->declare_parameter<int>("init_max_loops", 20000);
     init_stable_eps_ = this->declare_parameter<int>("init_stable_eps", 5);
     init_stable_count_req_ = this->declare_parameter<int>("init_stable_count", 0); // 0: don't wait for stability
@@ -296,13 +306,10 @@ private:
     int v0 = static_cast<int>(std::round(sensor1_sum * force_scale_));
     int v1 = static_cast<int>(std::round(sensor2_sum * force_scale_));
     int v2 = static_cast<int>(std::round(sensor3_sum * force_scale_));
-    int limit = 1000;
+    int limit = init_force_limit_;
     v0 = std::max(-limit, std::min(limit, v0));
     v1 = std::max(-limit, std::min(limit, v1));
     v2 = std::max(-limit, std::min(limit, v2));
-    if (safe_mode_) {
-      v0 = v1 = v2 = 0;
-    }
   firmware_->setForces({v0, v1, v2});
   // publish 제거로 인해 주기 IOLoop 호출이 사라졌으므로 즉시 IO 수행
   device_.runIOLoop();
@@ -313,7 +320,16 @@ private:
       RCLCPP_INFO(get_logger(), "Force command: [%d, %d, %d]", v0, v1, v2);
       RCLCPP_INFO(get_logger(), "Sensor command: [%lf, %lf, %lf]", sensor1_sum, sensor2_sum, sensor3_sum);
     }
-    // firmware_->setForces(f_enc);
+    if (safe_mode_) {
+      static int safe_warn_count = 0;
+      if (safe_warn_count < 5) {
+        RCLCPP_WARN(get_logger(), "Safe mode active - forces set to zero");
+        safe_warn_count++;
+      }
+    }
+    else {
+      firmware_->setForces({v0, v1, v2});
+    }
   }
 
   void init_csv() {
@@ -426,7 +442,7 @@ private:
   std::array<int,3> init_target_enc_ {-500,-500,-500};
   double init_kp_ {100.0};
   double init_kd_ {0.1};
-  int init_force_limit_ {1000};
+  int init_force_limit_ {2000};
   int init_max_loops_ {5000};
   int init_stable_eps_ {5};
   int init_stable_count_req_ {0};
@@ -453,37 +469,8 @@ private:
 };
 
 int main(int argc, char** argv) {
-  // 1) 사용자 정의 CLI 파싱 (ROS2 초기화 이전) -- 예: --force_scale=0.001 --safe_mode / --no-safe_mode
-  double cli_force_scale = 0.0; bool has_force_scale = false;
-  bool cli_safe_mode = true;    bool has_safe_mode = false;
-  for (int i = 1; i < argc; ++i) {
-    std::string a(argv[i]);
-    auto parse_val = [&](const std::string & s, const std::string & key){
-      if (s.rfind(key, 0) == 0 && s.size() > key.size()) {
-        try { cli_force_scale = std::stod(s.substr(key.size())); has_force_scale = true; } catch(...) {}
-        return true;
-      }
-      return false;
-    };
-    if (parse_val(a, "--force_scale=" ) || parse_val(a, "--force-scale=")) continue;
-    if (a == "--safe_mode" || a == "--safe-mode") { cli_safe_mode = true; has_safe_mode = true; continue; }
-    if (a == "--no_safe_mode" || a == "--no-safe-mode") { cli_safe_mode = false; has_safe_mode = true; continue; }
-  }
-
   rclcpp::init(argc, argv);
-  rclcpp::NodeOptions opts;
-  // 2) 파라미터 오버라이드 (ros2 run ... --ros-args -p force_scale:=... 와 동일 효과)
-  if (has_force_scale) opts.append_parameter_override("force_scale", cli_force_scale);
-  if (has_safe_mode)  opts.append_parameter_override("safe_mode", cli_safe_mode);
-
-  auto node = std::make_shared<FalconNode>(opts);
-  RCLCPP_INFO(node->get_logger(), "CLI overrides -> force_scale:%s safe_mode:%s", 
-              has_force_scale ? std::to_string(cli_force_scale).c_str() : "(param/default)",
-              has_safe_mode  ? (cli_safe_mode ? "true" : "false") : "(param/default)");
-  RCLCPP_INFO(node->get_logger(), "사용 예:");
-  RCLCPP_INFO(node->get_logger(), "  ros2 run hri_falcon_robot_bridge falcon_node -- --force_scale=0.001 --no-safe_mode");
-  RCLCPP_INFO(node->get_logger(), "  또는 ROS 파라미터 방식: --ros-args -p force_scale:=0.001 -p safe_mode:=false");
-  rclcpp::spin(node);
+  rclcpp::spin(std::make_shared<FalconNode>());
   rclcpp::shutdown();
   return 0;
 }

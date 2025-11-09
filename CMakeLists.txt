@@ -11,6 +11,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # Set libnifalcon paths (local build)
 set(LIBNIFALCON_ROOT_DIR "/home/songwoo/Desktop/work_dir/libnifalcon")
@@ -53,6 +54,46 @@ endif()
 
 install(TARGETS falcon_node DESTINATION lib/${PROJECT_NAME})
 
+# --- SenseGlove SDK (optional C++ node) ---
+set(SENSEGLOVE_SDK_ROOT $ENV{SENSEGLOVE_SDK_ROOT})
+if(NOT SENSEGLOVE_SDK_ROOT OR SENSEGLOVE_SDK_ROOT STREQUAL "")
+  set(SENSEGLOVE_SDK_ROOT "/home/songwoo/Desktop/work_dir/SenseGlove-API")
+endif()
+set(SENSEGLOVE_INCLUDE_DIR "${SENSEGLOVE_SDK_ROOT}/include")
+set(SENSEGLOVE_LIB_DIR $ENV{SENSEGLOVE_SDK_LIB_DIR})
+if(NOT SENSEGLOVE_LIB_DIR OR SENSEGLOVE_LIB_DIR STREQUAL "")
+  set(SENSEGLOVE_LIB_DIR "${SENSEGLOVE_SDK_ROOT}/lib/linux/v22/x86-64/release")
+endif()
+
+if(EXISTS "${SENSEGLOVE_INCLUDE_DIR}/SenseGlove/Core/HandLayer.hpp")
+  set(SENSEGLOVE_SDK_FOUND TRUE)
+  message(STATUS "SenseGlove SDK include found at ${SENSEGLOVE_INCLUDE_DIR}")
+else()
+  set(SENSEGLOVE_SDK_FOUND FALSE)
+  message(WARNING "SenseGlove SDK include directory not found (expected ${SENSEGLOVE_INCLUDE_DIR}). sense_glove_node target will be skipped.")
+endif()
+
+if(SENSEGLOVE_SDK_FOUND AND EXISTS "${SENSEGLOVE_LIB_DIR}/libsgcore.so" AND EXISTS "${SENSEGLOVE_LIB_DIR}/libsgconnect.so")
+  add_executable(sense_glove_node src/sense_glove_node.cpp)
+  target_compile_definitions(sense_glove_node PRIVATE HAVE_SENSEGLOVE_SDK)
+  target_include_directories(sense_glove_node PRIVATE ${SENSEGLOVE_INCLUDE_DIR})
+  target_link_directories(sense_glove_node PRIVATE ${SENSEGLOVE_LIB_DIR})
+  target_link_libraries(sense_glove_node sgcore sgconnect)
+  ament_target_dependencies(sense_glove_node rclcpp sensor_msgs std_msgs std_srvs)
+  if(NOT MSVC)
+    target_compile_options(sense_glove_node PRIVATE -g -O0 -fno-omit-frame-pointer)
+  endif()
+  set_target_properties(sense_glove_node PROPERTIES
+    BUILD_RPATH "${SENSEGLOVE_LIB_DIR}"
+    INSTALL_RPATH "${SENSEGLOVE_LIB_DIR}"
+  )
+  install(TARGETS sense_glove_node DESTINATION lib/${PROJECT_NAME})
+else()
+  if(SENSEGLOVE_SDK_FOUND)
+    message(WARNING "SenseGlove shared libraries not found under ${SENSEGLOVE_LIB_DIR}. sense_glove_node target will be skipped.")
+  endif()
+endif()
+
 # --- Python nodes ---
 
 ament_python_install_package(${PROJECT_NAME})
@@ -60,8 +101,8 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   hri_falcon_robot_bridge/force_sensor_node.py
   hri_falcon_robot_bridge/haptic_robot_controller.py
-  hri_falcon_robot_bridge/continuous_force_test_node.py
   hri_falcon_robot_bridge/hand_tracker_node.py
+  hri_falcon_robot_bridge/sense_glove_mj_node.py
   hri_falcon_robot_bridge/robot_controller_node.py
   hri_falcon_robot_bridge/ball_tracker_node.py
   hri_falcon_robot_bridge/emg_node.py
@@ -73,6 +114,13 @@ install(PROGRAMS
   hri_falcon_robot_bridge/hand_tracker_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME hand_tracker_node
+)
+
+# Optional: alias for sense_glove_mj_node without .py
+install(PROGRAMS
+  hri_falcon_robot_bridge/sense_glove_mj_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME sense_glove_mj_node
 )
 
 # Optional: alias for robot_controller_node without .py
