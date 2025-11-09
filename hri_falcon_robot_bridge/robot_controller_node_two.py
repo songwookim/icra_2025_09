@@ -2,35 +2,23 @@
 from __future__ import annotations
 
 """
-Robot Controller Node (unit passthrough).
+Robot Controller Node (units-only from hand_tracker) with optional CSV logging.
 
 - Subscribes: Int32MultiArray (9) on /hand_tracker/targets_units
 - Commands: Dynamixel via DynamixelControl if available and safe_mode=False; otherwise dry-run logs
 - Initial posture: fixed initial_val applied once at startup and used as baseline when disabled
 """
 
-DEFAULT_UNITS_TOPIC = '/hand_tracker/targets_units'
-DEFAULT_JOINT_ORDER = [
-    'thumb_cmc', 'thumb_mcp', 'thumb_ip',
-    'index_mcp', 'index_pip', 'index_dip',
-    'middle_mcp', 'middle_pip', 'middle_dip',
-]
-DEFAULT_UNITS_BASELINE = [
-    1000.0, 2000.0, 2000.0,
-    1000.0, 2000.0, 2000.0,
-    1000.0, 2000.0, 2000.0,
-]
-
-FALLBACK_INITIAL_POSITIONS = [1117, 1881, 1789, 1222, 1815, 1790, 1299, 1689, 1745]
-
-import math
 import os
 import sys
+import csv
+import datetime
+import pathlib
 from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32MultiArray, Bool
+from std_msgs.msg import Int32MultiArray
 
 try:
     from .dynamixel_control import DynamixelControl  # type: ignore
@@ -60,41 +48,33 @@ class RobotControllerNode(Node):
             rclpy.shutdown()
             sys.exit(1)
         cfg_dyn = getattr(self.config, 'dynamixel', None) if self.config is not None else None
-        default_ids = list(getattr(cfg_dyn, 'ids', [10, 11, 12, 20, 21, 22, 30, 31, 32]))
+        default_ids = list(getattr(cfg_dyn, 'ids', [11, 12, 21, 22, 31, 32]))
         default_mode = int(getattr(getattr(cfg_dyn, 'control_modes', {}), 'default_mode', 3))
-        initial_positions_cfg = list(getattr(cfg_dyn, 'initial_positions', [])) if cfg_dyn is not None else []
-        if initial_positions_cfg:
-            initial_val_default = [int(x) for x in initial_positions_cfg]
-        else:
-            initial_val_default = list(FALLBACK_INITIAL_POSITIONS)
 
         # 파라미터 선언
         self.declare_parameter('ids', default_ids)
         self.declare_parameter('mode', default_mode)
-        self.declare_parameter('units_baseline', list(DEFAULT_UNITS_BASELINE))
-        self.declare_parameter('clip_min', [])
-        self.declare_parameter('clip_max', [])
+        self.declare_parameter('scale', [1.0, 1.0, 1.0])
+        self.declare_parameter('offset', [1000, 1000, 1000])
+        self.declare_parameter('clip_min', [0, 0, 0])
+        self.declare_parameter('clip_max', [4095, 4095, 4095])
         self.declare_parameter('hand_joint_order', [
-            'thumb_cmc', 'thumb_mcp', 'thumb_ip',
-            'index_mcp', 'index_pip', 'index_dip',
-            'middle_mcp', 'middle_pip', 'middle_dip'
+            'thumb_cmc','thumb_mcp','thumb_ip',
+            'index_mcp','index_hpip','index_dip',
+            'middle_mcp','middle_pip','middle_dip'
         ])
-        self.declare_parameter('hand_units_topic', DEFAULT_UNITS_TOPIC)
-        self.declare_parameter('units_enabled_topic', '/hand_tracker/units_enabled')
+        self.declare_parameter('hand_units_topic', '/hand_tracker/targets_units')
         self.declare_parameter('max_step_units', 20.0)
         self.declare_parameter('safe_mode', True)
         # hand enable/disable parameters removed (always enabled)
+        self.declare_parameter('log_hand_csv_enable', True)
+        self.declare_parameter('log_hand_csv_path', '')
+        # initial_val_default = [1240, 2187, 2103, 1240, 2187, 2103, 1240, 2187, 2103]
+        initial_val_default = [1154, 2019, 1940, 1000, 1960, 1960, 1138, 2048, 1801]
         self.declare_parameter('initial_val', initial_val_default)
         
 
         # 유틸
-        def _ensure_list(val):
-            if isinstance(val, (list, tuple)):
-                return list(val)
-            if val is None:
-                return []
-            return [val]
-
         def _fit_len(arr, n: int, fill):
             arr = list(arr)
             if len(arr) < n:
@@ -102,42 +82,26 @@ class RobotControllerNode(Node):
             return arr[:n]
 
         # 파라미터 값 읽기
-        ids_param = _ensure_list(self.get_parameter('ids').value) or default_ids
-        self.ids = [int(x) for x in ids_param]
+        ids_val = self.get_parameter('ids').value or default_ids
+        self.ids = [int(x) for x in ids_val]
         self.mode = int(self.get_parameter('mode').value or default_mode)
-
-        joint_param = _ensure_list(self.get_parameter('hand_joint_order').value)
-        self.hand_joint_order = [str(x).lower() for x in (joint_param or DEFAULT_JOINT_ORDER)]
-        if len(self.hand_joint_order) != len(self.ids):
-            self.get_logger().warn(
-                f"joint/order mismatch ids={len(self.ids)} joints={len(self.hand_joint_order)} -> min len 사용"
-            )
-
-        init_param = _ensure_list(self.get_parameter('initial_val').value) or initial_val_default
-        init_fill = init_param[-1] if init_param else (initial_val_default[-1] if initial_val_default else 2000)
-        self.initial_val = [int(x) for x in _fit_len(init_param, len(self.ids), init_fill)]
-        self.base_positions = [float(v) for v in self.initial_val]
-
-        baseline_param = _ensure_list(self.get_parameter('units_baseline').value)
-        if not baseline_param:
-            baseline_param = list(DEFAULT_UNITS_BASELINE)
-        baseline_fill = baseline_param[-1]
-        self.units_baseline = [float(x) for x in _fit_len(baseline_param, len(self.hand_joint_order), baseline_fill)]
-
-        clip_min_param = _ensure_list(self.get_parameter('clip_min').value)
-        clip_max_param = _ensure_list(self.get_parameter('clip_max').value)
-        clip_min_source = clip_min_param if clip_min_param else [0]
-        clip_max_source = clip_max_param if clip_max_param else [4095]
-        clip_min_fill = clip_min_source[-1] if clip_min_source else 0
-        clip_max_fill = clip_max_source[-1] if clip_max_source else 4095
-        self.clip_min = [int(x) for x in _fit_len(clip_min_source, len(self.ids), clip_min_fill)]
-        self.clip_max = [int(x) for x in _fit_len(clip_max_source, len(self.ids), clip_max_fill)]
-
-        self.hand_units_topic = str(self.get_parameter('hand_units_topic').value or DEFAULT_UNITS_TOPIC)
-        self.units_enabled_topic = str(self.get_parameter('units_enabled_topic').value or '/hand_tracker/units_enabled')
+        self.scale = [float(x) for x in (self.get_parameter('scale').value or [1.0, 1.0, 1.0])]
+        offset_param = list(self.get_parameter('offset').value or [1000, 1000, 1000])
+        clip_min_param = list(self.get_parameter('clip_min').value or [0, 0, 0])
+        clip_max_param = list(self.get_parameter('clip_max').value or [4095, 4095, 4095])
+        self.offset = [float(x) for x in _fit_len(offset_param, len(self.ids), 1000.0)]
+        self.clip_min = [int(x) for x in _fit_len(clip_min_param, len(self.ids), 0)]
+        self.clip_max = [int(x) for x in _fit_len(clip_max_param, len(self.ids), 4095)]
+        self.hand_joint_order = [str(x).lower() for x in (self.get_parameter('hand_joint_order').value or [])]
+        self.hand_units_topic = str(self.get_parameter('hand_units_topic').value or '/hand_tracker/targets_units')
         self.max_step_units = float(self.get_parameter('max_step_units').value or 20.0)
         self.safe_mode = bool(self.get_parameter('safe_mode').value)
+        # hand enable/disable logic removed -> always enabled
         self.hand_enabled = True
+        self.log_hand_csv_enable = bool(self.get_parameter('log_hand_csv_enable').value)
+        self.log_hand_csv_path = str(self.get_parameter('log_hand_csv_path').value or '')
+        init_param = list(self.get_parameter('initial_val').value or [1240, 2187, 2103, 1240, 2187, 2103, 1240, 2187, 2103])
+        self.initial_val = [int(x) for x in _fit_len(init_param, len(self.ids), 2000)]
 
         # Backend 연결 (Dynamixel or Dry-run)
         self.controller = None
@@ -156,16 +120,38 @@ class RobotControllerNode(Node):
         self.get_logger().info(f"[SETUP] src=hand(units) test={self.safe_mode} ids={self.ids}")
 
         # 내부 상태 & CSV
-        # removed _filt_deg (was only used for disable behavior)
+    # removed _filt_deg (was only used for disable behavior)
         self._last_targets: Optional[List[int]] = None
+        self.base_positions = list(self.initial_val)
         # keyboard toggle removed
-        self._units_enabled_log_state: Optional[bool] = None
+        self._hand_csv_fp = None
+        self._hand_csv_writer = None
+        self._last_joint_debug = None
+        if self.log_hand_csv_enable:
+            try:
+                if not self.log_hand_csv_path:
+                    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                    self.log_hand_csv_path = str(pathlib.Path.cwd() / f"{ts}_handangles.csv")
+                p = pathlib.Path(self.log_hand_csv_path)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                need_header = (not p.exists()) or p.stat().st_size == 0
+                self._hand_csv_fp = open(p, 'a', newline='')
+                self._hand_csv_writer = csv.writer(self._hand_csv_fp)
+                if need_header:
+                    header = ['t_sec', 't_nanosec']
+                    for jn in self.hand_joint_order:
+                        header.append(f"{jn}_raw_deg")
+                        header.append(f"{jn}_target_units")
+                    self._hand_csv_writer.writerow(header)
+                self.get_logger().info(f"Hand CSV logging (wide) -> {p}")
+            except Exception as e:
+                self.get_logger().error(f"CSV 파일 열기 실패: {e}")
+                self.log_hand_csv_enable = False
 
         # 구독 설정
-        self.sub_units = self.create_subscription(Int32MultiArray, self.hand_units_topic, self.on_unit_targets, 10)
-        self.units_enabled_sub = self.create_subscription(Bool, self.units_enabled_topic, self.on_units_enabled, 10)
+        self.sub_units = self.create_subscription(Int32MultiArray, self.hand_units_topic, self.on_units_targets, 10)
         self.get_logger().info(f"Input source: {self.hand_units_topic} (units)")
-        self.get_logger().info(f"Enable source: {self.units_enabled_topic}")
+        # enable topic removed (always enabled)
 
         # 시작 시 초기 포즈로 세팅(한 번)
         try:
@@ -174,57 +160,57 @@ class RobotControllerNode(Node):
         except Exception as e:
             self.get_logger().warn(f"초기 포즈 적용 실패: {e}")
 
+    # keyboard toggle feature removed
+
     # ============================== Utils
     def _load_config(self) -> Optional['DictConfig']:  # type: ignore[name-defined]
         try:
             pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             cfg_path = os.path.join(pkg_dir, 'resource', 'robot_parameter', 'config.yaml')
-            if os.path.exists(cfg_path) and OmegaConf is not None:
+            if os.path.exists(cfg_path):
                 cfg = OmegaConf.load(cfg_path)
                 self.get_logger().debug(f"Loaded config.yaml ({cfg_path})")
                 return cfg
-            if not os.path.exists(cfg_path):
-                self.get_logger().error(f"Config 파일 없음: {cfg_path}")
-            elif OmegaConf is None:
-                self.get_logger().error("OmegaConf 미설치 -> config 사용 불가")
         except Exception as e:
             self.get_logger().warn(f"Config load 실패: {e}")
 
     # ============================== Hand Units (Int32MultiArray, 9 elems)
-    def on_unit_targets(self, msg: Int32MultiArray):
-        units_in = [int(x) for x in (msg.data or [])]
-        if not units_in and self._last_targets is None:
-            self.get_logger().info("No units yet -> apply initial posture once")
+    def on_units_targets(self, msg: Int32MultiArray):
+        data = list(msg.data or [])
+        data[0] = data[0] - 1000  # thumb_cmc offset 
+        data[3] = data[3] - 1000  # thumb_cmc offset 
+        # data[6] = data[6] - 1000  # thumb_cmc offset 
+        # 데이터가 아직 없고 첫 호출이면 초기 포즈 적용 후 종료
+        if not data and self._last_targets is None:
+            self.get_logger().info("No data yet -> apply initial posture once")
             self._send_targets(self.initial_val)
             return
-
+        # base는 설정된 초기 포즈 사용
         base = [float(v) for v in (self.base_positions or self.initial_val)]
-        n = len(self.ids)
-
-        if not self.hand_enabled:
-            if self._last_targets is None:
-                idle_targets = [self._clip_target(i, base[i]) for i in range(n)]
-                self._send_targets(idle_targets)
-            return
-
-        final_targets: List[int] = []
-        for i in range(n):
-            if i < len(units_in):
-                candidate = float(units_in[i])
-            else:
-                candidate = base[i]
-            final_targets.append(self._clip_target(i, candidate))
-
+        # decide commanded targets depending on enabled state
+        # build targets aligned to motor ids length (always enabled)
+        n = min(len(self.ids), len(data))
+        clipped = [self._clip_target(i, float(int(data[i]))) for i in range(n)]
+        for i in range(n, len(self.ids)):
+            clipped.append(self._clip_target(i, base[i]))
+        final_targets = clipped
+        # send to motors (or dry-run); step-limit is applied inside
         self._send_targets(final_targets)
-
-    def on_units_enabled(self, msg: Bool):
-        new_state = bool(msg.data)
-        if self._units_enabled_log_state is None or new_state != self._units_enabled_log_state:
-            status = 'ENABLED' if new_state else 'DISABLED'
-            self.get_logger().info(f"Qpos stream -> {status}")
-            self._units_enabled_log_state = new_state
-        if self.hand_enabled != new_state:
-            self.hand_enabled = new_state
+        # CSV logging: record final commanded target_units per joint order; raw_deg empty
+        if self.log_hand_csv_enable and self._hand_csv_writer:
+            try:
+                now = self.get_clock().now().to_msg()
+                row = [now.sec, now.nanosec]
+                sent = self._last_targets or []
+                for i, _ in enumerate(self.hand_joint_order):
+                    row.append('')  # raw_deg
+                    tu = sent[i] if i < len(sent) else ''
+                    row.append(int(tu) if tu != '' else '')
+                self._hand_csv_writer.writerow(row)
+                if self._hand_csv_fp:
+                    self._hand_csv_fp.flush()
+            except Exception as e:
+                self.get_logger().warn(f"CSV 로그 실패(units): {e}")
 
     # ============================== Utilities (send)
     def _clip_target(self, i: int, val: float) -> int:
@@ -275,6 +261,11 @@ def _run(node: RobotControllerNode):
     try:
         rclpy.spin(node)
     finally:
+        try:
+            if getattr(node, '_hand_csv_fp', None):
+                node._hand_csv_fp.close()  # type: ignore
+        except Exception:
+            pass
         node.destroy_node()
         rclpy.shutdown()
 

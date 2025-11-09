@@ -16,6 +16,12 @@ Pipeline:
   subscribes encoders/position → map → Dynamixel set_joint_positions(...)
 ```
 
+```
+cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer 
+sudo vi /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+   # change to 16 -> 1
+   
+```
 ## Build
 ```bash
 cd ~/humble_ws/src

@@ -42,3 +42,7 @@ dynamixel:
 
   current:
     max_current: 10 # 2047
+
+  initial_positions: [1117, 1881, 1789, 1222, 1815, 1790, 1299, 1689, 1745]
+
+    

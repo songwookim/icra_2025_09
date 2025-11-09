@@ -9,13 +9,10 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 #include <mutex>
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
-#include "std_msgs/msg/int32_multi_array.hpp"
-#include "std_msgs/msg/float64_multi_array.hpp"
 #include "std_srvs/srv/trigger.hpp"
 
 #ifdef HAVE_SENSEGLOVE_SDK
@@ -31,13 +28,10 @@ namespace
 constexpr std::size_t kFingerCount = 3;  // THUMB, INDEX, MIDDLE
 constexpr std::size_t kJointsPerFinger = 3;
 constexpr std::size_t kAxesPerSensor = 6;
-constexpr double kDegToRad = M_PI / 180.0;
-constexpr double kRadToDeg = 180.0 / M_PI;
-
 struct JointLimit
 {
-  double open_deg;
-  double closed_deg;
+  double open_rad;
+  double closed_rad;
 };
 
 constexpr std::array<const char *, kFingerCount> kFingerNames{"THUMB", "INDEX", "MIDDLE"};
@@ -48,17 +42,17 @@ constexpr std::array<std::array<const char *, kJointsPerFinger>, kFingerCount> k
 
 constexpr std::array<std::array<JointLimit, kJointsPerFinger>, kFingerCount> kJointLimits{{
   std::array<JointLimit, kJointsPerFinger>{
-    JointLimit{170.0, 230.0},
-    JointLimit{170.0, 240.0},
-    JointLimit{170.0, 250.0}},
+    JointLimit{0.0, 6.2831853071795862}, // 0~360도
+    JointLimit{2.9670597283903604, 4.1887902047863905}, // approx 170~240도
+    JointLimit{2.9670597283903604, 4.3633231299858238}},
   std::array<JointLimit, kJointsPerFinger>{
-    JointLimit{175.0, 240.0},
-    JointLimit{175.0, 250.0},
-    JointLimit{175.0, 255.0}},
+    JointLimit{3.0543261909901558, 4.1887902047863905},
+    JointLimit{3.0543261909901558, 4.3633231299858238},
+    JointLimit{3.0543261909901558, 4.4505895925855405}},
   std::array<JointLimit, kJointsPerFinger>{
-    JointLimit{175.0, 240.0},
-    JointLimit{175.0, 255.0},
-    JointLimit{175.0, 260.0}}
+    JointLimit{3.0543261909901558, 4.1887902047863905},
+    JointLimit{3.0543261909901558, 4.4505895925855405},
+    JointLimit{3.0543261909901558, 4.5378560551852573}}
 }};
 
 constexpr std::array<std::pair<const char *, const char *>, 9> kCommandOrder{{
@@ -76,16 +70,6 @@ constexpr std::array<std::pair<const char *, const char *>, 9> kCommandOrder{{
 inline double clamp(double value, double min_value, double max_value)
 {
   return std::max(min_value, std::min(max_value, value));
-}
-
-inline double deg_wrap(double angle_deg)
-{
-  double wrapped = std::fmod(angle_deg, 360.0);
-  if (wrapped < 0.0)
-  {
-    wrapped += 360.0;
-  }
-  return wrapped;
 }
 
 inline std::array<double, 3> cross_product(const std::array<double, 3> & a, const std::array<double, 3> & b)
@@ -138,12 +122,6 @@ public:
   SenseGloveNode()
   : Node("sense_glove_node"),
     publish_joint_state_(true),
-    units_publish_enabled_(true),
-    units_baseline_(2000.0),
-    units_per_rad_(4096.0 / (2.0 * M_PI)),
-    units_motion_scale_qpos_(1.0),
-    units_min_(0.0),
-    units_max_(4095.0),
     qpos_gain_(0.5),
     qpos_smooth_alpha_(0.5),
     qpos_step_max_(0.05),
@@ -192,22 +170,15 @@ public:
     declare_parameter("update_rate_hz", 50.0);
     declare_parameter("hand_side", std::string("right"));
     declare_parameter("publish_joint_state", true);
-    declare_parameter("units_publish_enabled", true);
     declare_parameter("joint_state_topic", std::string("/hand_tracker/joint_state"));
-    declare_parameter("units_topic", std::string("/hand_tracker/targets_units"));
-    declare_parameter("units_baseline", units_baseline_);
-    declare_parameter("units_per_rad", units_per_rad_);
-    declare_parameter("units_motion_scale_qpos", units_motion_scale_qpos_);
-    declare_parameter("units_min", units_min_);
-    declare_parameter("units_max", units_max_);
     declare_parameter("qpos_gain", qpos_gain_);
     declare_parameter("qpos_smooth_alpha", qpos_smooth_alpha_);
     declare_parameter("qpos_step_max", qpos_step_max_);
     declare_parameter("clamp_qpos_symm", clamp_qpos_symm_);
     declare_parameter("clamp_qpos_min", clamp_qpos_min_);
-  declare_parameter("clamp_qpos_max", clamp_qpos_max_);
-  declare_parameter<double>("pose_log_interval_sec", 1.0);
-  log_interval_sec_ = std::max(0.0, get_parameter("pose_log_interval_sec").as_double());
+    declare_parameter("clamp_qpos_max", clamp_qpos_max_);
+    declare_parameter<double>("pose_log_interval_sec", 1.0);
+    log_interval_sec_ = std::max(0.0, get_parameter("pose_log_interval_sec").as_double());
 
     const double raw_update_rate = get_parameter("update_rate_hz").as_double();
     update_rate_hz_ = raw_update_rate < 1.0 ? 1.0 : raw_update_rate;
@@ -218,14 +189,7 @@ public:
     use_right_hand_ = !(hand_side_lower == "left" || hand_side_lower == "l");
 
     publish_joint_state_ = get_parameter("publish_joint_state").as_bool();
-    units_publish_enabled_ = get_parameter("units_publish_enabled").as_bool();
     joint_state_topic_ = get_parameter("joint_state_topic").as_string();
-    units_topic_ = get_parameter("units_topic").as_string();
-    units_baseline_ = get_parameter("units_baseline").as_double();
-    units_per_rad_ = get_parameter("units_per_rad").as_double();
-    units_motion_scale_qpos_ = get_parameter("units_motion_scale_qpos").as_double();
-    units_min_ = get_parameter("units_min").as_double();
-    units_max_ = get_parameter("units_max").as_double();
     qpos_gain_ = get_parameter("qpos_gain").as_double();
     qpos_smooth_alpha_ = clamp(get_parameter("qpos_smooth_alpha").as_double(), 0.0, 1.0);
     qpos_step_max_ = std::max(0.0, get_parameter("qpos_step_max").as_double());
@@ -234,7 +198,6 @@ public:
     clamp_qpos_max_ = get_parameter("clamp_qpos_max").as_double();
 
     joint_pub_ = create_publisher<sensor_msgs::msg::JointState>(joint_state_topic_, 10);
-    units_pub_ = create_publisher<std_msgs::msg::Int32MultiArray>(units_topic_, 10);
     zero_srv_ = create_service<std_srvs::srv::Trigger>(
       "set_zero", std::bind(&SenseGloveNode::handle_zero_request, this, std::placeholders::_1,
       std::placeholders::_2));
@@ -314,10 +277,10 @@ private:
     }
 
     const auto angles = angles_opt.value();
+    process_command_stream(angles);
+
     if (!publish_joint_state_)
     {
-      // still compute qpos for downstream units output
-      process_command_stream(angles);
       return;
     }
 
@@ -330,37 +293,34 @@ private:
     {
       for (std::size_t j = 0; j < kJointsPerFinger; ++j)
       {
-        const double angle_deg = angles[f][j];
-        if (std::isnan(angle_deg))
+        const double qpos = latest_smoothed_qpos_[f][j];
+        if (!std::isfinite(qpos))
         {
           continue;
         }
         joint_msg.name.emplace_back(std::string(kFingerNames[f]) + "_" + kJointNames[f][j]);
-        joint_msg.position.emplace_back(angle_deg * kDegToRad);
+        joint_msg.position.emplace_back(qpos);
       }
     }
 
     joint_pub_->publish(joint_msg);
-    process_command_stream(angles);
   }
 
   void process_command_stream(const FingerJointMatrix & angles)
   {
     FingerJointMatrix smoothed_qpos = latest_smoothed_qpos_;
-    std::vector<int32_t> units_out;
-    units_out.reserve(kCommandOrder.size());
 
     for (const auto & entry : kCommandOrder)
     {
       const int f_idx = finger_index(entry.first);
       const int j_idx = f_idx >= 0 ? joint_index(static_cast<std::size_t>(f_idx), entry.second) : -1;
-      double raw_angle_deg = std::numeric_limits<double>::quiet_NaN();
+      double raw_angle_rad = std::numeric_limits<double>::quiet_NaN();
       if (f_idx >= 0 && j_idx >= 0)
       {
-        raw_angle_deg = angles[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
+        raw_angle_rad = angles[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
       }
 
-      double qpos = map_angle_to_qpos(f_idx, j_idx, raw_angle_deg);
+      double qpos = map_angle_to_qpos(f_idx, j_idx, raw_angle_rad);
       if (f_idx >= 0 && j_idx >= 0)
       {
         qpos -= zero_qpos_ref_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
@@ -383,14 +343,6 @@ private:
 
         prev_qpos_cmd_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)] = smoothed;
         smoothed_qpos[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)] = smoothed;
-
-        double units_value = units_baseline_ + smoothed * units_per_rad_ * units_motion_scale_qpos_;
-        units_value = clamp(units_value, units_min_, units_max_);
-        units_out.emplace_back(static_cast<int32_t>(std::lround(units_value)));
-      }
-      else
-      {
-        units_out.emplace_back(static_cast<int32_t>(units_baseline_));
       }
     }
 
@@ -416,8 +368,8 @@ private:
         {
           continue;
         }
-        const double angle_deg = angles[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
-        if (std::isnan(angle_deg))
+        const double angle_rad = angles[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
+        if (std::isnan(angle_rad))
         {
           continue;
         }
@@ -425,23 +377,16 @@ private:
         {
           oss << ", ";
         }
-        oss << entry.first << '_' << entry.second << '=' << std::fixed << std::setprecision(1) << angle_deg;
+        oss << entry.first << '_' << entry.second << '=' << std::fixed << std::setprecision(3) << angle_rad;
         any = true;
       }
       if (any)
       {
         system("clear"); // Linux / macOS
-        RCLCPP_INFO(get_logger(), "SenseGlove angles(deg): %s", oss.str().c_str());
+        RCLCPP_INFO(get_logger(), "SenseGlove angles(rad): %s", oss.str().c_str());
       }
       first_pose_logged_ = true;
       last_pose_log_time_ = now;
-    }
-
-    if (units_publish_enabled_)
-    {
-      std_msgs::msg::Int32MultiArray msg;
-      msg.data = units_out;
-      units_pub_->publish(msg);
     }
   }
 
@@ -485,7 +430,7 @@ private:
         {
           continue;
         }
-        result[f][j] = flex_rad * kRadToDeg;
+        result[f][j] = flex_rad;
         any_valid = true;
       }
     }
@@ -504,9 +449,9 @@ private:
       bool fallback_valid = false;
       for (const auto & row : fallback)
       {
-        for (double angle_deg : row)
+        for (double angle_rad : row)
         {
-          if (std::isfinite(angle_deg))
+          if (std::isfinite(angle_rad))
           {
             fallback_valid = true;
             break;
@@ -563,33 +508,33 @@ private:
       for (std::size_t j = 0; j < kJointsPerFinger; ++j)
       {
         const auto & limits = kJointLimits[f][j];
-        const double angle = limits.open_deg + flex_val * (limits.closed_deg - limits.open_deg);
-        result[f][j] = angle;
+        const double angle_rad = limits.open_rad + flex_val * (limits.closed_rad - limits.open_rad);
+        result[f][j] = angle_rad;
       }
     }
 
     return result;
   }
 
-  double map_angle_to_qpos(int finger_idx, int joint_idx, double raw_angle_deg) const
+  double map_angle_to_qpos(int finger_idx, int joint_idx, double raw_angle_rad) const
   {
-    if (finger_idx < 0 || joint_idx < 0 || std::isnan(raw_angle_deg))
+    if (finger_idx < 0 || joint_idx < 0 || std::isnan(raw_angle_rad))
     {
       return 0.0;
     }
 
-    double centered_deg = 0.0;
-    if (raw_angle_deg >= -180.0 && raw_angle_deg <= 180.0)
+    double centered_rad = raw_angle_rad;
+    if (raw_angle_rad > M_PI || raw_angle_rad < -M_PI)
     {
-      centered_deg = raw_angle_deg;
-    }
-    else
-    {
-      const double clamped = clamp(raw_angle_deg, 0.0, 360.0);
-      centered_deg = clamped - 180.0;
+      centered_rad = std::fmod(raw_angle_rad + M_PI, 2.0 * M_PI);
+      if (centered_rad < 0.0)
+      {
+        centered_rad += 2.0 * M_PI;
+      }
+      centered_rad -= M_PI;
     }
     const double direction = joint_orientation_[static_cast<std::size_t>(finger_idx)][static_cast<std::size_t>(joint_idx)];
-    double qpos = centered_deg * kDegToRad * direction * global_qpos_sign_;
+    double qpos = centered_rad * direction * global_qpos_sign_;
     qpos *= qpos_gain_;
     if (clamp_qpos_symm_)
     {
@@ -601,14 +546,7 @@ private:
   // Parameters & state
   double update_rate_hz_;
   bool publish_joint_state_;
-  bool units_publish_enabled_;
   std::string joint_state_topic_;
-  std::string units_topic_;
-  double units_baseline_;
-  double units_per_rad_;
-  double units_motion_scale_qpos_;
-  double units_min_;
-  double units_max_;
   double qpos_gain_;
   double qpos_smooth_alpha_;
   double qpos_step_max_;
@@ -652,7 +590,6 @@ private:
   FingerJointMatrix latest_smoothed_qpos_{};
 
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
-  rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr units_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr zero_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

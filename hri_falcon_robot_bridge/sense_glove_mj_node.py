@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""SenseGlove-to-MuJoCo bridge that consumes SenseGlove joint angles.
+"""SenseGlove-to-MuJoCo bridge that exports qpos-driven unit commands.
 
-This node subscribes to the joint angles published by the C++ SenseGlove node
-and maps them to qpos / unit commands for the downstream hardware interface or
-simulator. It mirrors the behaviour of the original hand_tracker_node.py but
-without any camera or MediaPipe dependencies.
+The node treats MuJoCo as the authoritative source of joint positions, polls
+the simulator for qpos updates, and converts them into Dynamixel unit targets
+while optionally mirroring the motion inside MuJoCo for visualization. The
+behaviour mirrors the original hand_tracker_node.py implementation but without
+any camera or MediaPipe dependencies.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import select
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import IO, Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import rclpy
-from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32MultiArray, String, Bool
@@ -30,6 +32,18 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     mj = None  # type: ignore[assignment]
     mj_viewer = None  # type: ignore[assignment]
+
+try:
+    import termios
+    import tty
+except Exception:  # pragma: no cover - platform-specific
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
+
+try:
+    from omegaconf import OmegaConf  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    OmegaConf = None  # type: ignore[assignment]
 
 FINGER_NAMES: Sequence[str] = ("THUMB", "INDEX", "MIDDLE")
 JOINT_NAMES = {
@@ -49,6 +63,52 @@ COMMAND_ORDER: Sequence[Tuple[str, str]] = (
     ("MIDDLE", "DIP"),
 )
 
+COMMAND_COUNT = len(COMMAND_ORDER)
+
+
+def _load_initial_units_from_config() -> Optional[List[float]]:
+    if OmegaConf is None:
+        return None
+    try:
+        pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cfg_path = os.path.join(pkg_dir, "resource", "robot_parameter", "config.yaml")
+    except Exception:
+        return None
+    if not os.path.exists(cfg_path):
+        return None
+    try:
+        cfg = OmegaConf.load(cfg_path)
+        cfg_data = OmegaConf.to_container(cfg, resolve=True)  # type: ignore[call-arg]
+    except Exception:
+        return None
+    if not isinstance(cfg_data, dict):
+        return None
+    dynamixel_cfg = cfg_data.get("dynamixel")
+    if not isinstance(dynamixel_cfg, dict):
+        return None
+    initial_vals = dynamixel_cfg.get("initial_positions")
+    if not isinstance(initial_vals, (list, tuple)):
+        return None
+    collected: List[float] = []
+    for value in initial_vals:
+        try:
+            collected.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return collected if collected else None
+
+
+_FALLBACK_UNITS_BASELINE: Sequence[float] = tuple(
+    1000.0 if idx % 3 == 0 else 2000.0 for idx in range(COMMAND_COUNT)
+)
+_CONFIG_UNITS_BASELINE = _load_initial_units_from_config()
+if _CONFIG_UNITS_BASELINE and len(_CONFIG_UNITS_BASELINE) >= COMMAND_COUNT:
+    DEFAULT_UNITS_BASELINE: Sequence[float] = tuple(
+        _CONFIG_UNITS_BASELINE[idx] for idx in range(COMMAND_COUNT)
+    )
+else:
+    DEFAULT_UNITS_BASELINE = _FALLBACK_UNITS_BASELINE
+
 # DClaw joint names used by the MuJoCo model
 DCLAW_JOINTS: Dict[str, Sequence[str]] = {
     "THUMB": ("THJ30", "THJ31", "THJ32"),
@@ -56,7 +116,8 @@ DCLAW_JOINTS: Dict[str, Sequence[str]] = {
     "MIDDLE": ("MFJ20", "MFJ21", "MFJ22"),
 }
 
-DEFAULT_MUJOCO_MODEL_PATH = "/home/songwoo/Desktop/work_dir/realsense_hand_retargetting/universal_robots_ur5e_with_dclaw/dclaw/dclaw3xh.xml"
+# DEFAULT_MUJOCO_MODEL_PATH = "/home/songwoo/Desktop/work_dir/realsense_hand_retargetting/universal_robots_ur5e_with_dclaw/dclaw/dclaw3xh.xml"
+DEFAULT_MUJOCO_MODEL_PATH = '/home/songwoo/git/ur_dclaw/dclaw_finger_description/urdf/dclaw_finger_mjcf_final.xml'
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
@@ -69,20 +130,21 @@ class SenseGloveMJNode(Node):
 
         # Topic configuration
         self.declare_parameter("joint_state_topic", "/hand_tracker/joint_state")
-        self.declare_parameter("republish_joint_state_topic", "/hand_tracker/joint_states")
         self.declare_parameter("units_topic", "/hand_tracker/targets_units")
         self.declare_parameter("key_topic", "/hand_tracker/key")
+        self.declare_parameter("units_state_topic", "/hand_tracker/units_enabled")
         self.declare_parameter("pose_log_interval_sec", 1.0)
         self.declare_parameter("pose_log_enabled", False)
         self.declare_parameter("log_clamp_events", True)
 
         # Unit / qpos mapping configuration (mirrors the C++ node defaults)
-        self.declare_parameter("units_publish_enabled", True)
-        self.declare_parameter("units_baseline", 2000.0)
+        self.declare_parameter("units_publish_enabled", False)
+        self.declare_parameter("units_baseline", list(DEFAULT_UNITS_BASELINE))
         self.declare_parameter("units_per_rad", 4096.0 / (2.0 * math.pi))
         self.declare_parameter("units_motion_scale_qpos", 1.0)
         self.declare_parameter("units_min", 0.0)
         self.declare_parameter("units_max", 4095.0)
+        self.declare_parameter("mujoco_qpos_poll_interval_sec", 0.01)
 
         self.declare_parameter("qpos_gain", 0.5)
         self.declare_parameter("qpos_smooth_alpha", 0.5)
@@ -91,11 +153,12 @@ class SenseGloveMJNode(Node):
         self.declare_parameter("clamp_qpos_min", -1.57)
         self.declare_parameter("clamp_qpos_max", 1.57)
         self.declare_parameter("global_qpos_sign", -1.0)
+        self.declare_parameter("units_output_sign", -1.0)
 
         # MuJoCo / EE pose configuration (optional)
         self.declare_parameter("run_mujoco", True)
         self.declare_parameter("mujoco_model_path", DEFAULT_MUJOCO_MODEL_PATH)
-        self.declare_parameter("ee_pose_publish_enabled", False)
+        self.declare_parameter("ee_pose_publish_enabled", True)
         self.declare_parameter("ee_pose_topic", "/ee_pose")
         self.declare_parameter("ee_pose_topic_mf", "/ee_pose_mf")
         self.declare_parameter("ee_pose_topic_th", "/ee_pose_th")
@@ -106,55 +169,65 @@ class SenseGloveMJNode(Node):
         self.declare_parameter("ee_pose_mj_site_th", "THtip")
         self.declare_parameter("terminal_status_interval_sec", 1.0)
 
-        self.joint_state_topic: str = self.get_parameter("joint_state_topic").value
-        self.republish_joint_state_topic: str = self.get_parameter("republish_joint_state_topic").value
-        self.units_topic: str = self.get_parameter("units_topic").value
-        self.key_topic: str = self.get_parameter("key_topic").value
-        self.pose_log_interval_sec: float = max(0.0, float(self.get_parameter("pose_log_interval_sec").value))
-        self.pose_log_enabled: bool = bool(self.get_parameter("pose_log_enabled").value)
-        self.log_clamp_events: bool = bool(self.get_parameter("log_clamp_events").value)
+        self.joint_state_topic = self.get_parameter("joint_state_topic").get_parameter_value().string_value
+        self.units_topic = self.get_parameter("units_topic").get_parameter_value().string_value
+        self.key_topic = self.get_parameter("key_topic").get_parameter_value().string_value
+        self.units_state_topic = self.get_parameter("units_state_topic").get_parameter_value().string_value
+        self.pose_log_interval_sec = max(0.0, self.get_parameter("pose_log_interval_sec").get_parameter_value().double_value)
+        self.pose_log_enabled = self.get_parameter("pose_log_enabled").get_parameter_value().bool_value
+        self.log_clamp_events = self.get_parameter("log_clamp_events").get_parameter_value().bool_value
 
-        self.units_publish_enabled: bool = bool(self.get_parameter("units_publish_enabled").value)
-        self.units_baseline: float = float(self.get_parameter("units_baseline").value)
-        self.units_per_rad: float = float(self.get_parameter("units_per_rad").value)
-        self.units_motion_scale_qpos: float = float(self.get_parameter("units_motion_scale_qpos").value)
-        self.units_min: float = float(self.get_parameter("units_min").value)
-        self.units_max: float = float(self.get_parameter("units_max").value)
+        self.units_publish_enabled = self.get_parameter("units_publish_enabled").get_parameter_value().bool_value
+        raw_units_baseline = self.get_parameter("units_baseline").value
+        self.units_baseline: List[float] = self._ensure_float_list(
+            raw_units_baseline,
+            COMMAND_COUNT,
+            DEFAULT_UNITS_BASELINE,
+        )
+        self.units_per_rad = self.get_parameter("units_per_rad").get_parameter_value().double_value
+        self.units_motion_scale_qpos = self.get_parameter("units_motion_scale_qpos").get_parameter_value().double_value
+        self.units_min = self.get_parameter("units_min").get_parameter_value().double_value
+        self.units_max = self.get_parameter("units_max").get_parameter_value().double_value
+        self.units_output_sign = self.get_parameter("units_output_sign").get_parameter_value().double_value
+        poll_interval_param = self.get_parameter("mujoco_qpos_poll_interval_sec").get_parameter_value().double_value
+        if poll_interval_param <= 0.0:
+            poll_interval_param = 0.01
+        self.mujoco_qpos_poll_interval_sec = poll_interval_param
 
-        self.qpos_gain: float = float(self.get_parameter("qpos_gain").value)
-        self.qpos_smooth_alpha: float = clamp(float(self.get_parameter("qpos_smooth_alpha").value), 0.0, 1.0)
-        self.qpos_step_max: float = max(0.0, float(self.get_parameter("qpos_step_max").value))
-        self.clamp_qpos_symm: bool = bool(self.get_parameter("clamp_qpos_symm").value)
-        self.clamp_qpos_min: float = float(self.get_parameter("clamp_qpos_min").value)
-        self.clamp_qpos_max: float = float(self.get_parameter("clamp_qpos_max").value)
-        self.global_qpos_sign: float = float(self.get_parameter("global_qpos_sign").value)
+        self.qpos_gain = self.get_parameter("qpos_gain").get_parameter_value().double_value
+        self.qpos_smooth_alpha = clamp(self.get_parameter("qpos_smooth_alpha").get_parameter_value().double_value, 0.0, 1.0)
+        self.qpos_step_max = max(0.0, self.get_parameter("qpos_step_max").get_parameter_value().double_value)
+        self.clamp_qpos_symm = self.get_parameter("clamp_qpos_symm").get_parameter_value().bool_value
+        self.clamp_qpos_min = self.get_parameter("clamp_qpos_min").get_parameter_value().double_value
+        self.clamp_qpos_max = self.get_parameter("clamp_qpos_max").get_parameter_value().double_value
+        self.global_qpos_sign = self.get_parameter("global_qpos_sign").get_parameter_value().double_value
 
-        self.run_mujoco: bool = bool(self.get_parameter("run_mujoco").value)
-        self.mujoco_model_path: str = str(self.get_parameter("mujoco_model_path").value)
+        self.run_mujoco = self.get_parameter("run_mujoco").get_parameter_value().bool_value
+        self.mujoco_model_path = self.get_parameter("mujoco_model_path").get_parameter_value().string_value
         if not self.mujoco_model_path:
             self.mujoco_model_path = DEFAULT_MUJOCO_MODEL_PATH
-        self.ee_pose_publish_enabled: bool = bool(self.get_parameter("ee_pose_publish_enabled").value)
-        self.ee_pose_topic: str = str(self.get_parameter("ee_pose_topic").value)
-        self.ee_pose_topic_mf: str = str(self.get_parameter("ee_pose_topic_mf").value)
-        self.ee_pose_topic_th: str = str(self.get_parameter("ee_pose_topic_th").value)
-        self.ee_pose_frame_id: str = str(self.get_parameter("ee_pose_frame_id").value)
-        self.ee_pose_source: str = str(self.get_parameter("ee_pose_source").value).lower().strip()
-        self.ee_pose_mj_site: str = str(self.get_parameter("ee_pose_mj_site").value)
-        self.ee_pose_mj_body: str = str(self.get_parameter("ee_pose_mj_body").value)
-        self.ee_pose_mj_site_th: str = str(self.get_parameter("ee_pose_mj_site_th").value)
-        self.terminal_status_interval_sec: float = max(0.0, float(self.get_parameter("terminal_status_interval_sec").value))
+        self.ee_pose_publish_enabled = self.get_parameter("ee_pose_publish_enabled").get_parameter_value().bool_value
+        self.ee_pose_topic = self.get_parameter("ee_pose_topic").get_parameter_value().string_value
+        self.ee_pose_topic_mf = self.get_parameter("ee_pose_topic_mf").get_parameter_value().string_value
+        self.ee_pose_topic_th = self.get_parameter("ee_pose_topic_th").get_parameter_value().string_value
+        self.ee_pose_frame_id = self.get_parameter("ee_pose_frame_id").get_parameter_value().string_value
+        self.ee_pose_source = self.get_parameter("ee_pose_source").get_parameter_value().string_value.lower().strip()
+        self.ee_pose_mj_site = self.get_parameter("ee_pose_mj_site").get_parameter_value().string_value
+        self.ee_pose_mj_body = self.get_parameter("ee_pose_mj_body").get_parameter_value().string_value
+        self.ee_pose_mj_site_th = self.get_parameter("ee_pose_mj_site_th").get_parameter_value().string_value
+        self.terminal_status_interval_sec = max(0.0, self.get_parameter("terminal_status_interval_sec").get_parameter_value().double_value)
 
         # Internal state
         # Per-finger orientation overrides (mirrors hand_tracker defaults)
-        self.declare_parameter("joint_orientation_thumb", [1., 1., 1.])
-        self.declare_parameter("joint_orientation_index", [1., 1., 1.])
-        self.declare_parameter("joint_orientation_middle", [1., 1., 1.])
+        self.declare_parameter("joint_orientation_thumb", [-1., -1., -1.])
+        self.declare_parameter("joint_orientation_index", [-1., -1., -1.])
+        self.declare_parameter("joint_orientation_middle", [-1., -1., -1.])
 
         self._finger_index = {name: idx for idx, name in enumerate(FINGER_NAMES)}
         self._joint_orientation: List[List[float]] = [
-            self._load_orientation_param("joint_orientation_thumb", (1., 1., 1.)),
-            self._load_orientation_param("joint_orientation_index", (1., 1., 1.)),
-            self._load_orientation_param("joint_orientation_middle", (1., 1., 1.)),
+            self._load_orientation_param("joint_orientation_thumb", (-1., -1., -1.)),
+            self._load_orientation_param("joint_orientation_index", (-1., -1., -1.)),
+            self._load_orientation_param("joint_orientation_middle", (-1., -1., -1.)),
         ]
         self._thumb_sign_patterns: List[List[float]] = [
             [1.0, 1.0, 1.0],
@@ -166,30 +239,30 @@ class SenseGloveMJNode(Node):
             [-1.0, 1.0, -1.0],
             [1.0, -1.0, -1.0],
         ]
+        baseline_zero_qpos = self._build_zero_qpos_from_units(self.units_baseline)
+        self._mujoco_qpos_poll_timer = None
+        self._mj_poll_warned = False
         self._thumb_pattern_idx = 0
         self._viz_thumb_complement = False
-        self._zero_qpos_ref: List[List[float]] = [[0.0] * 3 for _ in FINGER_NAMES]
+        self._initial_zero_qpos_ref: List[List[float]] = [row[:] for row in baseline_zero_qpos]
+        self._zero_qpos_ref: List[List[float]] = [row[:] for row in baseline_zero_qpos]
         self._prev_qpos_cmd: List[List[float]] = [[0.0] * 3 for _ in FINGER_NAMES]
         self._latest_smoothed_qpos: List[List[float]] = [[0.0] * 3 for _ in FINGER_NAMES]
-        self._latest_raw_qpos: List[List[float]] = [[0.0] * 3 for _ in FINGER_NAMES]
+        self._latest_raw_qpos: List[List[float]] = [row[:] for row in self._zero_qpos_ref]
         self._latest_qpos_valid: bool = False
         self._latest_raw_valid: bool = False
         self._first_pose_logged: bool = False
-        self._last_pose_log_time: Optional[rclpy.time.Time] = None
+        self._last_pose_log_time: Optional[Time] = None
         self._clamp_notified: List[List[bool]] = [[False] * 3 for _ in FINGER_NAMES]
         self._logger_active: Optional[bool] = None
-        self._time_start: Optional[Tuple[int, int]] = None
         self._last_ee_pose: Optional[Tuple[float, float, float]] = None
-        self._latest_angles_deg: List[List[float]] = [[math.nan] * 3 for _ in FINGER_NAMES]
-        self._last_status_overlay: Optional[Tuple[str, str]] = None
+        self._latest_input_qpos: List[List[float]] = [[math.nan] * 3 for _ in FINGER_NAMES]
+        self._latest_glove_positions: List[List[float]] = [[math.nan] * 3 for _ in FINGER_NAMES]
 
         # ROS entities
         self.units_pub = self.create_publisher(Int32MultiArray, self.units_topic, 10)
         self.key_pub = self.create_publisher(String, self.key_topic, 10)
-        self.joint_state_sub = self.create_subscription(JointState, self.joint_state_topic, self._on_joint_state, 10)
-        self.joint_state_repub = None
-        if self.republish_joint_state_topic:
-            self.joint_state_repub = self.create_publisher(JointState, self.republish_joint_state_topic, 10)
+        self.units_state_pub = self.create_publisher(Bool, self.units_state_topic, 10)
 
         self.ee_pose_pub = None
         self.ee_pose_pub_mf = None
@@ -202,7 +275,17 @@ class SenseGloveMJNode(Node):
             self.ee_pose_pub_th = self.create_publisher(PoseStamped, self.ee_pose_topic_th, 10)
 
         self.zero_srv = self.create_service(Trigger, "set_zero", self._handle_zero_request)
-        self.get_logger().info("SenseGlove MJ bridge ready (waiting for joint states)...")
+        self.get_logger().info("SenseGlove MJ bridge ready...")
+
+        self.joint_state_sub = None
+
+        zero_segments = []
+        for finger_name, joint_name in COMMAND_ORDER:
+            f_idx = self._finger_index[finger_name]
+            j_idx = JOINT_NAMES[finger_name].index(joint_name)
+            zero_segments.append(f"{finger_name}_{joint_name}={self._zero_qpos_ref[f_idx][j_idx]:.3f}rad")
+        if zero_segments:
+            self.get_logger().info("[Zero] baseline qpos (rad) loaded from config -> " + ", ".join(zero_segments))
 
         try:
             self.create_subscription(Bool, "/data_logger/logging_active", self._on_logger_state, 10)
@@ -226,31 +309,235 @@ class SenseGloveMJNode(Node):
         self.enable_terminal_input: bool = bool(self.get_parameter("enable_terminal_input").value)
         self._terminal_stop_event = threading.Event()
         self._terminal_thread: Optional[threading.Thread] = None
-        if self.enable_terminal_input and sys.stdin.isatty():
-            self._terminal_thread = threading.Thread(target=self._terminal_input_loop, name="sg_mj_terminal", daemon=True)
-            self._terminal_thread.start()
-        elif not sys.stdin.isatty():
-            self.get_logger().warn("STDIN이 TTY가 아니라 터미널 키 입력을 사용할 수 없습니다. 필요시 ros2 run 명령을 직접 실행해 주세요.")
+        self._terminal_fd: Optional[int] = None
+        self._terminal_old_attrs: Optional[List[Any]] = None
+        self._terminal_stream: Optional[IO[str]] = None
+        if self.enable_terminal_input:
+            if self._setup_terminal_reader():
+                self._terminal_thread = threading.Thread(target=self._terminal_input_loop, name="sg_mj_terminal", daemon=True)
+                self._terminal_thread.start()
+            else:
+                self.get_logger().warn("터미널 키 입력 초기화 실패 -> 키 입력 비활성화")
 
         self._init_mujoco()
+        self._apply_initial_mujoco_pose()
+        self._configure_qpos_source()
         self._log_key_shortcuts()
+        self._publish_units_state(initial=True)
+        self._publish_baseline_units(initial=True)
 
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
     def _log_key_shortcuts(self) -> None:
         shortcuts = [
-            "h: toggle units publish",
-            "s: toggle data logger",
-            "c: capture zero reference",
-            "t: cycle thumb orientation",
-            "r: toggle thumb complement visual",
-            "o: flip index/middle orientation",
-            "x: flip global qpos sign",
-            "g: cycle qpos gain",
-            "j: print current qpos",
+            "\nh: toggle units publish\n",
+            "s: toggle data logger\n",
+            "c: capture zero reference\n",
+            "t: cycle thumb orientatioe\n",
+            "r: toggle thumb complement visuae\n",
+            "o: flip index/middle orientatioe\n",
+            "x: flip global qpos sige\n",
+            "g: cycle qpos gaie\n",
+            "j: print current qpoe\n",
         ]
         self.get_logger().info("[Keys] " + " | ".join(shortcuts))
+
+    def _ensure_float_list(self, raw: Any, length: int, default: Sequence[float]) -> List[float]:
+        default_list = list(default)
+        values: List[float] = []
+        if isinstance(raw, (list, tuple)):
+            for element in raw:
+                try:
+                    values.append(float(element))
+                except (TypeError, ValueError):
+                    continue
+        elif isinstance(raw, (int, float)):
+            values = [float(raw)]
+
+        if not values:
+            values = [float(val) for val in default_list[:length]]
+
+        if len(values) < length:
+            fill_val = values[-1] if values else float(default_list[-1])
+            values.extend([fill_val] * (length - len(values)))
+
+        return values[:length]
+
+    def _publish_units_state(self, initial: bool = False) -> None:
+        if self.units_state_pub is None:
+            return
+        try:
+            msg = Bool()
+            msg.data = bool(self.units_publish_enabled)
+            self.units_state_pub.publish(msg)
+            if not initial:
+                state = "ON" if msg.data else "OFF"
+                self.get_logger().info(f"[Units] state broadcast -> {state}")
+                if msg.data:
+                    self._publish_baseline_units()
+        except Exception:
+            pass
+
+    def _publish_baseline_units(self, initial: bool = False) -> None:
+        if not self.units_publish_enabled:
+            return
+        if self.units_pub is None:
+            return
+        try:
+            msg = Int32MultiArray()
+            msg.data = [int(round(val)) for val in self.units_baseline]
+            self.units_pub.publish(msg)
+            if initial:
+                self.get_logger().info("[Units] published baseline posture from config")
+        except Exception:
+            pass
+
+    def _build_zero_qpos_from_units(self, units_values: Sequence[float]) -> List[List[float]]:
+        zero_qpos = [[0.0] * 3 for _ in FINGER_NAMES]
+        if not units_values:
+            return zero_qpos
+
+        denom = self.units_per_rad * self.units_motion_scale_qpos
+        if not math.isfinite(denom) or abs(denom) < 1e-9:
+            fallback = self.units_per_rad if math.isfinite(self.units_per_rad) and abs(self.units_per_rad) >= 1e-9 else 1.0
+            denom = fallback
+
+        for cmd_idx, (finger_name, joint_name) in enumerate(COMMAND_ORDER):
+            if cmd_idx >= len(units_values):
+                units_val = float(units_values[-1])
+            else:
+                units_val = float(units_values[cmd_idx])
+            rad_val = units_val / denom
+            f_idx = self._finger_index[finger_name]
+            j_idx = JOINT_NAMES[finger_name].index(joint_name)
+            zero_qpos[f_idx][j_idx] = rad_val
+        return zero_qpos
+
+    def _apply_initial_mujoco_pose(self) -> None:
+        if not self._mj_enabled or self._mj_model is None or self._mj_data is None:
+            return
+
+        any_written = False
+        for finger_name, joint_names in DCLAW_JOINTS.items():
+            f_idx = self._finger_index.get(finger_name)
+            if f_idx is None:
+                continue
+            for j_idx, mj_joint in enumerate(joint_names):
+                adr = self._mj_qpos_adr.get(mj_joint)
+                if adr is None:
+                    continue
+                try:
+                    value = float(self._zero_qpos_ref[f_idx][j_idx])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if adr in [0,3,6]:
+                    value -= 1.57
+                else :
+                    value -= 3.14
+                self._mj_data.qpos[adr] = value
+                any_written = True
+
+        if not any_written:
+            return
+
+        try:
+            mj.mj_forward(self._mj_model, self._mj_data)  # type: ignore[attr-defined]
+        except Exception as exc:
+            if not self._mj_forward_warned:
+                self._mj_forward_warned = True
+                self.get_logger().warn(f"[MuJoCo] forward failed after baseline apply: {exc}")
+            return
+
+        if self._mj_viewer is not None:
+            try:
+                if self._mj_viewer.is_running():  # type: ignore[attr-defined]
+                    self._mj_viewer.sync()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        self.get_logger().info("[MuJoCo] qpos set to baseline zero reference from config")
+
+    def _configure_qpos_source(self) -> None:
+        def _start_mujoco_poll() -> None:
+            if not self._mj_enabled or self._mj_data is None:
+                self.get_logger().error("MuJoCo initialization failed; qpos polling cannot start.")
+                return
+            if self._mujoco_qpos_poll_timer is not None:
+                return
+            interval = max(0.001, self.mujoco_qpos_poll_interval_sec)
+            self._mujoco_qpos_poll_timer = self.create_timer(interval, self._poll_mujoco_qpos)
+            self.get_logger().info(f"[MuJoCo] qpos polling enabled (period={interval:.3f}s)")
+
+        if self.joint_state_topic:
+            try:
+                if self.joint_state_sub is None:
+                    self.joint_state_sub = self.create_subscription(
+                        JointState,
+                        self.joint_state_topic,
+                        self._on_joint_state,
+                        10,
+                    )
+                    self.get_logger().info(
+                        f"[SenseGlove] joint state subscription attached -> {self.joint_state_topic}"
+                    )
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Failed to subscribe joint state topic '{self.joint_state_topic}': {exc}. Falling back to MuJoCo polling."
+                )
+                _start_mujoco_poll()
+                return
+
+            if self._mujoco_qpos_poll_timer is not None:
+                try:
+                    self._mujoco_qpos_poll_timer.cancel()
+                except Exception:
+                    pass
+                self._mujoco_qpos_poll_timer = None
+
+            if self._mj_enabled and self.run_mujoco:
+                self.get_logger().info("[MuJoCo] joint states will drive the simulation mirror.")
+            return
+
+        _start_mujoco_poll()
+
+    def _poll_mujoco_qpos(self) -> None:
+        if not self._mj_enabled or self._mj_data is None:
+            return
+
+        qpos_buffer = getattr(self._mj_data, "qpos", None)
+        if qpos_buffer is None:
+            if not self._mj_poll_warned:
+                self._mj_poll_warned = True
+                self.get_logger().warn("[MuJoCo] qpos buffer unavailable; skipping poll.")
+            return
+
+        qpos_values: List[List[float]] = [[math.nan] * 3 for _ in FINGER_NAMES]
+        any_valid = False
+        for finger_name, joint_names in DCLAW_JOINTS.items():
+            f_idx = self._finger_index.get(finger_name)
+            if f_idx is None:
+                continue
+            for j_idx, mj_joint in enumerate(joint_names):
+                adr = self._mj_qpos_adr.get(mj_joint)
+                if adr is None:
+                    continue
+                try:
+                    value = float(qpos_buffer[adr])
+                except Exception:
+                    continue
+                if not math.isfinite(value):
+                    continue
+                qpos_values[f_idx][j_idx] = value
+                any_valid = True
+
+        if any_valid:
+            if self._mj_poll_warned:
+                self._mj_poll_warned = False
+            self._process_qpos(qpos_values)
+        elif not self._mj_poll_warned:
+            self._mj_poll_warned = True
+            self.get_logger().warn("[MuJoCo] qpos polling yielded no valid joint values.")
 
     def _load_orientation_param(self, param_name: str, fallback: Sequence[float]) -> List[float]:
         try:
@@ -285,18 +572,15 @@ class SenseGloveMJNode(Node):
                 self._clamp_notified[finger_idx][joint_idx] = False
 
         return (
-            tuple(self._joint_orientation[index_idx]),
-            tuple(self._joint_orientation[middle_idx]),
+            cast(Tuple[float, float, float], tuple(self._joint_orientation[index_idx])),
+            cast(Tuple[float, float, float], tuple(self._joint_orientation[middle_idx])),
         )
 
     # ------------------------------------------------------------------
     # ROS callbacks
     # ------------------------------------------------------------------
     def _on_joint_state(self, msg: JointState) -> None:
-        if self.joint_state_repub is not None:
-            self.joint_state_repub.publish(msg)
-
-        angles_deg = [[math.nan] * 3 for _ in FINGER_NAMES]
+        incoming_qpos = [[math.nan] * 3 for _ in FINGER_NAMES]
 
         for name, position in zip(msg.name, msg.position):
             parts = name.split("_", 1)
@@ -310,9 +594,16 @@ class SenseGloveMJNode(Node):
                 continue
             f_idx = self._finger_index[finger]
             j_idx = joint_list.index(joint)
-            angles_deg[f_idx][j_idx] = math.degrees(position)
+            baseline = 0.0
+            try:
+                baseline = float(self._zero_qpos_ref[f_idx][j_idx])
+            except (IndexError, TypeError, ValueError):
+                baseline = 0.0
+            glove_val = float(position)
+            self._latest_glove_positions[f_idx][j_idx] = glove_val
+            incoming_qpos[f_idx][j_idx] = -glove_val + baseline
 
-        self._process_angles(angles_deg)
+        self._process_qpos(incoming_qpos)
 
     def _handle_zero_request(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         if not self._capture_zero_reference():
@@ -327,31 +618,34 @@ class SenseGloveMJNode(Node):
     # ------------------------------------------------------------------
     # Processing helpers
     # ------------------------------------------------------------------
-    def _process_angles(self, angles_deg: List[List[float]]) -> None:
-        self._latest_angles_deg = [row[:] for row in angles_deg]
+    def _process_qpos(self, qpos_values: List[List[float]]) -> None:
+        self._latest_input_qpos = [row[:] for row in qpos_values]
         smoothed_qpos = [row[:] for row in self._latest_smoothed_qpos]
         raw_qpos = [row[:] for row in self._latest_raw_qpos]
         units_out: List[int] = []
         any_valid = False
         raw_all_valid = True
 
-        for finger_name, joint_name in COMMAND_ORDER:
+        for cmd_idx, (finger_name, joint_name) in enumerate(COMMAND_ORDER):
+            baseline_units = self.units_baseline[cmd_idx]
             f_idx = self._finger_index[finger_name]
             j_idx = JOINT_NAMES[finger_name].index(joint_name)
-            angle_deg = angles_deg[f_idx][j_idx]
-            mapped_qpos = self._map_angle_to_qpos(f_idx, j_idx, angle_deg)
+            mapped_qpos = qpos_values[f_idx][j_idx]
 
-            if math.isnan(angle_deg):
+            if math.isnan(mapped_qpos):
                 raw_all_valid = False
-                units_out.append(int(round(self.units_baseline)))
+                units_out.append(int(round(baseline_units)))
                 continue
 
             any_valid = True
             raw_qpos[f_idx][j_idx] = mapped_qpos
-            qpos = mapped_qpos - self._zero_qpos_ref[f_idx][j_idx]
+            delta = mapped_qpos - self._zero_qpos_ref[f_idx][j_idx]
+            direction = self._joint_orientation[f_idx][j_idx]
+            signed_qpos = delta * direction * self.global_qpos_sign
+            command_qpos = signed_qpos * self.qpos_gain
 
             previous = self._prev_qpos_cmd[f_idx][j_idx]
-            smoothed = (1.0 - self.qpos_smooth_alpha) * previous + self.qpos_smooth_alpha * qpos
+            smoothed = (1.0 - self.qpos_smooth_alpha) * previous + self.qpos_smooth_alpha * command_qpos
             delta = smoothed - previous
             if delta > self.qpos_step_max:
                 smoothed = previous + self.qpos_step_max
@@ -371,19 +665,22 @@ class SenseGloveMJNode(Node):
             ):
                 self._clamp_notified[f_idx][j_idx] = True
                 self.get_logger().warn(
-                    "[Clamp] %s_%s saturated at %.3f rad (raw=%.3f rad). "
-                    "Adjust clamp_qpos_min/max or qpos_gain if this is unintended.",
-                    finger_name,
-                    joint_name,
-                    smoothed,
-                    qpos,
+                    f"[Clamp] {finger_name}_{joint_name} saturated at {smoothed:.3f} rad (raw={command_qpos:.3f} rad). "
+                    "Adjust clamp_qpos_min/max or qpos_gain if this is unintended."
                 )
 
             self._prev_qpos_cmd[f_idx][j_idx] = smoothed
             smoothed_qpos[f_idx][j_idx] = smoothed
 
-            units_val = self.units_baseline + smoothed * self.units_per_rad * self.units_motion_scale_qpos
-            units_val = clamp(units_val, self.units_min, self.units_max)
+            raw_angle = raw_qpos[f_idx][j_idx]
+            offset = 1.57 if cmd_idx in (0, 3, 6) else 3.14
+            adjusted = raw_angle - offset
+            units_calc = adjusted * self.units_per_rad * self.units_motion_scale_qpos
+            if not math.isfinite(units_calc):
+                units_calc = 0.0
+            units_calc = clamp(units_calc, -4096.0, 4096.0)
+            bias = 1000.0 if cmd_idx in (0, 3, 6) else 2000.0
+            units_val = clamp(units_calc + bias, self.units_min, self.units_max)
             units_out.append(int(round(units_val)))
 
         if any_valid:
@@ -391,47 +688,17 @@ class SenseGloveMJNode(Node):
             self._latest_raw_valid = raw_all_valid
             self._latest_smoothed_qpos = smoothed_qpos
             self._latest_qpos_valid = True
-            self._maybe_log_pose(angles_deg)
+            if self.run_mujoco:
+                self._apply_to_mujoco(raw_qpos)
+            self._maybe_log_qpos(smoothed_qpos)
             if self.units_publish_enabled:
                 msg = Int32MultiArray()
                 msg.data = units_out
                 self.units_pub.publish(msg)
-            if self._mj_enabled:
-                self._apply_to_mujoco(smoothed_qpos)
         else:
             self._latest_qpos_valid = False
             self._latest_raw_valid = False
-
-        self._update_status_overlay()
-
-    def _map_angle_to_qpos(self, f_idx: int, j_idx: int, angle_deg: float) -> float:
-        direction = self._joint_orientation[f_idx][j_idx]
-        return self._map_angle_with_direction(f_idx, j_idx, angle_deg, direction)
-
-    def _map_angle_with_direction(
-        self,
-        f_idx: int,
-        j_idx: int,
-        angle_deg: float,
-        direction: float,
-        apply_clamp: bool = True,
-    ) -> float:
-        if math.isnan(angle_deg):
-            return 0.0
-
-        if -180.0 <= angle_deg <= 180.0:
-            centered_deg = angle_deg
-        else:
-            centered_deg = clamp(angle_deg, 0.0, 360.0) - 180.0
-
-        qpos = math.radians(centered_deg) * direction * self.global_qpos_sign
-        qpos *= self.qpos_gain
-
-        if apply_clamp and self.clamp_qpos_symm:
-            qpos = clamp(qpos, self.clamp_qpos_min, self.clamp_qpos_max)
-        return qpos
-
-    def _maybe_log_pose(self, angles_deg: List[List[float]]) -> None:
+    def _maybe_log_qpos(self, qpos_values: List[List[float]]) -> None:
         if not self.pose_log_enabled:
             return
 
@@ -442,7 +709,10 @@ class SenseGloveMJNode(Node):
             should_log = True
         elif self.pose_log_interval_sec > 0.0 and self._last_pose_log_time is not None:
             elapsed = now - self._last_pose_log_time
-            if elapsed >= Duration(seconds=self.pose_log_interval_sec):
+            threshold_ns = int(self.pose_log_interval_sec * 1e9)
+            if threshold_ns <= 0:
+                threshold_ns = 0
+            if elapsed.nanoseconds() >= threshold_ns:
                 should_log = True
 
         if not should_log:
@@ -452,54 +722,92 @@ class SenseGloveMJNode(Node):
         for finger_name, joint_name in COMMAND_ORDER:
             f_idx = self._finger_index[finger_name]
             j_idx = JOINT_NAMES[finger_name].index(joint_name)
-            angle_deg = angles_deg[f_idx][j_idx]
-            if math.isnan(angle_deg):
+            qpos = qpos_values[f_idx][j_idx]
+            if math.isnan(qpos):
                 continue
-            entries.append(f"{finger_name}_{joint_name}={angle_deg:.1f}")
+            entries.append(f"{finger_name}_{joint_name}={qpos:.3f}")
 
         if entries:
-            self.get_logger().info("SenseGlove angles(deg): " + ", ".join(entries))
+            self.get_logger().info("SenseGlove qpos(rad): " + ", ".join(entries))
             self._first_pose_logged = True
             self._last_pose_log_time = now
-
-    def _update_status_overlay(self, force: bool = False) -> None:
-        if mj_viewer is None or self._mj_viewer is None:
-            self._last_status_overlay = None
-            return
-
-        units_state = "ON" if self.units_publish_enabled else "OFF"
-        if self._logger_active is None:
-            log_state = "WAIT"
-        else:
-            log_state = "ON" if self._logger_active else "OFF"
-
-        line1 = f"Units (h): {units_state}"
-        line2 = f"Logger (s): {log_state}"
-
-        try:
-            self._mj_viewer.add_overlay(mj_viewer.Overlay.GridTopLeft, line1, line2)  # type: ignore[attr-defined]
-            self._last_status_overlay = (line1, line2)
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------
     # Key handling helpers
     # ------------------------------------------------------------------
+    def _setup_terminal_reader(self) -> bool:
+        if termios is None or tty is None:
+            return False
+
+        fd: Optional[int] = None
+        stream: Optional[IO[str]] = None
+        opened_stream = False
+
+        try:
+            if sys.stdin.isatty():
+                stream = sys.stdin
+                fd = sys.stdin.fileno()
+            else:
+                stream = open("/dev/tty")
+                opened_stream = True
+                fd = stream.fileno()
+        except Exception as exc:
+            if opened_stream and stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            self.get_logger().warn(f"TTY 열기 실패: {exc}")
+            return False
+
+        if fd is None or stream is None:
+            if opened_stream and stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            return False
+
+        try:
+            old_attrs = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception as exc:
+            if opened_stream:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            self.get_logger().warn(f"TTY cbreak 설정 실패: {exc}")
+            return False
+
+        self._terminal_fd = fd
+        self._terminal_old_attrs = list(old_attrs)
+        self._terminal_stream = stream
+        return True
+
     def _terminal_input_loop(self) -> None:
         prefix = "[Term/Key]"
+        fd = self._terminal_fd
+        stream = self._terminal_stream
+        if fd is None or stream is None:
+            return
         while not self._terminal_stop_event.is_set():
             try:
-                ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+                ready, _, _ = select.select([fd], [], [], 0.25)
             except Exception:
                 break
             if not ready:
                 continue
             try:
-                ch = sys.stdin.read(1)
+                data = os.read(fd, 1)
             except Exception:
                 break
-            if not ch:
+            if not data:
                 break
+            try:
+                ch = data.decode(errors="ignore")
+            except Exception:
+                continue
             if ch in ("\n", "\r"):
                 continue
             if ch == "\x03":  # Ctrl-C
@@ -527,14 +835,13 @@ class SenseGloveMJNode(Node):
             self.get_logger().info(f"{prefix} complement (thumb) -> {self._viz_thumb_complement}")
         elif key == "s":
             publish = True
-            self._update_status_overlay(force=True)
             self.get_logger().info(f"{prefix} [Logger] toggle request")
         elif key == "h":
             publish = True
             self.units_publish_enabled = not self.units_publish_enabled
             state = "ON" if self.units_publish_enabled else "OFF"
-            self._update_status_overlay(force=True)
             self.get_logger().info(f"{prefix} [Units] publish -> {state}")
+            self._publish_units_state()
         elif key == "c":
             publish = True
             if self._capture_zero_reference():
@@ -597,11 +904,12 @@ class SenseGloveMJNode(Node):
         for joint_idx in range(3):
             self._clamp_notified[thumb_idx][joint_idx] = False
 
-        thumb_angles = self._latest_angles_deg[thumb_idx]
+        thumb_qpos = self._latest_smoothed_qpos[thumb_idx]
         angle_segments: List[str] = []
-        for joint_name, angle in zip(JOINT_NAMES["THUMB"], thumb_angles):
-            if math.isfinite(angle):
-                angle_segments.append(f"{joint_name}={angle:+.1f}deg")
+        for joint_idx, joint_name in enumerate(JOINT_NAMES["THUMB"]):
+            value = thumb_qpos[joint_idx]
+            if math.isfinite(value):
+                angle_segments.append(f"{joint_name}={value:+.3f}rad")
             else:
                 angle_segments.append(f"{joint_name}=--")
         angle_info = ", ".join(angle_segments)
@@ -653,7 +961,6 @@ class SenseGloveMJNode(Node):
                     key_callback=None,
                 )  # type: ignore[attr-defined]
                 self.get_logger().info("[MuJoCo] viewer started")
-                self.get_logger().info("[MuJoCo] 키 입력은 터미널에서만 처리됩니다 (viewer key callback 미사용)")
             except Exception as exc:
                 self._mj_viewer = None
                 self.get_logger().warn(f"[MuJoCo] viewer start failed, continuing headless: {exc}")
@@ -678,8 +985,6 @@ class SenseGloveMJNode(Node):
             except Exception as exc:
                 self.get_logger().warn(f"[EE] MuJoCo identifiers lookup failed: {exc}")
 
-        self._update_status_overlay(force=True)
-
     def _apply_to_mujoco(self, smoothed_qpos: List[List[float]]) -> None:
         if not self._mj_enabled or self._mj_model is None or self._mj_data is None:
             return
@@ -698,7 +1003,14 @@ class SenseGloveMJNode(Node):
                     val = smoothed_qpos[f_idx][j_idx]
                 except IndexError:
                     continue
-                self._mj_data.qpos[adr] = float(val)
+                if not math.isfinite(val):
+                    continue
+                applied = float(val)
+                if adr in [0, 3, 6]:
+                    applied -= 1.57
+                else:
+                    applied -= 3.14
+                self._mj_data.qpos[adr] = applied
 
         try:
             mj.mj_forward(self._mj_model, self._mj_data)  # type: ignore[attr-defined]
@@ -718,19 +1030,24 @@ class SenseGloveMJNode(Node):
         if self.ee_pose_publish_enabled and self.ee_pose_source == "mujoco":
             self._publish_ee_pose()
 
-        self._update_status_overlay()
-
     def _capture_zero_reference(self) -> bool:
-        if not self._latest_qpos_valid:
-            return False
-
         updated_any = False
+        missing: List[str] = []
         for finger_idx in range(len(FINGER_NAMES)):
             for joint_idx in range(3):
-                value = self._latest_raw_qpos[finger_idx][joint_idx]
-                if not math.isfinite(value):
+                try:
+                    initial_val = self._initial_zero_qpos_ref[finger_idx][joint_idx]
+                except IndexError:
+                    initial_val = 0.0
+                glove_val = self._latest_glove_positions[finger_idx][joint_idx]
+                if not math.isfinite(glove_val):
+                    finger_name = FINGER_NAMES[finger_idx]
+                    joint_name = JOINT_NAMES[finger_name][joint_idx]
+                    missing.append(f"{finger_name}_{joint_name}")
                     continue
-                self._zero_qpos_ref[finger_idx][joint_idx] = value
+                new_zero = initial_val + glove_val
+                self._zero_qpos_ref[finger_idx][joint_idx] = new_zero
+                self._latest_raw_qpos[finger_idx][joint_idx] = new_zero
                 self._prev_qpos_cmd[finger_idx][joint_idx] = 0.0
                 self._latest_smoothed_qpos[finger_idx][joint_idx] = 0.0
                 self._clamp_notified[finger_idx][joint_idx] = False
@@ -738,18 +1055,11 @@ class SenseGloveMJNode(Node):
 
         if not updated_any:
             return False
-
-        missing = []
-        for finger_idx, finger_name in enumerate(FINGER_NAMES):
-            for joint_idx, joint_name in enumerate(JOINT_NAMES[finger_name]):
-                if not math.isfinite(self._latest_raw_qpos[finger_idx][joint_idx]):
-                    missing.append(f"{finger_name}_{joint_name}")
         if missing:
             detail = ", ".join(missing)
             self.get_logger().warn(
-                f"[Zero] 일부 관절 값이 유효하지 않아 이전 값을 유지합니다: {detail}"
+                f"[Zero] 일부 관절의 SenseGlove 측정값이 없어 기존 값을 유지합니다: {detail}"
             )
-
         return True
 
     def _log_current_qpos(self) -> None:
@@ -766,7 +1076,6 @@ class SenseGloveMJNode(Node):
             lines.append(f"{finger_name}: " + ", ".join(segments))
         if lines:
             self.get_logger().info("[QPOS]\n" + "\n".join(lines))
-
     def _publish_ee_pose(self) -> None:
         if self._mj_data is None:
             return
@@ -834,21 +1143,22 @@ class SenseGloveMJNode(Node):
             active = bool(msg.data)
         except Exception:
             active = False
+        previous = self._logger_active
         self._logger_active = active
-        if active:
-            try:
-                now_msg = self.get_clock().now().to_msg()
-                self._time_start = (int(now_msg.sec), int(now_msg.nanosec))
-            except Exception:
-                self._time_start = None
-        else:
-            self._time_start = None
-        self._update_status_overlay(force=True)
+        if previous is None or previous != active:
+            state = "ON" if active else "OFF"
+            self.get_logger().info(f"[Logger] state -> {state}")
 
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
     def destroy_node(self) -> None:
+        if self._mujoco_qpos_poll_timer is not None:
+            try:
+                self._mujoco_qpos_poll_timer.cancel()
+            except Exception:
+                pass
+            self._mujoco_qpos_poll_timer = None
         if self._terminal_thread is not None:
             self._terminal_stop_event.set()
             try:
@@ -857,6 +1167,19 @@ class SenseGloveMJNode(Node):
             except Exception:
                 pass
             self._terminal_thread = None
+        if self._terminal_fd is not None and self._terminal_old_attrs is not None and termios is not None:
+            try:
+                termios.tcsetattr(self._terminal_fd, termios.TCSADRAIN, self._terminal_old_attrs)
+            except Exception:
+                pass
+        if self._terminal_stream is not None and self._terminal_stream is not sys.stdin:
+            try:
+                self._terminal_stream.close()
+            except Exception:
+                pass
+        self._terminal_fd = None
+        self._terminal_old_attrs = None
+        self._terminal_stream = None
         if self._mj_viewer is not None:
             try:
                 self._mj_viewer.close()  # type: ignore[attr-defined]
