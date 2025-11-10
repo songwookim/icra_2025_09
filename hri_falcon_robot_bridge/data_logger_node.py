@@ -255,10 +255,11 @@ class DataLoggerNode(Node):
             pass
 
     def _resolve_default_csv_dir(self) -> Path:
+        # 기본 CSV 디렉터리를 패키지 하위 outputs/logs/YYYYMMDD로 설정
+        # __file__ = <pkg_dir>/hri_falcon_robot_bridge/data_logger_node.py
         pkg_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        workspace_dir = (pkg_dir / '..' / '..').resolve()
         date_dir = datetime.datetime.now().strftime('%Y%m%d')
-        return workspace_dir / 'outputs' / 'logs' / date_dir
+        return pkg_dir / 'outputs' / 'logs' / date_dir
 
     def _init_csv(self) -> None:
         try:
@@ -326,43 +327,37 @@ class DataLoggerNode(Node):
             self._csv_writer = None
             self._current_csv_path = None
 
-    # =============== Callbacks
+    # =============== Callbacks (타임스탬프 없이 값만 저장, 기록 시점에 타임스탬프 생성)
     def _on_force(self, idx: int, msg: Any) -> None:
         try:
             w = getattr(msg, 'wrench', None)
-            hdr = getattr(msg, 'header', None)
-            stamp = getattr(hdr, 'stamp', None)
             self._force[idx] = (
                 float(getattr(getattr(w, 'force', None), 'x', 0.0)),
                 float(getattr(getattr(w, 'force', None), 'y', 0.0)),
                 float(getattr(getattr(w, 'force', None), 'z', 0.0)),
                 float(getattr(getattr(w, 'torque', None), 'x', 0.0)),
                 float(getattr(getattr(w, 'torque', None), 'y', 0.0)),
-                float(getattr(getattr(w, 'torque', None), 'z', 0.0)),
-                int(getattr(stamp, 'sec', 0)), int(getattr(stamp, 'nanosec', 0))
+                float(getattr(getattr(w, 'torque', None), 'z', 0.0))
             )
         except Exception:
             pass
 
     def _on_deform_circ(self, msg: Float32) -> None:
         try:
-            now_msg = self.get_clock().now().to_msg()
-            self._deform_circ = (float(msg.data), int(now_msg.sec), int(now_msg.nanosec))
+            self._deform_circ = float(msg.data)
         except Exception:
             pass
 
     def _on_deform_ecc(self, msg: Float32) -> None:
         try:
-            now_msg = self.get_clock().now().to_msg()
-            self._deform_ecc = (float(msg.data), int(now_msg.sec), int(now_msg.nanosec))
+            self._deform_ecc = float(msg.data)
         except Exception:
             pass
 
     def _on_emg(self, msg: Float32MultiArray) -> None:
         try:
             data = [float(x) for x in list(msg.data)[:8]]
-            now_msg = self.get_clock().now().to_msg()
-            self._emg = (data, int(now_msg.sec), int(now_msg.nanosec))
+            self._emg = data
             self._emg_recv_count += 1
             # Debug: Log first and every 50th EMG packet to verify delivery
             if self._emg_recv_count == 1 or (self._emg_recv_count % 50 == 0):
@@ -377,10 +372,7 @@ class DataLoggerNode(Node):
     def _on_ee_pose(self, msg: PoseStamped) -> None:
         try:
             p = msg.pose.position
-            self._ee = (
-                float(p.x), float(p.y), float(p.z),
-                int(msg.header.stamp.sec), int(msg.header.stamp.nanosec)
-            )
+            self._ee = (float(p.x), float(p.y), float(p.z))
             self._ee_recv_count += 1
         except Exception:
             pass
@@ -388,30 +380,21 @@ class DataLoggerNode(Node):
     def _on_ee_pose_mf(self, msg: PoseStamped) -> None:
         try:
             p = msg.pose.position
-            self._ee_mf = (
-                float(p.x), float(p.y), float(p.z),
-                int(msg.header.stamp.sec), int(msg.header.stamp.nanosec)
-            )
+            self._ee_mf = (float(p.x), float(p.y), float(p.z))
         except Exception:
             pass
 
     def _on_ee_pose_th(self, msg: PoseStamped) -> None:
         try:
             p = msg.pose.position
-            self._ee_th = (
-                float(p.x), float(p.y), float(p.z),
-                int(msg.header.stamp.sec), int(msg.header.stamp.nanosec)
-            )
+            self._ee_th = (float(p.x), float(p.y), float(p.z))
         except Exception:
             pass
 
     def _on_ee_odom(self, msg: Odometry) -> None:
         try:
             p = msg.pose.pose.position
-            self._ee = (
-                float(p.x), float(p.y), float(p.z),
-                int(msg.header.stamp.sec), int(msg.header.stamp.nanosec)
-            )
+            self._ee = (float(p.x), float(p.y), float(p.z))
             self._ee_recv_count += 1
         except Exception:
             pass
@@ -458,46 +441,46 @@ class DataLoggerNode(Node):
                 self.get_logger().debug(f'EMG recv count={self._emg_recv_count}, last_written={self._emg_last_written_count}')
         except Exception:
             pass
-        # Force sensors s1..s3
+        # Force sensors s1..s3 (타임스탬프는 현재 시각 사용)
         for i in range(3):
             f = self._force[i]
             if f is None:
                 # 6 values + 2 stamps = 8 columns
                 row += ['','','','','','','','']
             else:
-                fx,fy,fz,tx,ty,tz,ss,sn = f
-                row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}", f"{tx:.6f}", f"{ty:.6f}", f"{tz:.6f}", str(ss), str(sn)]
-        # EE pose (position only)
+                fx,fy,fz,tx,ty,tz = f
+                row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}", f"{tx:.6f}", f"{ty:.6f}", f"{tz:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
+        # EE pose (position only, 타임스탬프는 현재 시각)
         if self._ee is None:
             row += ['','','','','']
         else:
-            px,py,pz,ss,sn = self._ee
-            row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}", str(ss), str(sn)]
-        # EE pose (MF)
+            px,py,pz = self._ee
+            row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
+        # EE pose (MF, 타임스탬프는 현재 시각)
         if self._ee_mf is None:
             row += ['','','','','']
         else:
-            px,py,pz,ss,sn = self._ee_mf
-            row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}", str(ss), str(sn)]
-        # EE pose (TH)
+            px,py,pz = self._ee_mf
+            row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
+        # EE pose (TH, 타임스탬프는 현재 시각)
         if self._ee_th is None:
             row += ['','','','','']
         else:
-            px,py,pz,ss,sn = self._ee_th
-            row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}", str(ss), str(sn)]
-        # Deform circ
+            px,py,pz = self._ee_th
+            row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
+        # Deform circ (타임스탬프는 현재 시각)
         if self._deform_circ is None:
             row += ['','','']
         else:
-            circ, ss, sn = self._deform_circ
-            row += [f"{circ:.6f}", str(ss), str(sn)]
-        # Deform ecc
+            circ = self._deform_circ
+            row += [f"{circ:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
+        # Deform ecc (타임스탬프는 현재 시각)
         if self._deform_ecc is None:
             row += ['','','']
         else:
-            ecc, ss, sn = self._deform_ecc
-            row += [f"{ecc:.6f}", str(ss), str(sn)]
-        # EMG (저장 간격 적용: emg_log_every_n)
+            ecc = self._deform_ecc
+            row += [f"{ecc:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
+        # EMG (저장 간격 적용: emg_log_every_n, 타임스탬프는 현재 시각)
         self._emg_log_counter += 1
         if (self._emg_log_counter % self.emg_log_every_n) != 0:
             # 이번 행에서는 EMG 생략
@@ -511,9 +494,9 @@ class DataLoggerNode(Node):
                 if (self.emg_write_mode == 'blank') and (not updated):
                     row += ['']*8 + ['','']
                 else:
-                    vals, ss, sn = self._emg
+                    vals = self._emg
                     vals = (vals + [0.0]*8)[:8]
-                    row += [f"{v:.6f}" for v in vals] + [str(ss), str(sn)]
+                    row += [f"{v:.6f}" for v in vals] + [str(now_msg.sec), str(now_msg.nanosec)]
                     self._emg_last_written_count = self._emg_recv_count
         try:
             self._csv_writer.writerow(row)

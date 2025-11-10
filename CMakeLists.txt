@@ -144,8 +144,13 @@ install(PROGRAMS
   RENAME emg_node
 )
 
-# --- Launch ---
-install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}/)
+# --- Launch (optional) ---
+# launch 디렉터리가 삭제되었을 경우 설치 단계에서 에러가 발생하지 않도록 조건부 처리
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
+  install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}/)
+else()
+  message(STATUS "[${PROJECT_NAME}] launch 디렉터리 없음: 설치 단계에서 생략")
+endif()
 
 # --- Resource files ---
 install(DIRECTORY resource/ DESTINATION share/${PROJECT_NAME}/)
