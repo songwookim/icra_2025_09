@@ -9,7 +9,6 @@ from omegaconf import DictConfig
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import WrenchStamped
-from std_msgs.msg import Float64MultiArray, MultiArrayDimension
 import numpy as np
 # Optional dependencies
 try:
@@ -34,9 +33,6 @@ class ForceSensorNode(Node):
             self.get_logger().error("설정 로드 실패 -> 종료")
             rclpy.shutdown()
             sys.exit(1)
-
-        # Publishers
-        self.pub_array = self.create_publisher(Float64MultiArray, '/force_sensor/wrench_array', 10)
 
         # Parameters
         self.declare_parameter('publish_rate_hz', 1000.0)
@@ -145,16 +141,8 @@ class ForceSensorNode(Node):
     def on_timer(self) -> None:
         self.i += 1
         values = self.read_force()
-        # Publish combined array: shape (num_sensors, 6), row-major flatten
-        arr_msg = Float64MultiArray()
-        d0 = MultiArrayDimension(label='sensor', size=len(values), stride=6)
-        d1 = MultiArrayDimension(label='axis', size=6, stride=1)
-        arr_msg.layout.dim = [d0, d1]
-        arr_msg.data = [float(x) for row in values for x in row]
-        self.pub_array.publish(arr_msg)
-        self.get_logger().info(f'sensor data : {arr_msg.data}')
 
-    # 각 센서 별 토픽 퍼블리시
+        # 각 센서 별 토픽 퍼블리시
         now = self.get_clock().now().to_msg()
         for idx, row in enumerate(values):
             if idx >= len(self.pub_sensors):
@@ -170,6 +158,10 @@ class ForceSensorNode(Node):
             msg.wrench.torque.y = float(ty)
             msg.wrench.torque.z = float(tz)
             self.pub_sensors[idx].publish(msg)
+
+        if self.i % 200 == 0:
+            flat = [f"{val:.2f}" for row in values for val in row[:3]]
+            self.get_logger().info(f'sensor forces : {flat}')
 
     def _load_config(self) -> Optional[Any]:
         try:
