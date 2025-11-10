@@ -9,6 +9,7 @@ from omegaconf import DictConfig
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import WrenchStamped
+from std_msgs.msg import String, Bool
 import numpy as np
 # Optional dependencies
 try:
@@ -64,7 +65,15 @@ class ForceSensorNode(Node):
             for idx in range(self.num_sensors)
         ]
 
-    # State
+        # Calibration state publishers
+        self._calib_state_pub = self.create_publisher(Bool, '/force_sensor/calibration_mode', 10)
+        
+        try:
+            self.create_subscription(String, '/hand_tracker/key', self._on_key, 10)
+            self.get_logger().info("Subscribed /hand_tracker/key for calibration trigger (press 'f')")
+        except Exception as e:
+            self.get_logger().warn(f"Key subscribe 실패: {e}")
+        # State
         self.i = 0
         self.last_values_list = [
             (0.0, 0.0, 0.0, 0.0, 0.0, 0.0) for _ in range(self.num_sensors)
@@ -72,6 +81,16 @@ class ForceSensorNode(Node):
 
         # Timer
         self.timer = self.create_timer(1.0 / self.rate, self.on_timer)
+        try:
+            self._calib_state_pub.publish(Bool(data=False))
+        except Exception:
+            pass
+
+    def _on_key(self, msg: String) -> None:
+        if str(msg.data).lower() == 'f':
+            # 컨트롤러에 캘리브레이션 모드 설정
+            if self.controller is not None:
+                setattr(self.controller, 'calibration_mode', True)
 
     def read_force(self) -> List[Tuple[float, float, float, float, float, float]]:
         # Returns list of (fx, fy, fz, tx, ty, tz) length == num_sensors
@@ -141,6 +160,9 @@ class ForceSensorNode(Node):
     def on_timer(self) -> None:
         self.i += 1
         values = self.read_force()
+        if self.controller.calibration_mode :
+            pass
+        self._calib_state_pub.publish(Bool(data=getattr(self.controller, 'calibration_mode', False)))
 
         # 각 센서 별 토픽 퍼블리시
         now = self.get_clock().now().to_msg()
@@ -158,10 +180,6 @@ class ForceSensorNode(Node):
             msg.wrench.torque.y = float(ty)
             msg.wrench.torque.z = float(tz)
             self.pub_sensors[idx].publish(msg)
-
-        if self.i % 200 == 0:
-            flat = [f"{val:.2f}" for row in values for val in row[:3]]
-            self.get_logger().info(f'sensor forces : {flat}')
 
     def _load_config(self) -> Optional[Any]:
         try:
@@ -185,8 +203,8 @@ class ForceSensorNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Config load 실패: {e}")
             quit(1)
-    
-            
+
+
 
 def main() -> None:
     rclpy.init()

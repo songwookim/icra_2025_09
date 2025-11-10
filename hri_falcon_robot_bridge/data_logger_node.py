@@ -6,7 +6,7 @@ Multi-topic synchronized CSV logger node.
 - Force sensors: `/force_sensor/s{1..3}/wrench` (geometry_msgs/WrenchStamped)
 - EMG: `/emg/raw` (std_msgs/Float32MultiArray)
 - Deformity metrics: `/deformity_tracker/circularity` & `/deformity_tracker/eccentricity` (std_msgs/Float32)
-- End-effector pose: geometry_msgs/PoseStamped (ee_pose_topic) 또는 nav_msgs/Odometry (ee_pose_odometry_topic) 구독 지원 (optional)
+- End-effector pose: geometry_msgs/PoseStamped (ee_pose_topic_if) 또는 nav_msgs/Odometry (ee_pose_odometry_topic) 구독 지원 (optional)
 
 Control:
 - Subscribes to `/hand_tracker/key` (std_msgs/String). When message data == 's', toggles logging:
@@ -18,7 +18,7 @@ Control:
 Parameters:
 - `rate_hz` (float, default 100.0): logging frequency
 - `csv_dir` (string, default <workspace>/outputs/logs/YYYYMMDD)
-- `ee_pose_topic` (string, optional): geometry_msgs/PoseStamped topic
+- `ee_pose_topic_if` (string, optional): geometry_msgs/PoseStamped topic
 - `ee_pose_odometry_topic` (string, optional): nav_msgs/Odometry topic (pose.pose를 사용)
 - `start_immediately` (bool, default True): begin logging upon node start
  - `emg_log_every_n` (int, default 1): EMG 컬럼을 N번째 행마다 한 번만 기록 (1이면 매 행 기록)
@@ -54,7 +54,7 @@ class DataLoggerNode(Node):
         # Parameters
         self.declare_parameter('rate_hz', 200.0)
         self.declare_parameter('csv_dir', '')
-        self.declare_parameter('ee_pose_topic', '/ee_pose')
+        self.declare_parameter('ee_pose_topic_if', '/ee_pose_if')
         # 추가: 양손가락 EE 토픽 (MF/TH) 병행 구독 지원
         self.declare_parameter('ee_pose_topic_mf', '/ee_pose_mf')
         self.declare_parameter('ee_pose_topic_th', '/ee_pose_th')
@@ -73,7 +73,7 @@ class DataLoggerNode(Node):
 
         self.rate_hz = float(self.get_parameter('rate_hz').get_parameter_value().double_value)
         self.csv_dir_param = str(self.get_parameter('csv_dir').get_parameter_value().string_value)
-        self.ee_pose_topic = str(self.get_parameter('ee_pose_topic').get_parameter_value().string_value)
+        self.ee_pose_topic_if = str(self.get_parameter('ee_pose_topic_if').get_parameter_value().string_value)
         self.ee_pose_topic_mf = str(self.get_parameter('ee_pose_topic_mf').get_parameter_value().string_value)
         self.ee_pose_topic_th = str(self.get_parameter('ee_pose_topic_th').get_parameter_value().string_value)
         self.ee_pose_odom_topic = str(self.get_parameter('ee_pose_odometry_topic').get_parameter_value().string_value)
@@ -108,17 +108,17 @@ class DataLoggerNode(Node):
         except Exception:
             pass
 
-        # State holders (latest)
-        self._force: List[Optional[Tuple[float,float,float,float,float,float,int,int]]] = [None, None, None]
-        self._deform_circ: Optional[Tuple[float,int,int]] = None
-        self._deform_ecc: Optional[Tuple[float,int,int]] = None
-        self._emg: Optional[Tuple[List[float],int,int]] = None
+        # State holders (latest) - 타임스탬프는 기록 시점에 생성하므로 값만 저장
+        self._force: List[Optional[Tuple[float,float,float,float,float,float]]] = [None, None, None]
+        self._deform_circ: Optional[float] = None
+        self._deform_ecc: Optional[float] = None
+        self._emg: Optional[List[float]] = None
         self._emg_recv_count: int = 0
         self._emg_warned: bool = False
         self._emg_last_written_count: int = 0
-        self._ee: Optional[Tuple[float,float,float,int,int]] = None
-        self._ee_mf: Optional[Tuple[float,float,float,int,int]] = None
-        self._ee_th: Optional[Tuple[float,float,float,int,int]] = None
+        self._ee: Optional[Tuple[float,float,float]] = None
+        self._ee_mf: Optional[Tuple[float,float,float]] = None
+        self._ee_th: Optional[Tuple[float,float,float]] = None
         self._ee_recv_count: int = 0
         self._ee_warned: bool = False
         # EMG 저장 주기 카운터
@@ -128,8 +128,14 @@ class DataLoggerNode(Node):
         self._logging_active = self.start_immediately
         self._flush_counter = 0
 
-        # Publisher: logging active state
+        # Publisher: logging active state + human-readable status + current file path
         self._state_pub = self.create_publisher(Bool, '/data_logger/logging_active', 10)
+        self._status_pub = self.create_publisher(String, '/data_logger/status', 10)
+        self._file_pub = self.create_publisher(String, '/data_logger/current_file', 10)
+
+        # Track current and last CSV file path (for user feedback)
+        self._current_csv_path: Optional[str] = None
+        self._last_closed_csv_path: Optional[str] = None
 
         # Subscriptions: force sensors 2..3 (s1은 저장하지 않음)
         self._force_topics = (
@@ -152,10 +158,10 @@ class DataLoggerNode(Node):
             self.get_logger().warn(f"EMG subscribe 실패({self.emg_topic}): {e}")
 
         # Optional EE pose topic(s)
-        if self.ee_pose_topic:
+        if self.ee_pose_topic_if:
             try:
-                self.create_subscription(PoseStamped, self.ee_pose_topic, self._on_ee_pose, 20)
-                self.get_logger().info(f"EE Pose 구독(PoseStamped): {self.ee_pose_topic}")
+                self.create_subscription(PoseStamped, self.ee_pose_topic_if, self._on_ee_pose, 20)
+                self.get_logger().info(f"EE Pose 구독(PoseStamped): {self.ee_pose_topic_if}")
             except Exception as e:
                 self.get_logger().warn(f"EE pose topic(PoseStamped) subscribe 실패: {e}")
         if self.ee_pose_topic_mf:
@@ -197,6 +203,14 @@ class DataLoggerNode(Node):
             self._state_pub.publish(Bool(data=self._logging_active))
         except Exception:
             pass
+        # Also publish initial status line
+        try:
+            state_txt = 'ACTIVE' if self._logging_active else 'IDLE'
+            self._status_pub.publish(String(data=f'DataLogger {state_txt}'))
+            if self._current_csv_path:
+                self._file_pub.publish(String(data=self._current_csv_path))
+        except Exception:
+            pass
 
     def _on_key(self, msg: String) -> None:
         try:
@@ -207,6 +221,12 @@ class DataLoggerNode(Node):
                     try:
                         self._init_csv()
                         self.get_logger().info('[Start] Logging ACTIVATED and CSV opened via hand_tracker (s)')
+                        try:
+                            self._status_pub.publish(String(data='DataLogger ACTIVE'))
+                            if self._current_csv_path:
+                                self._file_pub.publish(String(data=self._current_csv_path))
+                        except Exception:
+                            pass
                     except Exception as e:
                         self.get_logger().warn(f'CSV start 실패: {e}')
                     try:
@@ -218,6 +238,13 @@ class DataLoggerNode(Node):
                     try:
                         self._close_csv()
                         self.get_logger().info('[Stop] Logging DEACTIVATED and CSV closed via hand_tracker (s)')
+                        try:
+                            self._status_pub.publish(String(data='DataLogger IDLE'))
+                            # Publish last file path so user knows where it was saved
+                            if self._last_closed_csv_path:
+                                self._file_pub.publish(String(data=self._last_closed_csv_path))
+                        except Exception:
+                            pass
                     except Exception as e:
                         self.get_logger().warn(f'CSV close 실패: {e}')
                     try:
@@ -243,6 +270,7 @@ class DataLoggerNode(Node):
             self._close_csv()
             self._csv_fp = open(path, 'w', newline='')
             self._csv_writer = csv.writer(self._csv_fp)
+            self._current_csv_path = str(path)
             # reset EMG schedule counter when starting a new file
             try:
                 self._emg_log_counter = 0
@@ -269,6 +297,12 @@ class DataLoggerNode(Node):
             if any('{si}' in h for h in header):
                 self.get_logger().warn('CSV header contains malformed placeholders. Please report this issue.')
             self.get_logger().info(f'CSV logging -> {path}')
+            # Broadcast current file path for UI/overlays
+            try:
+                self._file_pub.publish(String(data=str(path)))
+                self._status_pub.publish(String(data='DataLogger ACTIVE'))
+            except Exception:
+                pass
         except Exception as e:
             self.get_logger().error(f'CSV 초기화 실패: {e}')
 
@@ -280,11 +314,17 @@ class DataLoggerNode(Node):
                 except Exception:
                     pass
                 self._csv_fp.close()
+                # Remember last closed path for user feedback
+                try:
+                    self._last_closed_csv_path = self._current_csv_path  # type: ignore[attr-defined]
+                except Exception:
+                    pass
         except Exception:
             pass
         finally:
             self._csv_fp = None
             self._csv_writer = None
+            self._current_csv_path = None
 
     # =============== Callbacks
     def _on_force(self, idx: int, msg: Any) -> None:
@@ -384,7 +424,7 @@ class DataLoggerNode(Node):
             return  # paused
         # Warn once if EE is configured but not received
         if not self._ee_warned:
-            if (self.ee_pose_topic or self.ee_pose_odom_topic) and self._ee_recv_count == 0:
+            if (self.ee_pose_topic_if or self.ee_pose_odom_topic) and self._ee_recv_count == 0:
                 # Warn only after a short grace period (~1s)
                 # Using rate_hz, wait ~1s worth of ticks
                 ticks_for_1s = int(max(1.0, self.rate_hz))
@@ -393,7 +433,7 @@ class DataLoggerNode(Node):
                 self._tick_count += 1
                 if self._tick_count >= ticks_for_1s:
                     self.get_logger().warn(
-                        f"EE Pose 미수신: ee_pose_topic='{self.ee_pose_topic}', ee_pose_odometry_topic='{self.ee_pose_odom_topic}'. "
+                        f"EE Pose 미수신: ee_pose_topic_if='{self.ee_pose_topic_if}', ee_pose_odometry_topic='{self.ee_pose_odom_topic}'. "
                         "토픽명이 맞는지, 퍼블리셔가 작동 중인지 확인하세요.")
                     self._ee_warned = True
         # Warn once if EMG is not received

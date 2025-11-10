@@ -26,7 +26,7 @@ class MMS101Controller:
         self.measure_max = config.mms101.measure_max
         self.debug_mode = config.mms101.debug
         self.sensors = config.mms101.sensors
-
+        self.calibration_mode = False
         self.n_samples = 0
         self.sums = 0
         self.contact_flag = 0
@@ -191,13 +191,14 @@ class MMS101Controller:
                 self.offset = self.sums / self.n_samples  # Calculate the average offset
                 return np.zeros_like(sensed_data)
             else :
-                if self.contact_flag == 0:
+                if self.contact_flag == 0 or self.calibration_mode == True:
                     self.sums += mms101data
                     self.n_samples += 1  
                     if self.n_samples > 300: 
                         self.offset = self.sums / self.n_samples  # Calculate the average offset
                         self.n_samples = 0  # Reset the number of samples
                         self.sums = 0
+                        self.calibration_mode = False
                 return sensed_data        
             # print(sensed_data)
 

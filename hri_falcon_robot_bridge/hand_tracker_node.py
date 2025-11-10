@@ -216,8 +216,8 @@ class HandTrackerNode(Node):
         # 기본 경로: 사용자가 제공한 DClaw XML 경로를 기본값으로 설정
         self.declare_parameter('mujoco_model_path', '/home/songwoo/Desktop/work_dir/realsense_hand_retargetting/universal_robots_ur5e_with_dclaw/dclaw/dclaw3xh.xml')
         # Optional EE pose topic (to display or log end-effector pose)
-        # 기본 동작: /ee_pose 로 계속 퍼블리시
-        self.declare_parameter('ee_pose_topic', '/ee_pose')
+        # 기본 동작: /ee_pose_if 로 계속 퍼블리시
+        self.declare_parameter('ee_pose_topic_if', '/ee_pose_if')
         # 추가: MF / TH 각 EE 토픽 병행 퍼블리시를 위한 토픽명
         self.declare_parameter('ee_pose_topic_mf', '/ee_pose_mf')
         self.declare_parameter('ee_pose_topic_th', '/ee_pose_th')
@@ -249,7 +249,7 @@ class HandTrackerNode(Node):
         self.log_angles_csv_path = str(self.get_parameter('log_angles_csv_path').get_parameter_value().string_value)
         self.run_mujoco = bool(self.get_parameter('run_mujoco').get_parameter_value().bool_value)
         self.mujoco_model_path = str(self.get_parameter('mujoco_model_path').get_parameter_value().string_value)
-        self.ee_pose_topic = str(self.get_parameter('ee_pose_topic').get_parameter_value().string_value)
+        self.ee_pose_topic_if = str(self.get_parameter('ee_pose_topic_if').get_parameter_value().string_value)
         self.ee_pose_topic_mf = str(self.get_parameter('ee_pose_topic_mf').get_parameter_value().string_value)
         self.ee_pose_topic_th = str(self.get_parameter('ee_pose_topic_th').get_parameter_value().string_value)
         self.ee_pose_publish_enabled = bool(self.get_parameter('ee_pose_publish_enabled').get_parameter_value().bool_value)
@@ -293,17 +293,17 @@ class HandTrackerNode(Node):
         self.ee_pose_pub = None
         self.ee_pose_pub_mf = None
         self.ee_pose_pub_th = None
-        if self.ee_pose_topic:
+        if self.ee_pose_topic_if:
             # 퍼블리시를 원하면 퍼블리셔 생성
             if self.ee_pose_publish_enabled:
                 try:
-                    self.ee_pose_pub = self.create_publisher(PoseStamped, self.ee_pose_topic, 10)
-                    self.get_logger().info(f"EE Pose 퍼블리시: {self.ee_pose_topic} (source={self.ee_pose_source})")
+                    self.ee_pose_pub = self.create_publisher(PoseStamped, self.ee_pose_topic_if, 10)
+                    self.get_logger().info(f"EE Pose 퍼블리시: {self.ee_pose_topic_if} (source={self.ee_pose_source})")
                 except Exception as e:
                     self.get_logger().warn(f"EE pose publisher 생성 실패: {e}")
             # 동시에 외부 퍼블리셔도 볼 수 있도록 구독 유지(오버레이 표시용)
             try:
-                self.create_subscription(PoseStamped, self.ee_pose_topic, self._on_ee_pose, 10)
+                self.create_subscription(PoseStamped, self.ee_pose_topic_if, self._on_ee_pose, 10)
             except Exception as e:
                 self.get_logger().warn(f"EE pose subscribe 실패: {e}")
         # Dual publishers for MF / TH (optional)

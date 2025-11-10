@@ -146,7 +146,7 @@ class SenseGloveMJNode(Node):
         self.declare_parameter("units_max", 4095.0)
         self.declare_parameter("mujoco_qpos_poll_interval_sec", 0.01)
 
-        self.declare_parameter("qpos_gain", 0.5)
+        self.declare_parameter("qpos_gain", 0.75)
         self.declare_parameter("qpos_smooth_alpha", 0.5)
         self.declare_parameter("qpos_step_max", 0.05)
         self.declare_parameter("clamp_qpos_symm", True)
@@ -159,7 +159,7 @@ class SenseGloveMJNode(Node):
         self.declare_parameter("run_mujoco", True)
         self.declare_parameter("mujoco_model_path", DEFAULT_MUJOCO_MODEL_PATH)
         self.declare_parameter("ee_pose_publish_enabled", True)
-        self.declare_parameter("ee_pose_topic", "/ee_pose")
+        self.declare_parameter("ee_pose_topic_if", "/ee_pose_if")
         self.declare_parameter("ee_pose_topic_mf", "/ee_pose_mf")
         self.declare_parameter("ee_pose_topic_th", "/ee_pose_th")
         self.declare_parameter("ee_pose_frame_id", "world")
@@ -168,6 +168,9 @@ class SenseGloveMJNode(Node):
         self.declare_parameter("ee_pose_mj_body", "")
         self.declare_parameter("ee_pose_mj_site_th", "THtip")
         self.declare_parameter("terminal_status_interval_sec", 1.0)
+        # Force sensor calibration topics
+        self.declare_parameter("force_calib_status_topic", "/force_sensor/calibration_status")
+        self.declare_parameter("force_calibrating_topic", "/force_sensor/calibrating")
 
         self.joint_state_topic = self.get_parameter("joint_state_topic").get_parameter_value().string_value
         self.units_topic = self.get_parameter("units_topic").get_parameter_value().string_value
@@ -207,7 +210,7 @@ class SenseGloveMJNode(Node):
         if not self.mujoco_model_path:
             self.mujoco_model_path = DEFAULT_MUJOCO_MODEL_PATH
         self.ee_pose_publish_enabled = self.get_parameter("ee_pose_publish_enabled").get_parameter_value().bool_value
-        self.ee_pose_topic = self.get_parameter("ee_pose_topic").get_parameter_value().string_value
+        self.ee_pose_topic_if = self.get_parameter("ee_pose_topic_if").get_parameter_value().string_value
         self.ee_pose_topic_mf = self.get_parameter("ee_pose_topic_mf").get_parameter_value().string_value
         self.ee_pose_topic_th = self.get_parameter("ee_pose_topic_th").get_parameter_value().string_value
         self.ee_pose_frame_id = self.get_parameter("ee_pose_frame_id").get_parameter_value().string_value
@@ -216,6 +219,8 @@ class SenseGloveMJNode(Node):
         self.ee_pose_mj_body = self.get_parameter("ee_pose_mj_body").get_parameter_value().string_value
         self.ee_pose_mj_site_th = self.get_parameter("ee_pose_mj_site_th").get_parameter_value().string_value
         self.terminal_status_interval_sec = max(0.0, self.get_parameter("terminal_status_interval_sec").get_parameter_value().double_value)
+        self.force_calib_status_topic = self.get_parameter("force_calib_status_topic").get_parameter_value().string_value
+        self.force_calibrating_topic = self.get_parameter("force_calibrating_topic").get_parameter_value().string_value
 
         # Internal state
         # Per-finger orientation overrides (mirrors hand_tracker defaults)
@@ -258,6 +263,12 @@ class SenseGloveMJNode(Node):
         self._last_ee_pose: Optional[Tuple[float, float, float]] = None
         self._latest_input_qpos: List[List[float]] = [[math.nan] * 3 for _ in FINGER_NAMES]
         self._latest_glove_positions: List[List[float]] = [[math.nan] * 3 for _ in FINGER_NAMES]
+        # Track recently published key to avoid feedback when we also subscribe to the same topic
+        self._last_published_key: Optional[str] = None
+        self._last_published_time: Optional[Time] = None
+        # Track force calibration state for transition-aware logging
+        self._force_calib_status: Optional[str] = None
+        self._force_calibrating: Optional[bool] = None
 
         # ROS entities
         self.units_pub = self.create_publisher(Int32MultiArray, self.units_topic, 10)
@@ -267,8 +278,8 @@ class SenseGloveMJNode(Node):
         self.ee_pose_pub = None
         self.ee_pose_pub_mf = None
         self.ee_pose_pub_th = None
-        if self.ee_pose_publish_enabled and self.ee_pose_topic:
-            self.ee_pose_pub = self.create_publisher(PoseStamped, self.ee_pose_topic, 10)
+        if self.ee_pose_publish_enabled and self.ee_pose_topic_if:
+            self.ee_pose_pub = self.create_publisher(PoseStamped, self.ee_pose_topic_if, 10)
         if self.ee_pose_publish_enabled and self.ee_pose_topic_mf:
             self.ee_pose_pub_mf = self.create_publisher(PoseStamped, self.ee_pose_topic_mf, 10)
         if self.ee_pose_publish_enabled and self.ee_pose_topic_th:
@@ -289,6 +300,24 @@ class SenseGloveMJNode(Node):
 
         try:
             self.create_subscription(Bool, "/data_logger/logging_active", self._on_logger_state, 10)
+        except Exception:
+            pass
+
+        # Subscribe to remote key topic (e.g., keys from deformity_tracker UI)
+        try:
+            self.create_subscription(String, self.key_topic, self._on_remote_key, 10)
+        except Exception:
+            pass
+
+        # Subscribe to force sensor calibration status to announce completion
+        try:
+            if self.force_calib_status_topic:
+                self.create_subscription(String, self.force_calib_status_topic, self._on_force_calib_status, 10)
+        except Exception:
+            pass
+        try:
+            if self.force_calibrating_topic:
+                self.create_subscription(Bool, self.force_calibrating_topic, self._on_force_calibrating, 10)
         except Exception:
             pass
 
@@ -579,6 +608,44 @@ class SenseGloveMJNode(Node):
     # ------------------------------------------------------------------
     # ROS callbacks
     # ------------------------------------------------------------------
+    def _on_remote_key(self, msg: String) -> None:
+        try:
+            incoming = (msg.data or "").strip().lower()
+        except Exception:
+            return
+        if not incoming:
+            return
+
+        # Ignore our own recently published key to avoid feedback loop
+        try:
+            if self._last_published_key == incoming and self._last_published_time is not None:
+                elapsed = self.get_clock().now() - self._last_published_time
+                if elapsed.nanoseconds() <= int(0.3 * 1e9):
+                    return
+        except Exception:
+            pass
+
+        prefix = "[Remote/Key]"
+        if incoming == "h":
+            self.units_publish_enabled = not self.units_publish_enabled
+            state = "ON" if self.units_publish_enabled else "OFF"
+            self.get_logger().info(f"{prefix} [Units] publish -> {state}")
+            self._publish_units_state()
+        elif incoming == "c":
+            if self._capture_zero_reference():
+                self.get_logger().info(f"{prefix} [Zero] zero_qpos_ref updated from current glove pose")
+            else:
+                self.get_logger().warn(f"{prefix} [Zero] zero capture failed (no pose yet)")
+        elif incoming == "f":
+            # Force sensor node handles the actual calibration; we only acknowledge.
+            self.get_logger().info(f"{prefix} [Force] calibration request (100 samples)")
+        elif incoming == "s":
+            # Logger toggle handled elsewhere; acknowledge receipt.
+            self.get_logger().info(f"{prefix} [Logger] toggle request")
+        else:
+            # Unhandled remote key
+            return
+
     def _on_joint_state(self, msg: JointState) -> None:
         incoming_qpos = [[math.nan] * 3 for _ in FINGER_NAMES]
 
@@ -614,6 +681,39 @@ class SenseGloveMJNode(Node):
         response.message = "Zero reference captured from current glove pose."
         self.get_logger().info("Zero offsets updated from SenseGlove pose.")
         return response
+
+    def _on_force_calib_status(self, msg: String) -> None:
+        try:
+            new_status = (msg.data or "").strip().lower()
+        except Exception:
+            new_status = ""
+        previous = self._force_calib_status
+        self._force_calib_status = new_status
+        if previous == new_status:
+            return
+        if not new_status:
+            return
+        if new_status.startswith("in") or new_status.startswith("prog"):
+            self.get_logger().info("[Force] calibration in progress...")
+        elif new_status in ("done", "complete", "completed", "ok", "success"):
+            self.get_logger().info("[Force] calibration completed")
+        elif new_status in ("idle", "ready"):
+            # Avoid noisy logs; uncomment if needed
+            # self.get_logger().info("[Force] calibration idle")
+            pass
+
+    def _on_force_calibrating(self, msg: Bool) -> None:
+        try:
+            active = bool(msg.data)
+        except Exception:
+            active = False
+        previous = self._force_calibrating
+        self._force_calibrating = active
+        if previous is None or previous != active:
+            if active:
+                self.get_logger().info("[Force] calibration started")
+            else:
+                self.get_logger().info("[Force] calibration finished")
 
     # ------------------------------------------------------------------
     # Processing helpers
@@ -879,6 +979,10 @@ class SenseGloveMJNode(Node):
                 idx = 0
             self.qpos_gain = choices[(idx + 1) % len(choices)]
             self.get_logger().info(f"{prefix} qpos_gain -> {self.qpos_gain:.2f}")
+        elif key == "f":
+            # Forward calibration trigger to force sensor node
+            publish = True
+            self.get_logger().info(f"{prefix} [Force] calibration request (100 samples)")
         else:
             return
 
@@ -889,6 +993,9 @@ class SenseGloveMJNode(Node):
         if not key:
             return
         try:
+            # Mark last published key to avoid processing our own echo
+            self._last_published_key = key.lower()
+            self._last_published_time = self.get_clock().now()
             msg = String()
             msg.data = key
             self.key_pub.publish(msg)

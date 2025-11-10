@@ -104,7 +104,7 @@ install(PROGRAMS
   hri_falcon_robot_bridge/hand_tracker_node.py
   hri_falcon_robot_bridge/sense_glove_mj_node.py
   hri_falcon_robot_bridge/robot_controller_node.py
-  hri_falcon_robot_bridge/ball_tracker_node.py
+  hri_falcon_robot_bridge/deformity_tracker_node.py
   hri_falcon_robot_bridge/emg_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -130,11 +130,11 @@ install(PROGRAMS
   RENAME robot_controller_node
 )
 
-# Optional: alias for ball_tracker_node without .py
+# Optional: alias for deformity_tracker_node without .py
 install(PROGRAMS
-  hri_falcon_robot_bridge/ball_tracker_node.py
+  hri_falcon_robot_bridge/deformity_tracker_node.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME ball_tracker_node
+  RENAME deformity_tracker_node
 )
 
 # Optional: alias for emg_node without .py

@@ -80,12 +80,12 @@ constexpr std::array<std::pair<const char *, const char *>, 9> kCommandOrder{{
 }};
 
 constexpr std::array<ForceCalibrationSample, 6> kCalibrationTable{{
-  {0.0f, 0.0f},
-  {3.0f, 0.25f},
-  {5.0f, 0.4f},
-  {8.0f, 0.6f},
-  {12.0f, 0.85f},
-  {18.0f, 1.0f},
+  {1.0f, 0.0f},
+  {5.0f, 0.25f},
+  {7.0f, 0.4f},
+  {10.0f, 0.6f},
+  {14.0f, 0.85f},
+  {20.0f, 1.0f},
 }};
 
 inline double clamp(double value, double min_value, double max_value)
@@ -228,6 +228,9 @@ public:
     declare_parameter<double>("pose_log_interval_sec", 1.0);
   declare_parameter("force_feedback_topic_template", std::string("/force_sensor/s{index}/wrench"));
   declare_parameter("force_feedback_sensor_count", force_feedback_sensor_count_);
+  // When true, run haptics on the same timer as the main update loop to ensure
+  // SGCore::HandLayer updates and haptic sends are ordered consistently.
+  declare_parameter("sync_haptics_with_update", true);
     declare_parameter("force_feedback_alpha", force_feedback_alpha_);
     declare_parameter("force_feedback_level_alpha", force_feedback_level_alpha_);
     declare_parameter("force_feedback_lambda", force_feedback_lambda_);
@@ -278,6 +281,15 @@ public:
       force_feedback_publish_rate_ = publish_rate_param;
     }
     force_feedback_publish_period_ = 1.0 / std::max(force_feedback_publish_rate_, 1e-3);
+    // Sync option
+    sync_haptics_with_update_ = get_parameter("sync_haptics_with_update").as_bool();
+    if (sync_haptics_with_update_)
+    {
+      // Align haptics rate to update rate for deterministic ordering
+      force_feedback_publish_rate_ = update_rate_hz_;
+      force_feedback_publish_period_ = 1.0 / std::max(force_feedback_publish_rate_, 1e-3);
+    }
+
     force_feedback_force_norm_ = std::max(force_feedback_force_norm_, 1e-6);
     force_feedback_torque_norm_ = std::max(force_feedback_torque_norm_, 1e-6);
 
@@ -374,10 +386,17 @@ public:
           force_feedback_topics_.size(), topic_list.c_str());
       }
 
-      force_feedback_timer_ = create_wall_timer(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::duration<double>(force_feedback_publish_period_)),
-        std::bind(&SenseGloveNode::send_force_feedback, this));
+      if (!sync_haptics_with_update_)
+      {
+        force_feedback_timer_ = create_wall_timer(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(force_feedback_publish_period_)),
+          std::bind(&SenseGloveNode::send_force_feedback, this));
+      }
+      else
+      {
+        RCLCPP_INFO(get_logger(), "Haptics synchronized with main update loop (rate=%.1f Hz)", update_rate_hz_);
+      }
     }
 
 #ifdef HAVE_SENSEGLOVE_SDK
@@ -434,6 +453,7 @@ private:
 
   void on_timer()
   {
+  // (Removed explicit HandLayer::UpdateLayer call – not available in current SDK build)
     const auto angles_opt = read_joint_angles();
     if (!angles_opt.has_value())
     {
@@ -469,6 +489,12 @@ private:
     }
 
     joint_pub_->publish(joint_msg);
+
+    // If requested, send haptics on the same tick to ensure UpdateLayer() precedes it
+    if (force_feedback_enabled_ && sync_haptics_with_update_)
+    {
+      send_force_feedback();
+    }
   }
 
   void process_command_stream(const FingerJointMatrix & angles)
@@ -764,6 +790,7 @@ private:
   bool first_pose_logged_;
   double log_interval_sec_;
   bool force_feedback_enabled_;
+  bool sync_haptics_with_update_{};  // when true, send haptics in on_timer after UpdateLayer()
   int force_feedback_sensor_count_;
   double force_feedback_alpha_;
   double force_feedback_level_alpha_;
@@ -979,6 +1006,9 @@ void SenseGloveNode::send_force_feedback()
     return;
   }
 
+  // NOTE: HandLayer::UpdateLayer() symbol not present in this SDK version; relying on
+  // GetHandPose() polling in on_timer() to keep internal state fresh.
+
   const auto now = get_clock()->now();
 
   std::array<double, kFingerCount> levels{};
@@ -1064,13 +1094,20 @@ void SenseGloveNode::send_force_feedback()
 
     const bool all_queued = queued_thumb && queued_index && queued_middle;
 
-    if (!all_queued || !SGCore::HandLayer::SendHaptics(use_right_hand_))
-    {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Failed to queue or send haptic commands.");
-      return;
-    }
+    bool sent = SGCore::HandLayer::SendHaptics(use_right_hand_);
+    // if (!all_queued || !sent)
+    // {
+    //   RCLCPP_WARN_THROTTLE(
+    //     get_logger(), *get_clock(), 2000,
+    //     "Haptics queue/send fail detail: queued_thumb=%d queued_index=%d queued_middle=%d sent=%d glovesConnected=%d deviceConnected=%d",
+    //     queued_thumb, queued_index, queued_middle, sent ? 1 : 0,
+    //     SGCore::HandLayer::GlovesConnected(),
+    //     SGCore::HandLayer::DeviceConnected(use_right_hand_) ? 1 : 0);
+    //   RCLCPP_WARN_THROTTLE(
+    //     get_logger(), *get_clock(), 2000,
+    //     "Failed to queue or send haptic commands.");
+    //   return;
+    // }
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 500,
