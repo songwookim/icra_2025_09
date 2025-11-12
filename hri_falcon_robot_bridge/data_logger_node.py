@@ -116,7 +116,7 @@ class DataLoggerNode(Node):
         self._emg_recv_count: int = 0
         self._emg_warned: bool = False
         self._emg_last_written_count: int = 0
-        self._ee: Optional[Tuple[float,float,float]] = None
+        self._ee_if: Optional[Tuple[float,float,float]] = None
         self._ee_mf: Optional[Tuple[float,float,float]] = None
         self._ee_th: Optional[Tuple[float,float,float]] = None
         self._ee_recv_count: int = 0
@@ -363,7 +363,7 @@ class DataLoggerNode(Node):
             if self._emg_recv_count == 1 or (self._emg_recv_count % 50 == 0):
                 try:
                     preview = ", ".join(f"{v:.1f}" for v in data)
-                    self.get_logger().info(f"[EMG] recv #{self._emg_recv_count}: {preview}")
+                    # self.get_logger().info(f"[EMG] recv #{self._emg_recv_count}: {preview}")
                 except Exception:
                     pass
         except Exception:
@@ -372,7 +372,7 @@ class DataLoggerNode(Node):
     def _on_ee_pose(self, msg: PoseStamped) -> None:
         try:
             p = msg.pose.position
-            self._ee = (float(p.x), float(p.y), float(p.z))
+            self._ee_if = (float(p.x), float(p.y), float(p.z))
             self._ee_recv_count += 1
         except Exception:
             pass
@@ -394,7 +394,7 @@ class DataLoggerNode(Node):
     def _on_ee_odom(self, msg: Odometry) -> None:
         try:
             p = msg.pose.pose.position
-            self._ee = (float(p.x), float(p.y), float(p.z))
+            self._ee_if = (float(p.x), float(p.y), float(p.z))
             self._ee_recv_count += 1
         except Exception:
             pass
@@ -451,10 +451,10 @@ class DataLoggerNode(Node):
                 fx,fy,fz,tx,ty,tz = f
                 row += [f"{fx:.6f}", f"{fy:.6f}", f"{fz:.6f}", f"{tx:.6f}", f"{ty:.6f}", f"{tz:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
         # EE pose (position only, 타임스탬프는 현재 시각)
-        if self._ee is None:
+        if self._ee_if is None:
             row += ['','','','','']
         else:
-            px,py,pz = self._ee
+            px,py,pz = self._ee_if
             row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
         # EE pose (MF, 타임스탬프는 현재 시각)
         if self._ee_mf is None:

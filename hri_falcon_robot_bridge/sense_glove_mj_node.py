@@ -168,9 +168,6 @@ class SenseGloveMJNode(Node):
         self.declare_parameter("ee_pose_mj_body", "")
         self.declare_parameter("ee_pose_mj_site_th", "THtip")
         self.declare_parameter("terminal_status_interval_sec", 1.0)
-        # Force sensor calibration topics
-        self.declare_parameter("force_calib_status_topic", "/force_sensor/calibration_status")
-        self.declare_parameter("force_calibrating_topic", "/force_sensor/calibrating")
 
         self.joint_state_topic = self.get_parameter("joint_state_topic").get_parameter_value().string_value
         self.units_topic = self.get_parameter("units_topic").get_parameter_value().string_value
@@ -219,8 +216,6 @@ class SenseGloveMJNode(Node):
         self.ee_pose_mj_body = self.get_parameter("ee_pose_mj_body").get_parameter_value().string_value
         self.ee_pose_mj_site_th = self.get_parameter("ee_pose_mj_site_th").get_parameter_value().string_value
         self.terminal_status_interval_sec = max(0.0, self.get_parameter("terminal_status_interval_sec").get_parameter_value().double_value)
-        self.force_calib_status_topic = self.get_parameter("force_calib_status_topic").get_parameter_value().string_value
-        self.force_calibrating_topic = self.get_parameter("force_calibrating_topic").get_parameter_value().string_value
 
         # Internal state
         # Per-finger orientation overrides (mirrors hand_tracker defaults)
@@ -266,9 +261,6 @@ class SenseGloveMJNode(Node):
         # Track recently published key to avoid feedback when we also subscribe to the same topic
         self._last_published_key: Optional[str] = None
         self._last_published_time: Optional[Time] = None
-        # Track force calibration state for transition-aware logging
-        self._force_calib_status: Optional[str] = None
-        self._force_calibrating: Optional[bool] = None
 
         # ROS entities
         self.units_pub = self.create_publisher(Int32MultiArray, self.units_topic, 10)
@@ -306,18 +298,6 @@ class SenseGloveMJNode(Node):
         # Subscribe to remote key topic (e.g., keys from deformity_tracker UI)
         try:
             self.create_subscription(String, self.key_topic, self._on_remote_key, 10)
-        except Exception:
-            pass
-
-        # Subscribe to force sensor calibration status to announce completion
-        try:
-            if self.force_calib_status_topic:
-                self.create_subscription(String, self.force_calib_status_topic, self._on_force_calib_status, 10)
-        except Exception:
-            pass
-        try:
-            if self.force_calibrating_topic:
-                self.create_subscription(Bool, self.force_calibrating_topic, self._on_force_calibrating, 10)
         except Exception:
             pass
 
@@ -636,9 +616,6 @@ class SenseGloveMJNode(Node):
                 self.get_logger().info(f"{prefix} [Zero] zero_qpos_ref updated from current glove pose")
             else:
                 self.get_logger().warn(f"{prefix} [Zero] zero capture failed (no pose yet)")
-        elif incoming == "f":
-            # Force sensor node handles the actual calibration; we only acknowledge.
-            self.get_logger().info(f"{prefix} [Force] calibration request (100 samples)")
         elif incoming == "s":
             # Logger toggle handled elsewhere; acknowledge receipt.
             self.get_logger().info(f"{prefix} [Logger] toggle request")
@@ -682,39 +659,6 @@ class SenseGloveMJNode(Node):
         self.get_logger().info("Zero offsets updated from SenseGlove pose.")
         return response
 
-    def _on_force_calib_status(self, msg: String) -> None:
-        try:
-            new_status = (msg.data or "").strip().lower()
-        except Exception:
-            new_status = ""
-        previous = self._force_calib_status
-        self._force_calib_status = new_status
-        if previous == new_status:
-            return
-        if not new_status:
-            return
-        if new_status.startswith("in") or new_status.startswith("prog"):
-            self.get_logger().info("[Force] calibration in progress...")
-        elif new_status in ("done", "complete", "completed", "ok", "success"):
-            self.get_logger().info("[Force] calibration completed")
-        elif new_status in ("idle", "ready"):
-            # Avoid noisy logs; uncomment if needed
-            # self.get_logger().info("[Force] calibration idle")
-            pass
-
-    def _on_force_calibrating(self, msg: Bool) -> None:
-        try:
-            active = bool(msg.data)
-        except Exception:
-            active = False
-        previous = self._force_calibrating
-        self._force_calibrating = active
-        if previous is None or previous != active:
-            if active:
-                self.get_logger().info("[Force] calibration started")
-            else:
-                self.get_logger().info("[Force] calibration finished")
-
     # ------------------------------------------------------------------
     # Processing helpers
     # ------------------------------------------------------------------
@@ -739,38 +683,13 @@ class SenseGloveMJNode(Node):
 
             any_valid = True
             raw_qpos[f_idx][j_idx] = mapped_qpos
-            delta = mapped_qpos - self._zero_qpos_ref[f_idx][j_idx]
-            direction = self._joint_orientation[f_idx][j_idx]
-            signed_qpos = delta * direction * self.global_qpos_sign
-            command_qpos = signed_qpos * self.qpos_gain
+            
+            # Use raw_angle directly as qpos (no transformation)
+            final_qpos = mapped_qpos
+        
 
-            previous = self._prev_qpos_cmd[f_idx][j_idx]
-            smoothed = (1.0 - self.qpos_smooth_alpha) * previous + self.qpos_smooth_alpha * command_qpos
-            delta = smoothed - previous
-            if delta > self.qpos_step_max:
-                smoothed = previous + self.qpos_step_max
-            elif delta < -self.qpos_step_max:
-                smoothed = previous - self.qpos_step_max
-
-            was_clamped = False
-            if self.clamp_qpos_symm:
-                unclamped = smoothed
-                smoothed = clamp(smoothed, self.clamp_qpos_min, self.clamp_qpos_max)
-                was_clamped = abs(smoothed - unclamped) > 1e-6
-
-            if (
-                was_clamped
-                and self.log_clamp_events
-                and not self._clamp_notified[f_idx][j_idx]
-            ):
-                self._clamp_notified[f_idx][j_idx] = True
-                self.get_logger().warn(
-                    f"[Clamp] {finger_name}_{joint_name} saturated at {smoothed:.3f} rad (raw={command_qpos:.3f} rad). "
-                    "Adjust clamp_qpos_min/max or qpos_gain if this is unintended."
-                )
-
-            self._prev_qpos_cmd[f_idx][j_idx] = smoothed
-            smoothed_qpos[f_idx][j_idx] = smoothed
+            self._prev_qpos_cmd[f_idx][j_idx] = final_qpos
+            smoothed_qpos[f_idx][j_idx] = final_qpos
 
             raw_angle = raw_qpos[f_idx][j_idx]
             offset = 1.57 if cmd_idx in (0, 3, 6) else 3.14
@@ -781,7 +700,7 @@ class SenseGloveMJNode(Node):
             units_calc = clamp(units_calc, -4096.0, 4096.0)
             bias = 1000.0 if cmd_idx in (0, 3, 6) else 2000.0
             units_val = clamp(units_calc + bias, self.units_min, self.units_max)
-            units_out.append(int(round(units_val)))
+            units_out.append(int(round(units_val))+10)
 
         if any_valid:
             self._latest_raw_qpos = raw_qpos
@@ -979,10 +898,6 @@ class SenseGloveMJNode(Node):
                 idx = 0
             self.qpos_gain = choices[(idx + 1) % len(choices)]
             self.get_logger().info(f"{prefix} qpos_gain -> {self.qpos_gain:.2f}")
-        elif key == "f":
-            # Forward calibration trigger to force sensor node
-            publish = True
-            self.get_logger().info(f"{prefix} [Force] calibration request (100 samples)")
         else:
             return
 

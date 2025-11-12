@@ -5,11 +5,11 @@ For each demonstration CSV this script:
 - extracts force magnitudes (baseline-removed, no low-pass filtering),
 - aligns sEMG signals and builds transformation matrices T_F and T_K,
 - projects multiple filtered EMG variants (raw magnitude, low-pass, moving-average,
-    band-pass, and an ultra-smooth envelope) into stiffness trajectories, and
+    band-pass, ultra-smooth envelope, and a stronger ultra-smooth envelope) into stiffness trajectories, and
 - saves comparison plots plus a CSV with the force traces and low-pass stiffness.
 
-Four PNGs are emitted per input file, one per filtered EMG variant. Each PNG has
-subplots for force magnitude, stiffness (raw-EMG dashed vs filtered solid), and EMG
+One PNG is emitted per EMG variant (currently: low-pass, moving-avg, band-pass, ultra-smooth, ultra-smooth-strong).
+Each PNG has subplots for force magnitude, stiffness (raw-EMG dashed vs filtered solid), and EMG
 (raw dashed vs filtered solid) with a small horizontal margin.
 """
 
@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy.ndimage import uniform_filter1d
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, sosfiltfilt, savgol_filter
 
 if os.environ.get("DISPLAY", "") == "":
     import matplotlib
@@ -121,7 +121,14 @@ def _center_signal(signal: np.ndarray, baseline_fraction: float = 0.1) -> np.nda
 # Force processing
 # ---------------------------------------------------------------------------
 
-def _compute_signed_force(df: pd.DataFrame) -> np.ndarray:
+def _compute_signed_force(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract force and return both negative (for calculation) and positive (for plotting).
+    
+    Returns:
+        Tuple of (forces_negative, forces_positive)
+        - forces_negative: baseline-subtracted, sign preserved (negative values)
+        - forces_positive: absolute value for plotting
+    """
     force_prefixes = ("force_3", "s3", "force3")
     picked: Optional[List[str]] = None
     for prefix in force_prefixes:
@@ -134,8 +141,25 @@ def _compute_signed_force(df: pd.DataFrame) -> np.ndarray:
     force_raw = df[picked].to_numpy(dtype=float)
     rest_samples = max(1, int(len(force_raw) * 0.1))
     baseline = np.mean(force_raw[:rest_samples, :], axis=0, keepdims=True)
-    forces_signed = np.abs(force_raw - baseline)
-    return forces_signed
+    forces_centered = force_raw - baseline
+    # Negative for calculation (sign preserved)
+    forces_negative = forces_centered
+    # Positive for plotting (absolute value)
+    forces_positive = np.abs(forces_centered)
+    return forces_negative, forces_positive
+
+
+def _smooth_force(force: np.ndarray, fs: Optional[float], cutoff_hz: float = 3.0, order: int = 2) -> Optional[np.ndarray]:
+    """Apply low-pass filter to force signals to reduce noise."""
+    if force is None or force.size == 0:
+        return None
+    if fs is None or fs <= 0 or cutoff_hz <= 0 or fs <= 2 * cutoff_hz:
+        return None
+    try:
+        sos = butter(order, cutoff_hz, btype="low", fs=fs, output="sos")
+        return sosfiltfilt(sos, force, axis=0)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +219,48 @@ def _ultra_smooth_emg(emg_mag: np.ndarray, fs: Optional[float], cutoff_hz: float
     return smoothed
 
 
+def _ultra_smooth_strong_emg(
+    emg_mag: np.ndarray,
+    fs: Optional[float],
+    cutoff_hz: float = 1.0,
+    window_sec: float = 0.8,
+    sg_window_sec: float = 0.6,
+    sg_poly: int = 3,
+) -> Optional[np.ndarray]:
+    if emg_mag is None or emg_mag.size == 0:
+        return None
+    smoothed = np.asarray(emg_mag, dtype=float)
+    # Lower cutoff LPF
+    if fs is not None and fs > 0 and cutoff_hz > 0 and fs > 2 * cutoff_hz:
+        try:
+            sos = butter(2, cutoff_hz, btype="low", fs=fs, output="sos")
+            smoothed = sosfiltfilt(sos, smoothed, axis=0)
+        except ValueError:
+            pass
+    # Longer moving average
+    effective_fs = fs if fs is not None and fs > 0 else 200.0
+    window = max(1, int(round(window_sec * effective_fs)))
+    if window > 1:
+        smoothed = uniform_filter1d(smoothed, size=window, axis=0, mode="nearest")
+    # Savitzky–Golay as a final polish
+    sg_window = max(5, int(round(sg_window_sec * effective_fs)))
+    if sg_window % 2 == 0:
+        sg_window += 1
+    if sg_window > sg_poly + 2:
+        try:
+            smoothed = savgol_filter(
+                smoothed,
+                window_length=sg_window,
+                polyorder=sg_poly,
+                axis=0,
+                mode="interp",
+            )
+        except Exception:
+            pass
+    smoothed = np.maximum(smoothed, 0.0)
+    return smoothed
+
+
 # ---------------------------------------------------------------------------
 # Linear-algebra helpers for T_F / T_K
 # ---------------------------------------------------------------------------
@@ -232,6 +298,7 @@ def compute_tk_from_projection(H_F: np.ndarray, target_rank: int = 3) -> Tuple[n
 def _plot_variant(
     time: np.ndarray,
     forces_signed: np.ndarray,
+    forces_smoothed: np.ndarray,
     stiffness_raw: np.ndarray,
     stiffness_filtered: np.ndarray,
     emg_raw: np.ndarray,
@@ -248,12 +315,24 @@ def _plot_variant(
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
 
     for axis in range(min(3, forces_signed.shape[1])):
+        color = colors[axis % len(colors)]
+        # Plot raw force as dashed line
         ax_force.plot(
             time,
             forces_signed[:, axis],
-            color=colors[axis % len(colors)],
+            color=color,
+            linewidth=0.8,
+            linestyle="--",
+            alpha=0.3,
+            label=f"|F{axis + 1}| raw" if axis == 0 else None,
+        )
+        # Plot smoothed force as solid line
+        ax_force.plot(
+            time,
+            forces_smoothed[:, axis],
+            color=color,
             linewidth=1.2,
-            label=f"|F{axis + 1}|",
+            label=f"|F{axis + 1}| smoothed",
         )
     ax_force.set_ylabel("Force magnitude [N]")
     ax_force.grid(alpha=0.3)
@@ -344,10 +423,20 @@ def process_file(csv_path: Path, output_dir: Path) -> Optional[List[Path]]:
         print(f"[warn] {csv_path.name}: sampling rate unknown, assuming {fs:.1f} Hz")
 
     try:
-        forces_signed = _compute_signed_force(df)
+        forces_negative, forces_positive = _compute_signed_force(df)
     except Exception as exc:
         print(f"[skip] {csv_path.name}: force extraction failed ({exc})")
         return None
+
+    # Smooth force (both negative for calculation and positive for plotting)
+    forces_negative_smoothed = _smooth_force(forces_negative, fs)
+    if forces_negative_smoothed is None:
+        print(f"[warn] {csv_path.name}: force smoothing failed, using raw force")
+        forces_negative_smoothed = forces_negative
+    
+    forces_positive_smoothed = _smooth_force(forces_positive, fs)
+    if forces_positive_smoothed is None:
+        forces_positive_smoothed = forces_positive
 
     emg_cols = _guess_emg_columns(df)
     if not emg_cols:
@@ -381,6 +470,7 @@ def process_file(csv_path: Path, output_dir: Path) -> Optional[List[Path]]:
         bp_emg = np.abs(bp_emg)
 
     ultra_emg = _ultra_smooth_emg(emg_magnitude, fs)
+    ultra_strong_emg = _ultra_smooth_strong_emg(emg_magnitude, fs)
 
     variants: Dict[str, np.ndarray] = {}
     variants["lowpass"] = lp_emg if lp_emg is not None else emg_magnitude
@@ -390,9 +480,11 @@ def process_file(csv_path: Path, output_dir: Path) -> Optional[List[Path]]:
     else:
         print(f"[warn] {csv_path.name}: band-pass filter unavailable (fs={fs:.2f} Hz)")
     variants["ultra_smooth"] = ultra_emg if ultra_emg is not None else emg_magnitude
+    variants["ultra_smooth_strong"] = ultra_strong_emg if ultra_strong_emg is not None else (ultra_emg if ultra_emg is not None else emg_magnitude)
 
     P_raw = emg_magnitude.T
-    F_mat = forces_signed.T
+    # Use NEGATIVE force for T_F calculation
+    F_mat = forces_negative_smoothed.T
 
     try:
         T_F = compute_tf(P_raw, F_mat)
@@ -415,11 +507,13 @@ def process_file(csv_path: Path, output_dir: Path) -> Optional[List[Path]]:
             "moving_avg": "moving-avg",
             "bandpass": "band-pass",
             "ultra_smooth": "ultra-smooth",
+            "ultra_smooth_strong": "ultra-smooth-strong",
         }.get(variant_name, variant_name)
         try:
             _plot_variant(
                 time,
-                forces_signed,
+                forces_positive,  # Use POSITIVE force for plotting
+                forces_positive_smoothed,
                 stiffness_raw,
                 stiffness_variant,
                 emg_magnitude,
@@ -435,7 +529,8 @@ def process_file(csv_path: Path, output_dir: Path) -> Optional[List[Path]]:
         if variant_name == "lowpass":
             out_csv = output_dir / f"{csv_path.stem}_paper_profile.csv"
             try:
-                _save_profile_csv(out_csv, time, forces_signed, stiffness_variant)
+                # Save POSITIVE force in CSV for readability
+                _save_profile_csv(out_csv, time, forces_positive_smoothed, stiffness_variant)
                 out_paths.append(out_csv)
             except Exception as exc:
                 print(f"[warn] {csv_path.name}: CSV save failed ({exc})")

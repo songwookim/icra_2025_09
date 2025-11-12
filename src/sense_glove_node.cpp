@@ -54,17 +54,26 @@ constexpr std::array<std::array<const char *, kJointsPerFinger>, kFingerCount> k
 
 constexpr std::array<std::array<JointLimit, kJointsPerFinger>, kFingerCount> kJointLimits{{
   std::array<JointLimit, kJointsPerFinger>{
-    JointLimit{0.0, 6.2831853071795862}, // 0~360도
-    JointLimit{2.9670597283903604, 4.1887902047863905}, // approx 170~240도
-    JointLimit{2.9670597283903604, 4.3633231299858238}},
+    JointLimit{-6.2831853071795862, 6.2831853071795862}, // 0~360도
+    JointLimit{-6.2831853071795862, 6.2831853071795862}, // approx 170~240도
+    JointLimit{-6.2831853071795862, 6.2831853071795862}
+  },
   std::array<JointLimit, kJointsPerFinger>{
-    JointLimit{3.0543261909901558, 4.1887902047863905},
-    JointLimit{3.0543261909901558, 4.3633231299858238},
-    JointLimit{3.0543261909901558, 4.4505895925855405}},
+    //JointLimit{3.0543261909901558, 4.1887902047863905},
+    JointLimit{-6.2831853071795862, 6.2831853071795862},
+    JointLimit{-6.2831853071795862, 6.2831853071795862},
+    JointLimit{-6.2831853071795862, 6.2831853071795862}
+  },
+    // JointLimit{3.0543261909901558, 4.3633231299858238},
+    // JointLimit{3.0543261909901558, 4.4505895925855405}},
   std::array<JointLimit, kJointsPerFinger>{
-    JointLimit{3.0543261909901558, 4.1887902047863905},
-    JointLimit{3.0543261909901558, 4.4505895925855405},
-    JointLimit{3.0543261909901558, 4.5378560551852573}}
+    JointLimit{-6.2831853071795862, 6.2831853071795862},
+    JointLimit{-6.2831853071795862, 6.2831853071795862},
+    JointLimit{-6.2831853071795862, 6.2831853071795862},
+  }
+    // JointLimit{3.0543261909901558, 4.1887902047863905},
+    // JointLimit{3.0543261909901558, 4.4505895925855405},
+    // JointLimit{3.0543261909901558, 4.5378560551852573}}
 }};
 
 constexpr std::array<std::pair<const char *, const char *>, 9> kCommandOrder{{
@@ -81,11 +90,11 @@ constexpr std::array<std::pair<const char *, const char *>, 9> kCommandOrder{{
 
 constexpr std::array<ForceCalibrationSample, 6> kCalibrationTable{{
   {1.0f, 0.0f},
-  {5.0f, 0.25f},
-  {7.0f, 0.4f},
-  {10.0f, 0.6f},
-  {14.0f, 0.85f},
-  {20.0f, 1.0f},
+  {2.5f, 0.25f},
+  {4.0f, 0.4f},
+  {6.5f, 0.6f},
+  {8.0f, 0.85f},
+  {9.5f, 1.0f},
 }};
 
 inline double clamp(double value, double min_value, double max_value)
@@ -462,12 +471,12 @@ private:
     }
 
     const auto angles = angles_opt.value();
-    process_command_stream(angles);
+    // process_command_stream(angles);
 
-    if (!publish_joint_state_)
-    {
-      return;
-    }
+    // if (!publish_joint_state_)
+    // {
+    //   return;
+    // }
 
     sensor_msgs::msg::JointState joint_msg;
     joint_msg.header.stamp = get_clock()->now();
@@ -478,13 +487,13 @@ private:
     {
       for (std::size_t j = 0; j < kJointsPerFinger; ++j)
       {
-        const double qpos = latest_smoothed_qpos_[f][j];
-        if (!std::isfinite(qpos))
+        const double raw_angle = angles[f][j];
+        if (!std::isfinite(raw_angle))
         {
           continue;
         }
         joint_msg.name.emplace_back(std::string(kFingerNames[f]) + "_" + kJointNames[f][j]);
-        joint_msg.position.emplace_back(qpos);
+        joint_msg.position.emplace_back(raw_angle);
       }
     }
 
@@ -499,7 +508,7 @@ private:
 
   void process_command_stream(const FingerJointMatrix & angles)
   {
-    FingerJointMatrix smoothed_qpos = latest_smoothed_qpos_;
+    FingerJointMatrix output_qpos = latest_smoothed_qpos_;
 
     for (const auto & entry : kCommandOrder)
     {
@@ -514,30 +523,30 @@ private:
       double qpos = map_angle_to_qpos(f_idx, j_idx, raw_angle_rad);
       if (f_idx >= 0 && j_idx >= 0)
       {
-        qpos -= zero_qpos_ref_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
+        const double zero_offset = zero_qpos_ref_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
+        
+        // Pass through raw angle directly without any transformation
+        double final_qpos = raw_angle_rad;
 
-        const double previous = prev_qpos_cmd_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
-        double smoothed = (1.0 - qpos_smooth_alpha_) * previous + qpos_smooth_alpha_ * qpos;
-        const double delta = smoothed - previous;
-        if (delta > qpos_step_max_)
+        // Debug logging for THUMB joints - show GetY() raw value
+        if (f_idx == 0)  // THUMB
         {
-          smoothed = previous + qpos_step_max_;
-        }
-        else if (delta < -qpos_step_max_)
-        {
-          smoothed = previous - qpos_step_max_;
-        }
-        if (clamp_qpos_symm_)
-        {
-          smoothed = clamp(smoothed, clamp_qpos_min_, clamp_qpos_max_);
+          RCLCPP_INFO(
+            get_logger(),
+            "[THUMB/%s] GetY()=%.6f | zero_ref=%.6f | final_qpos=%.6f (raw passthrough)",
+            entry.second,
+            raw_angle_rad,
+            zero_offset,
+            final_qpos
+          );
         }
 
-        prev_qpos_cmd_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)] = smoothed;
-        smoothed_qpos[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)] = smoothed;
+        prev_qpos_cmd_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)] = final_qpos;
+        output_qpos[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)] = final_qpos;
       }
     }
 
-    latest_smoothed_qpos_ = smoothed_qpos;
+    latest_smoothed_qpos_ = output_qpos;
     latest_qpos_valid_ = true;
 
     const auto now = get_clock()->now();
@@ -573,7 +582,8 @@ private:
       }
       if (any)
       {
-        //RCLCPP_INFO(get_logger(), "SenseGlove angles(rad): %s", oss.str().c_str());
+        system("clear");
+        RCLCPP_INFO(get_logger(), "SenseGlove angles(rad): %s", oss.str().c_str());
         NULL;
       }
       first_pose_logged_ = true;
@@ -625,56 +635,6 @@ private:
         any_valid = true;
       }
     }
-
-    if (!any_valid)
-    {
-      std::array<double, 4> normalized{};
-      normalized.fill(-1.0);
-      const auto flex = pose.GetNormalizedFlexion(true);
-      const std::size_t copy_count = std::min<std::size_t>(normalized.size(), flex.size());
-      for (std::size_t idx = 0; idx < copy_count; ++idx)
-      {
-        normalized[idx] = clamp(static_cast<double>(flex[idx]), 0.0, 1.0);
-      }
-      const auto fallback = flex_to_angles(normalized);
-      bool fallback_valid = false;
-      for (const auto & row : fallback)
-      {
-        for (double angle_rad : row)
-        {
-          if (std::isfinite(angle_rad))
-          {
-            fallback_valid = true;
-            break;
-          }
-        }
-        if (fallback_valid)
-        {
-          break;
-        }
-      }
-
-      if (!fallback_valid)
-      {
-        return std::nullopt;
-      }
-
-      if (!glove_connected_logged_)
-      {
-        RCLCPP_INFO(get_logger(), "SenseGlove connected (%s hand detected).",
-          use_right_hand_ ? "right" : "left");
-        glove_connected_logged_ = true;
-      }
-      return fallback;
-    }
-
-    if (!glove_connected_logged_)
-    {
-      RCLCPP_INFO(get_logger(), "SenseGlove connected (%s hand detected).",
-        use_right_hand_ ? "right" : "left");
-      glove_connected_logged_ = true;
-    }
-
     return result;
 #else
     return std::nullopt;
@@ -769,7 +729,7 @@ private:
     {
       qpos = clamp(qpos, clamp_qpos_min_, clamp_qpos_max_);
     }
-    return qpos;
+    return raw_angle_rad;
   }
 
   // Parameters & state
@@ -1109,12 +1069,12 @@ void SenseGloveNode::send_force_feedback()
     //   return;
     // }
 
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 500,
-      "Target fingertip forces (N): thumb=%.2f, index=%.2f, middle=%.2f",
-      forces_newton[0],
-      forces_newton[1],
-      forces_newton[2]);
+    // RCLCPP_INFO_THROTTLE(
+    //   get_logger(), *get_clock(), 500,
+    //   "Target fingertip forces (N): thumb=%.2f, index=%.2f, middle=%.2f",
+    //   forces_newton[0],
+    //   forces_newton[1],
+    //   forces_newton[2]);
 
     last_haptics_send_ = now;
   }
