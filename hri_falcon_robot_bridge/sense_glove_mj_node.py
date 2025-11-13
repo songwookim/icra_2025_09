@@ -267,6 +267,10 @@ class SenseGloveMJNode(Node):
         self.key_pub = self.create_publisher(String, self.key_topic, 10)
         self.units_state_pub = self.create_publisher(Bool, self.units_state_topic, 10)
 
+        # qpos publisher 추가
+        self.qpos_topic = "/hand_tracker/qpos"
+        self.qpos_pub = self.create_publisher(JointState, self.qpos_topic, 10)
+
         self.ee_pose_pub = None
         self.ee_pose_pub_mf = None
         self.ee_pose_pub_th = None
@@ -417,7 +421,21 @@ class SenseGloveMJNode(Node):
                 units_val = float(units_values[-1])
             else:
                 units_val = float(units_values[cmd_idx])
-            rad_val = units_val / denom
+            
+            # Subtract the 12 offset that was added when converting qpos to units
+            units_val_adjusted = units_val - 12.0
+            
+            # Subtract bias to get units_calc
+            bias = 1000.0 if cmd_idx in (0, 3, 6) else 2000.0
+            units_calc = units_val_adjusted - bias
+            
+            # Convert to radians
+            rad_val = units_calc / denom
+            
+            # Add offset to get final qpos
+            offset = 1.57 if cmd_idx in (0, 3, 6) else 3.14
+            rad_val += offset
+            
             f_idx = self._finger_index[finger_name]
             j_idx = JOINT_NAMES[finger_name].index(joint_name)
             zero_qpos[f_idx][j_idx] = rad_val
@@ -699,8 +717,8 @@ class SenseGloveMJNode(Node):
                 units_calc = 0.0
             units_calc = clamp(units_calc, -4096.0, 4096.0)
             bias = 1000.0 if cmd_idx in (0, 3, 6) else 2000.0
-            units_val = clamp(units_calc + bias, self.units_min, self.units_max)
-            units_out.append(int(round(units_val))+10)
+            units_val = clamp(units_calc + bias + 12.0, self.units_min, self.units_max)
+            units_out.append(int(round(units_val)))
 
         if any_valid:
             self._latest_raw_qpos = raw_qpos
@@ -714,6 +732,13 @@ class SenseGloveMJNode(Node):
                 msg = Int32MultiArray()
                 msg.data = units_out
                 self.units_pub.publish(msg)
+            
+            # qpos publish
+            qpos_msg = JointState()
+            qpos_msg.header.stamp = self.get_clock().now().to_msg()
+            qpos_msg.name = [f"{finger}_{joint}" for finger, joint in COMMAND_ORDER]
+            qpos_msg.position = [raw_qpos[self._finger_index[finger]][JOINT_NAMES[finger].index(joint)] for finger, joint in COMMAND_ORDER]
+            self.qpos_pub.publish(qpos_msg)
         else:
             self._latest_qpos_valid = False
             self._latest_raw_valid = False

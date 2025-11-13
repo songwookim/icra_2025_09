@@ -546,6 +546,14 @@ class DeformityTrackerNode(Node):
                         except Exception:
                             pass
                     elif key == ord('c'):
+                        # Publish 'c' for zero capture in sense_glove_mj_node
+                        try:
+                            if self.key_pub is not None:
+                                self.key_pub.publish(String(data='c'))
+                                self.get_logger().info("[Key/Zero] capture request forwarded")
+                        except Exception:
+                            pass
+                    elif key == ord('v'):
                         # Toggle video capture
                         try:
                             if not self._recording:
@@ -554,9 +562,6 @@ class DeformityTrackerNode(Node):
                             else:
                                 self._stop_capture()
                                 self.get_logger().info("[Key/Capture] stopped")
-                            # Also publish 'c' for zero capture in sense_glove_mj_node
-                            if self.key_pub is not None:
-                                self.key_pub.publish(String(data='c'))
                         except Exception as e:
                             self.get_logger().warn(f"[Key/Capture] toggle failed: {e}")
                     elif key == ord('f'):
