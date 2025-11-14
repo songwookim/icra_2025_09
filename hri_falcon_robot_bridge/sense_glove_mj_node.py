@@ -733,12 +733,29 @@ class SenseGloveMJNode(Node):
                 msg.data = units_out
                 self.units_pub.publish(msg)
             
-            # qpos publish
-            qpos_msg = JointState()
-            qpos_msg.header.stamp = self.get_clock().now().to_msg()
-            qpos_msg.name = [f"{finger}_{joint}" for finger, joint in COMMAND_ORDER]
-            qpos_msg.position = [raw_qpos[self._finger_index[finger]][JOINT_NAMES[finger].index(joint)] for finger, joint in COMMAND_ORDER]
-            self.qpos_pub.publish(qpos_msg)
+            # qpos publish - MuJoCo 시뮬레이터에서 읽어온 qpos 사용
+            if self._mj_enabled and self._mj_data is not None:
+                qpos_msg = JointState()
+                qpos_msg.header.stamp = self.get_clock().now().to_msg()
+                qpos_msg.name = [f"{finger}_{joint}" for finger, joint in COMMAND_ORDER]
+                qpos_positions = []
+                for finger_name, joint_name in COMMAND_ORDER:
+                    f_idx = self._finger_index[finger_name]
+                    j_idx = JOINT_NAMES[finger_name].index(joint_name)
+                    mj_joint_names = DCLAW_JOINTS[finger_name]
+                    mj_joint = mj_joint_names[j_idx]
+                    adr = self._mj_qpos_adr.get(mj_joint)
+                    if adr is not None:
+                        try:
+                            mj_qpos_val = float(self._mj_data.qpos[adr])
+                            # MuJoCo에서 읽은 값에 offset을 더해 원래 qpos로 복원
+                            qpos_positions.append(mj_qpos_val)
+                        except Exception:
+                            qpos_positions.append(0.0)
+                    else:
+                        qpos_positions.append(0.0)
+                qpos_msg.position = qpos_positions
+                self.qpos_pub.publish(qpos_msg)
         else:
             self._latest_qpos_valid = False
             self._latest_raw_valid = False
