@@ -42,8 +42,8 @@ Train all models (BC, GMM, GMR, LSTM-GMM, Diffusion, IBC, GP, MDN):
 ```bash
 cd /home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge
 python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
-  --stiffness-dir outputs/analysis/stiffness_profiles \
-  --mode unified \
+  --stiffness-dir outputs/analysis/stiffness_profiles_global_tk \
+  --mode per-finger \
   --models all \
   --bc-epochs 200 \
   --diffusion-epochs 200 \
@@ -64,6 +64,16 @@ python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
 - **MDN**: Mixture Density Network (GMM + deep learning)
 
 **Tip:** Line continuation uses backslash (\) as the very last character — no trailing spaces. To use global-T_K, change `--stiffness-dir` to `outputs/analysis/stiffness_profiles_global_tk`.
+
+### GP 대용량 처리 메모 (중요)
+- Exact GP는 메모리 O(N^2), 시간 O(N^3) 복잡도로, 수십만 샘플에서 메모리 에러가 납니다.
+- 본 레포 GPBaseline은 자동으로 학습용 샘플을 최대 4k로 랜덤 서브샘플링하고, 예측은 배치로 분할해 메모리 폭주를 막습니다.
+- 설정은 `scripts/3_model_learning/configs/stiffness_policy/gp.yaml`에서 조정 가능합니다:
+  - `max_train_points`: 학습 최대 샘플 수 (기본 4000)
+  - `batch_predict_size`: 배치 예측 크기 (기본 2048)
+  - `subsample_strategy`: random (추후 kmeans 등 추가 가능)
+  
+대용량에서 GP가 너무 느리면, `--stride`를 늘려 입력 데이터 자체를 다운샘플링하거나, GP를 제외하고 다른 모델군(MDN/BC/Diffusion 등)을 활용하세요.
 ```
 오프라인 증강
 

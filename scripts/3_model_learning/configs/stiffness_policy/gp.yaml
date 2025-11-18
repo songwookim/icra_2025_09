@@ -15,3 +15,9 @@ n_restarts_optimizer: 5  # Number of random restarts for hyperparameter optimiza
 
 # Output
 output_std: true  # Return predictive standard deviation
+
+# Scalability guards (exact GP is O(N^2) memory and O(N^3) time)
+# Cap the number of training points and use batched prediction.
+max_train_points: 4000       # Subsample to at most this many points for training
+subsample_strategy: random   # random (default); future: kmeans
+batch_predict_size: 2048     # Predict in batches to limit memory
