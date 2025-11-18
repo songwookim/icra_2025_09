@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING, Literal, cast
 import random
-import random
 
 import numpy as np  # type: ignore[import]
 import pandas as pd  # type: ignore[import]
@@ -35,15 +34,32 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score  #
 from sklearn.mixture import GaussianMixture  # type: ignore[import]
 from sklearn.model_selection import train_test_split  # type: ignore[import]
 from sklearn.preprocessing import StandardScaler  # type: ignore[import]
-
 try:
+    import yaml  # type: ignore[import]
+except ImportError:  # pragma: no cover - PyYAML optional but encouraged
+    yaml = None
+
+# Robust torch / tensorboard import separation: failure of tensorboard won't nullify torch.
+try:  # torch core
     import torch  # type: ignore[import]
     import torch.nn as nn  # type: ignore[import]
     import torch.nn.functional as F  # type: ignore[import]
     from torch.utils.data import DataLoader, TensorDataset  # type: ignore[import]
-    
-    # New Behavior Cloning Model
-    
+    TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    torch = cast(Any, None)
+    nn = cast(Any, None)
+    F = cast(Any, None)
+    DataLoader = cast(Any, None)
+    TensorDataset = cast(Any, None)
+    TORCH_AVAILABLE = False
+
+try:  # tensorboard (optional)
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore[import]
+except ImportError:  # pragma: no cover
+    SummaryWriter = cast(Any, None)
+
+if TORCH_AVAILABLE:
     class BehaviorCloningModel(nn.Module):
         def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int, depth: int):
             super().__init__()
@@ -69,6 +85,7 @@ try:
             lr: float = 1e-3,
             batch_size: int = 256,
             epochs: int = 200,
+            weight_decay: float = 1e-4,
             device: Optional[str] = None,
             seed: int = 0,
             log_name: str = "bc",
@@ -80,7 +97,7 @@ try:
             self.epochs = epochs
             self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
             self.model = BehaviorCloningModel(obs_dim, act_dim, hidden_dim, depth).to(self.device)
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-4)
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
             self.criterion = nn.MSELoss()
             self.log_name = log_name
 
@@ -116,22 +133,150 @@ try:
             obs_tensor = torch.from_numpy(obs.astype(np.float32)).to(self.device)
             preds = self.model(obs_tensor)
             return preds.detach().cpu().numpy()
-    from torch.utils.tensorboard import SummaryWriter  # type: ignore[import]
-except ImportError:  # pragma: no cover - torch optional
-    torch = cast(Any, None)
-    nn = cast(Any, None)
-    F = cast(Any, None)
-    DataLoader = cast(Any, None)
-    TensorDataset = cast(Any, None)
-    SummaryWriter = cast(Any, None)
 
 
-DEFAULT_LOG_DIR = Path("outputs") / "logs" / "success"
-DEFAULT_STIFFNESS_DIR = Path("outputs") / "analysis" / "stiffness_profiles"
-DEFAULT_OUTPUT_DIR = Path("outputs") / "models" / "stiffness_policies"
+# Resolve project root robustly, independent of current working directory.
+# Script path: <repo>/src/hri_falcon_robot_bridge/scripts/3_model_learning/run_stiffness_policy_benchmarks.py
+# parents[4] points to the repository root (…/icra2025)
+_THIS_FILE = Path(__file__).resolve()
+try:
+    _PROJECT_ROOT = _THIS_FILE.parents[4]  # …/icra2025
+except Exception:
+    _PROJECT_ROOT = Path.cwd()
+_PKG_ROOT = _THIS_FILE.parents[2]  # …/src/hri_falcon_robot_bridge
+CONFIG_DIR = _PKG_ROOT / "scripts" / "3_model_learning" / "configs" / "stiffness_policy"
+
+# Prefer outputs under the package (…/src/hri_falcon_robot_bridge/outputs) if present,
+# otherwise fall back to project root (…/icra2025/outputs).
+_LOG_CANDIDATES = [
+    _PKG_ROOT / "outputs" / "logs" / "success",
+    _PROJECT_ROOT / "outputs" / "logs" / "success",
+]
+_STIFF_CANDIDATES = [
+    _PKG_ROOT / "outputs" / "analysis" / "stiffness_profiles",
+    _PROJECT_ROOT / "outputs" / "analysis" / "stiffness_profiles",
+]
+_OUT_CANDIDATES = [
+    _PKG_ROOT / "outputs" / "models" / "stiffness_policies",
+    _PROJECT_ROOT / "outputs" / "models" / "stiffness_policies",
+]
+
+
+def _parse_simple_yaml(path: Path) -> Dict[str, Any]:
+    """Minimal parser for simple key: value configs when PyYAML is unavailable."""
+    result: Dict[str, Any] = {}
+    with path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.split("#", 1)[0].strip()
+            if not key or not value:
+                continue
+            lower = value.lower()
+            if lower in {"true", "false"}:
+                parsed: Any = lower == "true"
+            else:
+                try:
+                    parsed = int(value, 0)
+                except ValueError:
+                    try:
+                        parsed = float(value)
+                    except ValueError:
+                        parsed = value
+            result[key] = parsed
+    return result
+
+
+def _load_yaml_config(name: str) -> Dict[str, Any]:
+    path = CONFIG_DIR / f"{name}.yaml"
+    if not path.exists():
+        return {}
+    if yaml is None:
+        data = _parse_simple_yaml(path)
+    else:
+        with path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config {path} must contain a mapping, got {type(data).__name__}")
+    return data
+
+
+TRAINING_DEFAULTS = _load_yaml_config("training_defaults")
+BC_CONFIG = _load_yaml_config("behavior_cloning")
+DIFF_COND_CONFIG = _load_yaml_config("diffusion_conditional")
+DIFF_TEMP_CONFIG = _load_yaml_config("diffusion_temporal")
+GMM_CONFIG = _load_yaml_config("gmm")
+IBC_CONFIG = _load_yaml_config("ibc")
+LSTM_GMM_CONFIG = _load_yaml_config("lstm_gmm")
+GP_CONFIG = _load_yaml_config("gp")
+MDN_CONFIG = _load_yaml_config("mdn")
+
+def _pick_first_existing(paths):
+    for p in paths:
+        if p.exists():
+            return p
+    return paths[0]
+
+DEFAULT_LOG_DIR = _pick_first_existing(_LOG_CANDIDATES)
+DEFAULT_STIFFNESS_DIR = _pick_first_existing(_STIFF_CANDIDATES)
+DEFAULT_OUTPUT_DIR = _pick_first_existing(_OUT_CANDIDATES)
 DEFAULT_TENSORBOARD_DIR = DEFAULT_OUTPUT_DIR / "tensorboard"
-OBS_COLUMNS = ["Fx", "Fy", "Fz", "deform_circ", "deform_ecc", "ee_px", "ee_py", "ee_pz"]
-ACTION_COLUMNS = ["Kx_lp", "Ky_lp", "Kz_lp"]
+# Observation columns: force (s1/s2/s3) from stiffness profile + deform/ee from raw demo
+OBS_COLUMNS = [
+    "s1_fx",
+    "s1_fy",
+    "s1_fz",
+    "s2_fx",
+    "s2_fy",
+    "s2_fz",
+    "s3_fx",
+    "s3_fy",
+    "s3_fz",
+    "deform_circ",
+    "deform_ecc",
+    "ee_if_px",
+    "ee_if_py",
+    "ee_if_pz",
+    "ee_mf_px",
+    "ee_mf_py",
+    "ee_mf_pz",
+    "ee_th_px",
+    "ee_th_py",
+    "ee_th_pz",
+]
+# Action columns: thumb (th), index (if), middle (mf) finger stiffness from stiffness profile
+ACTION_COLUMNS = [
+    "th_k1",
+    "th_k2",
+    "th_k3",
+    "if_k1",
+    "if_k2",
+    "if_k3",
+    "mf_k1",
+    "mf_k2",
+    "mf_k3",
+]
+
+# Per-finger observation and action columns (for independent models)
+FINGER_CONFIG = {
+    "th": {
+        "obs": ["s1_fx", "s1_fy", "s1_fz", "ee_th_px", "ee_th_py", "ee_th_pz", "deform_circ", "deform_ecc"],
+        "act": ["th_k1", "th_k2", "th_k3"],
+    },
+    "if": {
+        "obs": ["s2_fx", "s2_fy", "s2_fz", "ee_if_px", "ee_if_py", "ee_if_pz", "deform_circ", "deform_ecc"],
+        "act": ["if_k1", "if_k2", "if_k3"],
+    },
+    "mf": {
+        "obs": ["s3_fx", "s3_fy", "s3_fz", "ee_mf_px", "ee_mf_py", "ee_mf_pz", "deform_circ", "deform_ecc"],
+        "act": ["mf_k1", "mf_k2", "mf_k3"],
+    },
+}
 EPS = 1e-8
 
 
@@ -218,6 +363,16 @@ def _load_single_demo(log_path: Path, stiffness_dir: Path, stride: int) -> Optio
     raw = raw.iloc[:rows].reset_index(drop=True)
     stiff = stiff.iloc[:rows].reset_index(drop=True)
 
+    # Backward compatibility: if ee_if_px/py/pz is missing, use ee_px/py/pz
+    for finger in ["if", "mf", "th"]:
+        ee_finger_prefix = f"ee_{finger}_"
+        legacy_prefix = "ee_"
+        for axis in ["px", "py", "pz"]:
+            new_col = f"{ee_finger_prefix}{axis}"
+            old_col = f"{legacy_prefix}{axis}"
+            if new_col not in raw.columns and old_col in raw.columns:
+                raw[new_col] = raw[old_col]
+
     missing_obs = [col for col in OBS_COLUMNS if col not in raw.columns and col not in stiff.columns]
     if missing_obs:
         print(f"[skip] {log_path.name}: missing observation columns {missing_obs}")
@@ -261,6 +416,98 @@ def load_dataset(log_dir: Path, stiffness_dir: Path, stride: int) -> List[Trajec
             trajectories.append(traj)
     if not trajectories:
         raise RuntimeError("No valid demonstrations found. Ensure stiffness profiles exist.")
+    return trajectories
+
+
+def _load_single_demo_per_finger(
+    log_path: Path, stiffness_dir: Path, stride: int, finger: str
+) -> Optional[Trajectory]:
+    """Load a single demo for one finger (th/if/mf) with finger-specific obs/act columns."""
+    if finger not in FINGER_CONFIG:
+        raise ValueError(f"Invalid finger: {finger}. Must be one of {list(FINGER_CONFIG.keys())}")
+    
+    obs_cols = FINGER_CONFIG[finger]["obs"]
+    act_cols = FINGER_CONFIG[finger]["act"]
+    
+    try:
+        raw = pd.read_csv(log_path)
+    except Exception as exc:
+        print(f"[skip] {log_path.name} ({finger}): load failed ({exc})")
+        return None
+
+    try:
+        stiff = pd.read_csv(_resolve_stiffness_csv(stiffness_dir, log_path.stem))
+    except Exception as exc:
+        print(f"[skip] {log_path.name} ({finger}): stiffness load failed ({exc})")
+        return None
+
+    rows = min(len(raw), len(stiff))
+    if rows < 5:
+        print(f"[skip] {log_path.name} ({finger}): insufficient paired samples ({rows})")
+        return None
+
+    raw = raw.iloc[:rows].reset_index(drop=True)
+    stiff = stiff.iloc[:rows].reset_index(drop=True)
+
+    # Backward compatibility: if ee_if_px/py/pz is missing, use ee_px/py/pz
+    ee_finger_prefix = f"ee_{finger}_"
+    legacy_prefix = "ee_"
+    for axis in ["px", "py", "pz"]:
+        new_col = f"{ee_finger_prefix}{axis}"
+        old_col = f"{legacy_prefix}{axis}"
+        if new_col not in raw.columns and old_col in raw.columns:
+            raw[new_col] = raw[old_col]
+
+    # Check if all required columns exist
+    missing_obs = [col for col in obs_cols if col not in raw.columns and col not in stiff.columns]
+    if missing_obs:
+        print(f"[skip] {log_path.name} ({finger}): missing observation columns {missing_obs}")
+        return None
+
+    missing_act = [col for col in act_cols if col not in stiff.columns]
+    if missing_act:
+        print(f"[skip] {log_path.name} ({finger}): missing action columns {missing_act}")
+        return None
+
+    # Build observation array
+    obs_parts: List[np.ndarray] = []
+    for col in obs_cols:
+        if col in stiff.columns:
+            obs_parts.append(stiff[col].to_numpy(dtype=float).reshape(-1, 1))
+        else:
+            obs_parts.append(raw[col].to_numpy(dtype=float).reshape(-1, 1))
+    obs = np.hstack(obs_parts)
+
+    # Build action array
+    act = stiff[act_cols].to_numpy(dtype=float)
+
+    # Filter invalid values
+    mask = np.isfinite(obs).all(axis=1) & np.isfinite(act).all(axis=1)
+    obs = obs[mask]
+    act = act[mask]
+    
+    if stride > 1:
+        obs = obs[::stride]
+        act = act[::stride]
+        
+    if obs.shape[0] < 5:
+        print(f"[skip] {log_path.name} ({finger}): too few samples after filtering ({obs.shape[0]})")
+        return None
+
+    return Trajectory(name=f"{log_path.stem}_{finger}", observations=obs, actions=act)
+
+
+def load_dataset_per_finger(log_dir: Path, stiffness_dir: Path, stride: int, finger: str) -> List[Trajectory]:
+    """Load all demos for a specific finger."""
+    trajectories: List[Trajectory] = []
+    for csv_path in sorted(log_dir.glob("*.csv")):
+        if csv_path.name.endswith("_paper_profile.csv"):
+            continue
+        traj = _load_single_demo_per_finger(csv_path, stiffness_dir, stride, finger)
+        if traj is not None:
+            trajectories.append(traj)
+    if not trajectories:
+        raise RuntimeError(f"No valid demonstrations found for finger '{finger}'. Ensure stiffness profiles exist.")
     return trajectories
 
 
@@ -844,6 +1091,356 @@ if torch is not None:
             return act.cpu().numpy()
 
 
+class GPBaseline:
+    """Gaussian Process Regression for stiffness prediction with uncertainty quantification."""
+    
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        kernel_type: str = "rbf_ard",
+        length_scale_bounds: Tuple[float, float] = (0.01, 100.0),
+        nu: float = 1.5,
+        alpha: float = 1e-4,
+        normalize_y: bool = True,
+        n_restarts_optimizer: int = 5,
+    ):
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import RBF, Matern, ConstantKernel as C
+        
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        # Coerce numeric parameters (YAML may parse scientific notation as string)
+        try:
+            alpha = float(alpha)
+        except Exception:
+            alpha = 1e-4
+        if isinstance(length_scale_bounds, (list, tuple)):
+            length_scale_bounds = tuple(float(x) for x in length_scale_bounds)
+        try:
+            nu = float(nu)
+        except Exception:
+            nu = 1.5
+        try:
+            n_restarts_optimizer = int(n_restarts_optimizer)
+        except Exception:
+            n_restarts_optimizer = 5
+
+        self.normalize_y = bool(normalize_y)
+        self.n_restarts = n_restarts_optimizer
+        self.alpha = alpha
+        
+        # Build kernel
+        if kernel_type == "rbf_ard":
+            # Automatic Relevance Determination: separate length scale per input dimension
+            kernel = C(1.0, (1e-3, 1e3)) * RBF(
+                length_scale=np.ones(obs_dim),
+                length_scale_bounds=length_scale_bounds,
+            )
+        elif kernel_type == "rbf":
+            kernel = C(1.0, (1e-3, 1e3)) * RBF(
+                length_scale=1.0,
+                length_scale_bounds=length_scale_bounds,
+            )
+        elif kernel_type == "matern":
+            kernel = C(1.0, (1e-3, 1e3)) * Matern(
+                length_scale=np.ones(obs_dim),
+                length_scale_bounds=length_scale_bounds,
+                nu=nu,
+            )
+        else:
+            raise ValueError(f"Unknown kernel_type: {kernel_type}")
+        
+        # One GP per action dimension
+        self.gps = []
+        for _ in range(act_dim):
+            gp = GaussianProcessRegressor(
+                kernel=kernel,
+                alpha=alpha,
+                normalize_y=normalize_y,
+                n_restarts_optimizer=n_restarts_optimizer,
+                random_state=42,
+            )
+            self.gps.append(gp)
+    
+    def fit(self, obs: np.ndarray, act: np.ndarray) -> None:
+        """Fit one GP per action dimension."""
+        for i, gp in enumerate(self.gps):
+            gp.fit(obs, act[:, i])
+    
+    def predict(self, obs: np.ndarray, return_std: bool = False) -> np.ndarray:
+        """Predict with optional uncertainty."""
+        if return_std:
+            means = []
+            stds = []
+            for gp in self.gps:
+                mean, std = gp.predict(obs, return_std=True)
+                means.append(mean)
+                stds.append(std)
+            return np.column_stack(means), np.column_stack(stds)
+        else:
+            preds = [gp.predict(obs) for gp in self.gps]
+            return np.column_stack(preds)
+    
+    def nll(self, obs: np.ndarray, act: np.ndarray) -> float:
+        """Negative log likelihood (sum across action dimensions)."""
+        total_nll = 0.0
+        for i, gp in enumerate(self.gps):
+            total_nll += -gp.log_marginal_likelihood(gp.kernel_.theta)
+        return float(total_nll)
+
+
+if torch is not None:
+    
+    class MDNHead(nn.Module):
+        """Mixture Density Network head for multimodal predictions."""
+        
+        def __init__(
+            self,
+            input_dim: int,
+            output_dim: int,
+            n_components: int,
+            covariance_type: str = "diag",
+        ):
+            super().__init__()
+            self.output_dim = output_dim
+            self.n_components = n_components
+            self.covariance_type = covariance_type
+            
+            # Mixture weights (logits)
+            self.pi_head = nn.Linear(input_dim, n_components)
+            
+            # Means (n_components × output_dim)
+            self.mu_head = nn.Linear(input_dim, n_components * output_dim)
+            
+            # Covariances
+            if covariance_type == "diag":
+                # Log variance (n_components × output_dim)
+                self.sigma_head = nn.Linear(input_dim, n_components * output_dim)
+            elif covariance_type == "full":
+                # Lower triangular Cholesky factor (n_components × output_dim × output_dim)
+                n_tril = output_dim * (output_dim + 1) // 2
+                self.sigma_head = nn.Linear(input_dim, n_components * n_tril)
+            else:
+                raise ValueError(f"Unknown covariance_type: {covariance_type}")
+        
+        def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """
+            Returns:
+                pi: (batch, n_components) mixture weights (softmax)
+                mu: (batch, n_components, output_dim) means
+                sigma: (batch, n_components, output_dim) or (batch, n_components, output_dim, output_dim)
+            """
+            batch_size = x.shape[0]
+            
+            # Mixture weights
+            pi = F.softmax(self.pi_head(x), dim=-1)  # (batch, K)
+            
+            # Means
+            mu = self.mu_head(x).view(batch_size, self.n_components, self.output_dim)
+            
+            # Covariances
+            if self.covariance_type == "diag":
+                # Softplus ensures positivity
+                log_sigma = self.sigma_head(x).view(batch_size, self.n_components, self.output_dim)
+                sigma = F.softplus(log_sigma) + 1e-4  # (batch, K, D)
+            else:  # full
+                raise NotImplementedError("Full covariance not yet implemented")
+            
+            return pi, mu, sigma
+    
+    
+    class MDNBaseline:
+        """Mixture Density Network baseline for multimodal stiffness prediction."""
+        
+        def __init__(
+            self,
+            obs_dim: int,
+            act_dim: int,
+            hidden_units: List[int],
+            n_components: int,
+            covariance_type: str = "diag",
+            activation: str = "relu",
+            dropout: float = 0.1,
+            learning_rate: float = 0.001,
+            weight_decay: float = 0.0001,
+            mixture_reg: float = 0.01,
+            covariance_floor: float = 1e-4,
+        ):
+            self.obs_dim = obs_dim
+            self.act_dim = act_dim
+            self.n_components = n_components
+            self.covariance_type = covariance_type
+            self.lr = learning_rate
+            self.weight_decay = weight_decay
+            self.mixture_reg = mixture_reg
+            self.covariance_floor = covariance_floor
+            
+            # Build encoder
+            layers: List[nn.Module] = []
+            in_dim = obs_dim
+            for h_dim in hidden_units:
+                layers.append(nn.Linear(in_dim, h_dim))
+                if activation == "relu":
+                    layers.append(nn.ReLU())
+                elif activation == "tanh":
+                    layers.append(nn.Tanh())
+                elif activation == "elu":
+                    layers.append(nn.ELU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+                in_dim = h_dim
+            
+            self.encoder = nn.Sequential(*layers)
+            self.mdn_head = MDNHead(in_dim, act_dim, n_components, covariance_type)
+            self.model = nn.Sequential(self.encoder, self.mdn_head)
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay,
+            )
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.to(self.device)
+        
+        def _mdn_loss(
+            self,
+            pi: torch.Tensor,
+            mu: torch.Tensor,
+            sigma: torch.Tensor,
+            target: torch.Tensor,
+        ) -> torch.Tensor:
+            """Negative log likelihood for MDN (diagonal covariance)."""
+            # pi: (batch, K)
+            # mu: (batch, K, D)
+            # sigma: (batch, K, D)
+            # target: (batch, D)
+            
+            target = target.unsqueeze(1)  # (batch, 1, D)
+            
+            # Gaussian log prob per component
+            diff = target - mu  # (batch, K, D)
+            log_prob = -0.5 * (
+                diff**2 / (sigma + self.covariance_floor)
+                + torch.log(sigma + self.covariance_floor)
+                + math.log(2 * math.pi)
+            ).sum(dim=-1)  # (batch, K)
+            
+            # Mixture log prob
+            log_pi = torch.log(pi + 1e-8)  # (batch, K)
+            log_mixture = torch.logsumexp(log_pi + log_prob, dim=-1)  # (batch,)
+            
+            # Entropy regularization (encourage diversity)
+            entropy = -(pi * log_pi).sum(dim=-1).mean()
+            
+            return -log_mixture.mean() - self.mixture_reg * entropy
+        
+        def fit(
+            self,
+            obs_train: np.ndarray,
+            act_train: np.ndarray,
+            obs_val: np.ndarray,
+            act_val: np.ndarray,
+            epochs: int,
+            batch_size: int,
+            patience: int = 30,
+            min_delta: float = 1e-4,
+            writer: Optional[Any] = None,
+        ) -> None:
+            """Train MDN with early stopping."""
+            train_dataset = TensorDataset(
+                torch.FloatTensor(obs_train),
+                torch.FloatTensor(act_train),
+            )
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            
+            obs_val_t = torch.FloatTensor(obs_val).to(self.device)
+            act_val_t = torch.FloatTensor(act_val).to(self.device)
+            
+            best_val_loss = float("inf")
+            patience_counter = 0
+            
+            for epoch in range(epochs):
+                self.model.train()
+                train_loss = 0.0
+                for obs_b, act_b in train_loader:
+                    obs_b = obs_b.to(self.device)
+                    act_b = act_b.to(self.device)
+                    
+                    self.optimizer.zero_grad()
+                    features = self.encoder(obs_b)
+                    pi, mu, sigma = self.mdn_head(features)
+                    loss = self._mdn_loss(pi, mu, sigma, act_b)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optimizer.step()
+                    
+                    train_loss += loss.item() * obs_b.shape[0]
+                
+                train_loss /= len(train_dataset)
+                
+                # Validation
+                self.model.eval()
+                with torch.no_grad():
+                    features_val = self.encoder(obs_val_t)
+                    pi_val, mu_val, sigma_val = self.mdn_head(features_val)
+                    val_loss = self._mdn_loss(pi_val, mu_val, sigma_val, act_val_t).item()
+                
+                if writer:
+                    writer.add_scalar("MDN/train_loss", train_loss, epoch)
+                    writer.add_scalar("MDN/val_loss", val_loss, epoch)
+                
+                # Early stopping
+                if val_loss < best_val_loss - min_delta:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= patience:
+                    print(f"  Early stopping at epoch {epoch+1}")
+                    break
+                
+                if (epoch + 1) % 20 == 0:
+                    print(f"  Epoch {epoch+1}/{epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
+        
+        def predict(self, obs: np.ndarray, mode: str = "mean") -> np.ndarray:
+            """Predict with mode='mean' (mixture mean) or 'sample' (sample from mixture)."""
+            self.model.eval()
+            with torch.no_grad():
+                obs_t = torch.FloatTensor(obs).to(self.device)
+                features = self.encoder(obs_t)
+                pi, mu, sigma = self.mdn_head(features)
+                
+                if mode == "mean":
+                    # Weighted mean of components
+                    pred = (pi.unsqueeze(-1) * mu).sum(dim=1)  # (batch, D)
+                elif mode == "sample":
+                    # Sample from mixture
+                    batch_size = obs_t.shape[0]
+                    # Choose component per sample
+                    component_idx = torch.multinomial(pi, 1).squeeze(-1)  # (batch,)
+                    # Select corresponding mu and sigma
+                    mu_selected = mu[torch.arange(batch_size), component_idx]  # (batch, D)
+                    sigma_selected = sigma[torch.arange(batch_size), component_idx]  # (batch, D)
+                    # Sample from Gaussian
+                    pred = mu_selected + sigma_selected * torch.randn_like(mu_selected)
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+                
+                return pred.cpu().numpy()
+        
+        def nll(self, obs: np.ndarray, act: np.ndarray) -> float:
+            """Negative log likelihood."""
+            self.model.eval()
+            with torch.no_grad():
+                obs_t = torch.FloatTensor(obs).to(self.device)
+                act_t = torch.FloatTensor(act).to(self.device)
+                features = self.encoder(obs_t)
+                pi, mu, sigma = self.mdn_head(features)
+                loss = self._mdn_loss(pi, mu, sigma, act_t)
+                return loss.item()
+
+
 def compute_metrics(target: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
     mse = mean_squared_error(target, pred)
     rmse = math.sqrt(mse)
@@ -895,9 +1492,63 @@ def save_predictions(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run stiffness policy benchmarks.")
-    # 참고: configs/stiffness_policy/*.yaml 파일에 모델별 기본 하이퍼파라미터가 정리되어 있다.
-    # 스크립트가 YAML을 자동으로 로드하지는 않으므로, 값을 바꾸고 싶으면 여기 대응되는
-    # CLI 인자(예: --diffusion-epochs, --ibc-batch 등)를 직접 지정해서 덮어써야 한다.
+    training_defaults = TRAINING_DEFAULTS or {}
+
+    def _first_available_int(candidates: Sequence[Any], fallback: int) -> int:
+        for value in candidates:
+            if value is None:
+                continue
+            return int(value)
+        return fallback
+
+    seed_default = int(training_defaults.get("seed", 0))
+    stride_default = int(training_defaults.get("stride", 1))
+    test_size_default = float(training_defaults.get("test_size", 0.25))
+    sequence_window_default = _first_available_int(
+        (
+            training_defaults.get("sequence_window"),
+            DIFF_TEMP_CONFIG.get("sequence_window"),
+            LSTM_GMM_CONFIG.get("sequence_window"),
+        ),
+        1,
+    )
+    save_predictions_default = bool(training_defaults.get("save_predictions", False))
+    tensorboard_default = bool(training_defaults.get("use_tensorboard", True))
+
+    gmm_components_default = int(GMM_CONFIG.get("components", 8))
+    gmm_covariance_default = GMM_CONFIG.get("covariance_type", "full")
+    gmm_samples_default = int(GMM_CONFIG.get("samples", 16))
+    gmm_reg_covar_default = float(GMM_CONFIG.get("reg_covar", 1e-5))
+
+    bc_hidden_default = int(BC_CONFIG.get("hidden_dim", 256))
+    bc_depth_default = int(BC_CONFIG.get("hidden_layers", 3))
+    bc_batch_default = int(BC_CONFIG.get("batch_size", 256))
+    bc_lr_default = float(BC_CONFIG.get("learning_rate", 1e-3))
+    bc_epochs_default = int(BC_CONFIG.get("epochs", 200))
+    bc_weight_decay_default = float(BC_CONFIG.get("weight_decay", 1e-4))
+
+    diff_steps_default = int(DIFF_COND_CONFIG.get("steps", 75))
+    diff_hidden_default = int(DIFF_COND_CONFIG.get("hidden_dim", 256))
+    diff_batch_default = int(DIFF_COND_CONFIG.get("batch_size", 256))
+    diff_lr_default = float(DIFF_COND_CONFIG.get("learning_rate", 1e-3))
+    diff_epochs_default = int(DIFF_COND_CONFIG.get("epochs", 200))
+    diff_eta_default = float(DIFF_COND_CONFIG.get("eta", 0.0))
+
+    ibc_hidden_default = int(IBC_CONFIG.get("hidden_dim", 256))
+    ibc_depth_default = int(IBC_CONFIG.get("hidden_layers", 3))
+    ibc_batch_default = IBC_CONFIG.get("batch_size")
+    ibc_lr_default = float(IBC_CONFIG.get("learning_rate", 1e-3))
+    ibc_epochs_default = int(IBC_CONFIG.get("epochs", 300))
+    ibc_noise_default = float(IBC_CONFIG.get("noise_std", 0.5))
+    ibc_langevin_steps_default = int(IBC_CONFIG.get("langevin_steps", 30))
+    ibc_step_size_default = float(IBC_CONFIG.get("langevin_step_size", 1e-2))
+
+    lstm_components_default = int(LSTM_GMM_CONFIG.get("components", 5))
+    lstm_hidden_default = int(LSTM_GMM_CONFIG.get("hidden_dim", 256))
+    lstm_layers_default = int(LSTM_GMM_CONFIG.get("lstm_layers", 1))
+    lstm_epochs_default = int(LSTM_GMM_CONFIG.get("epochs", 200))
+    lstm_lr_default = float(LSTM_GMM_CONFIG.get("learning_rate", 1e-3))
+
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="Directory with raw demonstrations")
     parser.add_argument(
         "--stiffness-dir",
@@ -907,53 +1558,79 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for benchmark artifacts")
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="per-finger",
+        choices=["unified", "per-finger"],
+        help="Training mode: 'unified' (all obs->all act, 20D->9D) or 'per-finger' (3 independent models, 8D->3D each)",
+    )
+    parser.add_argument(
+        "--use-emg",
+        action="store_true",
+        help="Add EMG signals to observations (oracle experiment: 20D→28D or 8D→16D). Should achieve high R² if model architecture is correct.",
+    )
+    parser.add_argument(
         "--models",
         type=str,
         default="all",
-        help="Comma-separated models: gmm,gmr,bc,diffusion_c,diffusion_t,lstm_gmm,ibc,all (default: all)",
+        help="Comma-separated models: gmm,gmr,bc,diffusion_c,diffusion_t,lstm_gmm,ibc,gp,mdn,all (default: all)",
     )
-    parser.add_argument("--test-size", type=float, default=0.25, help="Fraction of trajectories reserved for testing")
+    parser.add_argument("--test-size", type=float, default=test_size_default, help="Fraction of trajectories reserved for testing")
     parser.add_argument(
         "--eval-demo",
         type=str,
         default=None,
         help="Optional CSV stem to reserve as the only evaluation trajectory (overrides --test-size)",
     )
-    parser.add_argument("--stride", type=int, default=1, help="Subsample demonstrations by stride")
-    parser.add_argument("--sequence-window", type=int, default=1, help="Temporal window length for sequence models")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--gmm-components", type=int, default=8, help="Number of mixture components")
-    parser.add_argument("--gmm-covariance", type=str, default="full", choices=["full", "diag", "spherical", "tied"], help="Covariance type")
-    parser.add_argument("--gmm-samples", type=int, default=16, help="Samples per query for stochastic GMM benchmark")
-    parser.add_argument("--diffusion-epochs", type=int, default=200, help="Training epochs for the diffusion policy")
-    parser.add_argument("--diffusion-steps", type=int, default=75, help="Diffusion timetable length")
-    parser.add_argument("--diffusion-hidden", type=int, default=256, help="Hidden width for the diffusion policy network")
-    parser.add_argument("--diffusion-batch", type=int, default=256, help="Batch size for diffusion policy training")
-    parser.add_argument("--diffusion-lr", type=float, default=1e-3, help="Learning rate for the diffusion policy")
-    parser.add_argument("--diffusion-eta", type=float, default=0.0, help="DDIM eta used for deterministic/stochastic trade-off")
-    parser.add_argument("--bc-epochs", type=int, default=200, help="Training epochs for behavior cloning baseline")
-    parser.add_argument("--bc-hidden", type=int, default=256, help="Hidden width for behavior cloning MLP")
-    parser.add_argument("--bc-depth", type=int, default=3, help="Number of hidden layers for behavior cloning MLP")
-    parser.add_argument("--bc-batch", type=int, default=256, help="Batch size for behavior cloning training")
-    parser.add_argument("--bc-lr", type=float, default=1e-3, help="Learning rate for behavior cloning baseline")
-    parser.add_argument("--lstm-gmm-components", type=int, default=5, help="Mixture components for LSTM-GMM baseline")
-    parser.add_argument("--lstm-gmm-hidden", type=int, default=256, help="Hidden width for LSTM encoder")
-    parser.add_argument("--lstm-gmm-layers", type=int, default=1, help="Number of LSTM layers")
-    parser.add_argument("--lstm-gmm-epochs", type=int, default=200, help="Training epochs for LSTM-GMM baseline")
-    parser.add_argument("--ibc-epochs", type=int, default=300, help="Training epochs for IBC baseline")
-    parser.add_argument("--ibc-hidden", type=int, default=256, help="Hidden width for IBC score network")
-    parser.add_argument("--ibc-depth", type=int, default=3, help="Hidden layers for IBC score network")
-    parser.add_argument("--ibc-lr", type=float, default=1e-3, help="Learning rate for IBC baseline")
-    parser.add_argument("--ibc-noise-std", type=float, default=0.5, help="Noise std used in IBC training and sampling")
-    parser.add_argument("--ibc-langevin-steps", type=int, default=30, help="Langevin iterations for IBC sampling")
-    parser.add_argument("--ibc-step-size", type=float, default=1e-2, help="Step size for IBC Langevin updates")
-    parser.add_argument("--ibc-batch", type=int, default=None, help="Batch size override for IBC baseline (defaults to --bc-batch)")
+    parser.add_argument("--stride", type=int, default=stride_default, help="Subsample demonstrations by stride")
+    parser.add_argument("--sequence-window", type=int, default=sequence_window_default, help="Temporal window length for sequence models")
+    parser.add_argument("--seed", type=int, default=seed_default, help="Random seed")
+    parser.add_argument("--gmm-components", type=int, default=gmm_components_default, help="Number of mixture components")
+    parser.add_argument(
+        "--gmm-covariance",
+        type=str,
+        default=gmm_covariance_default,
+        choices=["full", "diag", "spherical", "tied"],
+        help="Covariance type",
+    )
+    parser.add_argument("--gmm-samples", type=int, default=gmm_samples_default, help="Samples per query for stochastic GMM benchmark")
+    parser.add_argument("--gmm-reg-covar", type=float, default=gmm_reg_covar_default, help="Regularisation term for GMM covariances")
+    parser.add_argument("--diffusion-epochs", type=int, default=diff_epochs_default, help="Training epochs for the diffusion policy")
+    parser.add_argument("--diffusion-steps", type=int, default=diff_steps_default, help="Diffusion timetable length")
+    parser.add_argument("--diffusion-hidden", type=int, default=diff_hidden_default, help="Hidden width for the diffusion policy network")
+    parser.add_argument("--diffusion-batch", type=int, default=diff_batch_default, help="Batch size for diffusion policy training")
+    parser.add_argument("--diffusion-lr", type=float, default=diff_lr_default, help="Learning rate for the diffusion policy")
+    parser.add_argument("--diffusion-eta", type=float, default=diff_eta_default, help="DDIM eta used for deterministic/stochastic trade-off")
+    parser.add_argument("--bc-epochs", type=int, default=bc_epochs_default, help="Training epochs for behavior cloning baseline")
+    parser.add_argument("--bc-hidden", type=int, default=bc_hidden_default, help="Hidden width for behavior cloning MLP")
+    parser.add_argument("--bc-depth", type=int, default=bc_depth_default, help="Number of hidden layers for behavior cloning MLP")
+    parser.add_argument("--bc-batch", type=int, default=bc_batch_default, help="Batch size for behavior cloning training")
+    parser.add_argument("--bc-lr", type=float, default=bc_lr_default, help="Learning rate for behavior cloning baseline")
+    parser.add_argument("--bc-weight-decay", type=float, default=bc_weight_decay_default, help="Weight decay for behavior cloning baseline")
+    parser.add_argument("--lstm-gmm-components", type=int, default=lstm_components_default, help="Mixture components for LSTM-GMM baseline")
+    parser.add_argument("--lstm-gmm-hidden", type=int, default=lstm_hidden_default, help="Hidden width for LSTM encoder")
+    parser.add_argument("--lstm-gmm-layers", type=int, default=lstm_layers_default, help="Number of LSTM layers")
+    parser.add_argument("--lstm-gmm-epochs", type=int, default=lstm_epochs_default, help="Training epochs for LSTM-GMM baseline")
+    parser.add_argument("--lstm-gmm-lr", type=float, default=lstm_lr_default, help="Learning rate for LSTM-GMM baseline")
+    parser.add_argument("--ibc-epochs", type=int, default=ibc_epochs_default, help="Training epochs for IBC baseline")
+    parser.add_argument("--ibc-hidden", type=int, default=ibc_hidden_default, help="Hidden width for IBC score network")
+    parser.add_argument("--ibc-depth", type=int, default=ibc_depth_default, help="Hidden layers for IBC score network")
+    parser.add_argument("--ibc-lr", type=float, default=ibc_lr_default, help="Learning rate for IBC baseline")
+    parser.add_argument("--ibc-noise-std", type=float, default=ibc_noise_default, help="Noise std used in IBC training and sampling")
+    parser.add_argument("--ibc-langevin-steps", type=int, default=ibc_langevin_steps_default, help="Langevin iterations for IBC sampling")
+    parser.add_argument("--ibc-step-size", type=float, default=ibc_step_size_default, help="Step size for IBC Langevin updates")
+    parser.add_argument(
+        "--ibc-batch",
+        type=int,
+        default=int(ibc_batch_default) if ibc_batch_default is not None else None,
+        help="Batch size override for IBC baseline (defaults to its config value or --bc-batch)",
+    )
+    parser.set_defaults(tensorboard=tensorboard_default)
     parser.add_argument(
         "--tensorboard",
         dest="tensorboard",
         action="store_true",
-        default=True,
-        help="Enable TensorBoard logging for neural models (default: enabled)",
+        help="Enable TensorBoard logging for neural models",
     )
     parser.add_argument(
         "--no-tensorboard",
@@ -967,12 +1644,79 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TENSORBOARD_DIR,
         help="Base directory for TensorBoard logs (used when --tensorboard)",
     )
-    parser.add_argument("--save-predictions", action="store_true", help="Persist per-sample predictions to CSV")
+    parser.set_defaults(save_predictions=save_predictions_default)
+    parser.add_argument(
+        "--save-predictions",
+        dest="save_predictions",
+        action="store_true",
+        help="Persist per-sample predictions to CSV",
+    )
+    parser.add_argument(
+        "--no-save-predictions",
+        dest="save_predictions",
+        action="store_false",
+        help="Disable CSV export of predictions",
+    )
+    
+    # Data augmentation arguments
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="Enable data augmentation to increase training samples",
+    )
+    parser.add_argument(
+        "--augment-num",
+        type=int,
+        default=3,
+        help="Number of augmented copies per demonstration (default: 3)",
+    )
+    parser.add_argument(
+        "--augment-noise-force",
+        type=float,
+        default=0.02,
+        help="Noise std for force sensors (relative, default: 0.02 = 2%%)",
+    )
+    parser.add_argument(
+        "--augment-noise-stiffness",
+        type=float,
+        default=0.05,
+        help="Noise std for stiffness (relative, default: 0.05 = 5%%)",
+    )
+    parser.add_argument(
+        "--augment-scale-force",
+        type=float,
+        nargs=2,
+        default=[0.95, 1.05],
+        help="Force scaling range (min max, default: 0.95 1.05)",
+    )
+    parser.add_argument(
+        "--augment-scale-stiffness",
+        type=float,
+        nargs=2,
+        default=[0.90, 1.10],
+        help="Stiffness scaling range (min max, default: 0.90 1.10)",
+    )
+    parser.add_argument(
+        "--augment-temporal-jitter",
+        type=int,
+        default=3,
+        help="Max temporal jitter in timesteps (default: 3)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    
+    # Configure observation columns based on --use-emg flag
+    global OBS_COLUMNS
+    if args.use_emg:
+        OBS_COLUMNS = OBS_COLUMNS_WITH_EMG
+        print(f"[info] ⚡ ORACLE MODE: Using EMG observations ({len(OBS_COLUMNS)}D)")
+        print(f"[info] Expected: High R² if model architecture is correct")
+    else:
+        print(f"[info] Standard mode: Using sensor observations ({len(OBS_COLUMNS)}D)")
+    
     def set_global_seed(seed: int) -> None:
         random.seed(seed)
         np.random.seed(seed)
@@ -987,9 +1731,111 @@ def main() -> None:
         models_requested.remove("diffusion")
         models_requested.add("diffusion_c")
     if "all" in models_requested or not models_requested:
-        models_requested = {"gmm", "gmr", "bc", "ibc", "diffusion_c", "diffusion_t", "lstm_gmm"}
+        models_requested = {"gmm", "gmr", "bc", "ibc", "diffusion_c", "diffusion_t", "lstm_gmm", "gp", "mdn"}
+
+    # Branch based on mode
+    obs_dim = len(OBS_COLUMNS)
+    if args.mode == "per-finger":
+        print(f"[info] Running in per-finger mode (3 independent models: th, if, mf)")
+        if args.use_emg:
+            print(f"[warn] Per-finger mode with EMG not implemented yet. Using unified mode.")
+            args.mode = "unified"
+        else:
+            run_per_finger_benchmarks(args, models_requested)
+            return
+    
+    if args.mode == "unified":
+        print(f"[info] Running in unified mode (single model: {obs_dim}D obs -> 9D act)")
+        run_unified_benchmarks(args, models_requested)
+
+
+def _is_global_stiffness_dir(stiffness_dir: Path) -> bool:
+    name = stiffness_dir.name.lower()
+    full = str(stiffness_dir).lower()
+    return ("global_tk" in name) or ("global_tk" in full) or (name.endswith("_global") or "_global" in name)
+
+
+def _resolve_artifact_and_tb_dirs(base_output: Path, base_tb: Path, stiffness_dir: Path, timestamp: str) -> Tuple[Path, Optional[Path]]:
+    """Return artifact root and tensorboard run dir based on whether stiffness_dir is global.
+
+    - Artifacts: outputs/.../policy_learning_global_tk/artifacts or policy_learning/artifacts
+    - TensorBoard: outputs/.../policy_learning_global_tk/tensorboard/<ts> or policy_learning/tensorboard/<ts>
+    """
+    is_global = _is_global_stiffness_dir(stiffness_dir)
+    
+    if is_global:
+        # Use separate output directory for global_tk results
+        policy_learning_dir = base_output.parent / "policy_learning_global_tk"
+        ensure_dir(policy_learning_dir)
+        artifacts_root = ensure_dir(policy_learning_dir / "artifacts" / timestamp)
+        tb_parent = policy_learning_dir / "tensorboard"
+    else:
+        # Use default output directory for per-demo results
+        policy_learning_dir = base_output.parent / "policy_learning"
+        ensure_dir(policy_learning_dir)
+        artifacts_root = ensure_dir(policy_learning_dir / "artifacts" / timestamp)
+        tb_parent = policy_learning_dir / "tensorboard"
+    
+    tb_run = ensure_dir(tb_parent / timestamp) if SummaryWriter is not None else None
+    return artifacts_root, tb_run
+
+
+def run_unified_benchmarks(args, models_requested: set) -> None:
+    """Original unified training: all obs -> all act (20D -> 9D)."""
+    def set_global_seed(seed: int) -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        if torch is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
     trajectories = load_dataset(args.log_dir, args.stiffness_dir, stride=max(1, args.stride))
+    
+    # Apply data augmentation if requested
+    if args.augment:
+        print(f"\n{'='*80}")
+        print(f"DATA AUGMENTATION ENABLED")
+        print(f"{'='*80}")
+        from augmentation_utils import DataAugmentor, Trajectory as AugTrajectory
+        
+        original_count = len(trajectories)
+        original_samples = sum(len(t.observations) for t in trajectories)
+        
+        augmentor = DataAugmentor(seed=args.seed)
+        augmented_trajectories = []
+        
+        for traj in trajectories:
+            # Convert to augmentation utils Trajectory to avoid type mismatch
+            aug_input = AugTrajectory(
+                name=traj.name,
+                observations=traj.observations,
+                actions=traj.actions,
+            )
+            aug_trajs = augmentor.augment_trajectory(
+                aug_input,
+                obs_columns=OBS_COLUMNS,
+                num_augmentations=args.augment_num,
+                noise_std_force=args.augment_noise_force,
+                noise_std_stiffness=args.augment_noise_stiffness,
+                scale_range_force=tuple(args.augment_scale_force),
+                scale_range_stiffness=tuple(args.augment_scale_stiffness),
+                jitter_timesteps=args.augment_temporal_jitter,
+            )
+            # Convert back to local Trajectory class used by the rest of the pipeline
+            for t in aug_trajs:
+                augmented_trajectories.append(
+                    Trajectory(name=t.name, observations=t.observations, actions=t.actions)
+                )
+        
+        trajectories = augmented_trajectories
+        augmented_count = len(trajectories)
+        augmented_samples = sum(len(t.observations) for t in trajectories)
+        
+        print(f"Original:   {original_count} demos, {original_samples:,} samples")
+        print(f"Augmented:  {augmented_count} demos, {augmented_samples:,} samples")
+        print(f"Factor:     {augmented_count / original_count:.1f}x demos, {augmented_samples / original_samples:.1f}x samples")
+        print(f"{'='*80}\n")
 
     evaluation_meta: Dict[str, Any]
     if args.eval_demo:
@@ -1045,13 +1891,18 @@ def main() -> None:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     diffusion_eta = max(0.0, float(args.diffusion_eta))
     run_tensorboard_dir: Optional[Path] = None
+    ensure_dir(args.output_dir)
+    # Resolve artifact/tensorboard dirs depending on global vs local stiffness profiles
     if args.tensorboard:
         if torch is None or SummaryWriter is None:
-            raise RuntimeError("TensorBoard requested but torch or tensorboard is unavailable.")
-        ensure_dir(args.tensorboard_dir)
-        run_tensorboard_dir = ensure_dir(args.tensorboard_dir / timestamp)
-    ensure_dir(args.output_dir)
-    artifacts_root = ensure_dir(args.output_dir / "artifacts" / timestamp)
+            print("[warn] tensorboard requested but unavailable; proceeding without logs.")
+            args.tensorboard = False
+    artifacts_root, run_tensorboard_dir = _resolve_artifact_and_tb_dirs(
+        base_output=args.output_dir,
+        base_tb=args.tensorboard_dir,
+        stiffness_dir=args.stiffness_dir,
+        timestamp=timestamp,
+    )
     scalers_path = artifacts_root / "scalers.pkl"
     with scalers_path.open("wb") as fh:
         pickle.dump({"obs_scaler": obs_scaler, "act_scaler": act_scaler}, fh)
@@ -1073,7 +1924,7 @@ def main() -> None:
             act_dim=train_act_s.shape[1],
             n_components=args.gmm_components,
             covariance_type=args.gmm_covariance,
-            reg_covar=1e-5,
+            reg_covar=args.gmm_reg_covar,
         )
         gmm_model.fit(train_obs_s, train_act_s)
         gmm_artifact = artifacts_root / "gmm.pkl"
@@ -1142,6 +1993,7 @@ def main() -> None:
             "lr": args.bc_lr,
             "batch_size": args.bc_batch,
             "epochs": args.bc_epochs,
+            "weight_decay": args.bc_weight_decay,
             "seed": args.seed,
         }
         bc = BehaviorCloningBaseline(
@@ -1152,6 +2004,7 @@ def main() -> None:
             lr=bc_config["lr"],
             batch_size=bc_config["batch_size"],
             epochs=bc_config["epochs"],
+            weight_decay=bc_config["weight_decay"],
             seed=bc_config["seed"],
             log_name="bc",
         )
@@ -1258,6 +2111,126 @@ def main() -> None:
         if ibc_writer is not None:
             ibc_writer.flush()
             ibc_writer.close()
+
+    # GP Baseline (Gaussian Process Regression)
+    if "gp" in models_requested:
+        print("[info] training GP baseline ...")
+        gp_config = GP_CONFIG or {}
+        gp = GPBaseline(
+            obs_dim=train_obs.shape[1],
+            act_dim=train_act.shape[1],
+            kernel_type=gp_config.get("kernel_type", "rbf_ard"),
+            length_scale_bounds=tuple(gp_config.get("length_scale_bounds", [0.01, 100.0])),
+            nu=gp_config.get("nu", 1.5),
+            alpha=gp_config.get("alpha", 1e-4),
+            normalize_y=gp_config.get("normalize_y", True),
+            n_restarts_optimizer=gp_config.get("n_restarts_optimizer", 5),
+        )
+        gp.fit(train_obs, train_act)
+        
+        # Predict
+        pred_gp, pred_gp_std = gp.predict(test_obs, return_std=True)
+        metrics_gp = compute_metrics(test_act, pred_gp)
+        metrics_gp["nll"] = gp.nll(test_obs, test_act)
+        metrics_gp["mean_uncertainty"] = float(pred_gp_std.mean())
+        results["gp"] = metrics_gp
+        print(
+            f"[gp] rmse={metrics_gp['rmse']:.4f} "
+            f"mae={metrics_gp['mae']:.4f} r2={metrics_gp['r2']:.4f} "
+            f"uncertainty={metrics_gp['mean_uncertainty']:.4f}"
+        )
+        
+        # Save model
+        gp_artifact = artifacts_root / "gp.pkl"
+        with gp_artifact.open("wb") as fh:
+            pickle.dump({"model": gp, "config": gp_config}, fh)
+        
+        if args.save_predictions:
+            save_predictions(
+                artifacts_root / f"gp_predictions_{timestamp}.csv",
+                test_obs,
+                test_act,
+                pred_gp,
+                OBS_COLUMNS,
+                ACTION_COLUMNS,
+            )
+
+    # MDN Baseline (Mixture Density Network)
+    if "mdn" in models_requested:
+        if torch is None:
+            raise RuntimeError("MDN baseline requires PyTorch.")
+        print("[info] training MDN baseline ...")
+        mdn_config = MDN_CONFIG or {}
+        mdn = MDNBaseline(
+            obs_dim=train_obs_s.shape[1],
+            act_dim=train_act_s.shape[1],
+            hidden_units=mdn_config.get("hidden_units", [128, 128, 64]),
+            n_components=mdn_config.get("n_components", 5),
+            covariance_type=mdn_config.get("covariance_type", "diag"),
+            activation=mdn_config.get("activation", "relu"),
+            dropout=mdn_config.get("dropout", 0.1),
+            learning_rate=mdn_config.get("learning_rate", 0.001),
+            weight_decay=mdn_config.get("weight_decay", 0.0001),
+            mixture_reg=mdn_config.get("mixture_reg", 0.01),
+            covariance_floor=mdn_config.get("covariance_floor", 1e-4),
+        )
+        
+        mdn_writer = make_writer(run_tensorboard_dir, "mdn")
+        mdn.fit(
+            train_obs_s,
+            train_act_s,
+            test_obs_s,
+            test_act_s,
+            epochs=mdn_config.get("epochs", 200),
+            batch_size=mdn_config.get("batch_size", 32),
+            patience=mdn_config.get("patience", 30),
+            min_delta=mdn_config.get("min_delta", 1e-4),
+            writer=mdn_writer,
+        )
+        
+        # Predict (mean mode)
+        pred_mdn_scaled = mdn.predict(test_obs_s, mode="mean")
+        pred_mdn = act_scaler.inverse_transform(pred_mdn_scaled)
+        metrics_mdn = compute_metrics(test_act, pred_mdn)
+        metrics_mdn["nll"] = mdn.nll(test_obs_s, test_act_s)
+        results["mdn"] = metrics_mdn
+        print(
+            f"[mdn] rmse={metrics_mdn['rmse']:.4f} "
+            f"mae={metrics_mdn['mae']:.4f} r2={metrics_mdn['r2']:.4f} "
+            f"nll={metrics_mdn['nll']:.4f}"
+        )
+        
+        # Save model
+        mdn_artifact = artifacts_root / "mdn.pt"
+        torch.save(
+            {
+                "model_state": mdn.model.state_dict(),
+                "config": {
+                    "obs_dim": train_obs_s.shape[1],
+                    "act_dim": train_act_s.shape[1],
+                    "hidden_units": mdn_config.get("hidden_units", [128, 128, 64]),
+                    "n_components": mdn_config.get("n_components", 5),
+                    "covariance_type": mdn_config.get("covariance_type", "diag"),
+                    "activation": mdn_config.get("activation", "relu"),
+                    "dropout": mdn_config.get("dropout", 0.1),
+                },
+            },
+            mdn_artifact,
+        )
+        
+        if args.save_predictions:
+            save_predictions(
+                artifacts_root / f"mdn_predictions_{timestamp}.csv",
+                test_obs,
+                test_act,
+                pred_mdn,
+                OBS_COLUMNS,
+                ACTION_COLUMNS,
+            )
+        
+        if mdn_writer is not None:
+            mdn_writer.flush()
+            mdn_writer.close()
 
     if "diffusion_c" in models_requested:
         if torch is None:
@@ -1477,7 +2450,7 @@ def main() -> None:
             n_components=args.lstm_gmm_components,
             hidden_dim=args.lstm_gmm_hidden,
             n_layers=args.lstm_gmm_layers,
-            lr=args.bc_lr,
+            lr=args.lstm_gmm_lr,
             batch_size=args.bc_batch,
             epochs=args.lstm_gmm_epochs,
             seed=args.seed,
@@ -1493,7 +2466,7 @@ def main() -> None:
             "n_components": args.lstm_gmm_components,
             "hidden_dim": args.lstm_gmm_hidden,
             "n_layers": args.lstm_gmm_layers,
-            "lr": args.bc_lr,
+            "lr": args.lstm_gmm_lr,
             "batch_size": args.bc_batch,
             "epochs": args.lstm_gmm_epochs,
             "seed": args.seed,
@@ -1577,5 +2550,114 @@ def main() -> None:
     print(f"[done] artifacts stored in {artifacts_root}")
 
 
+def run_per_finger_benchmarks(args, models_requested: set) -> None:
+    """Per-finger training: 3 independent models (th: 8D->3D, if: 8D->3D, mf: 8D->3D)."""
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    
+    all_results = {}
+    
+    for finger in ["th", "if", "mf"]:
+        print(f"\n{'='*80}")
+        print(f"[info] Training models for finger: {finger.upper()}")
+        print(f"{'='*80}")
+        
+        # Load finger-specific data
+        trajectories = load_dataset_per_finger(args.log_dir, args.stiffness_dir, stride=max(1, args.stride), finger=finger)
+        
+        # Train/test split
+        if args.eval_demo:
+            eval_name = args.eval_demo
+            if eval_name.endswith(".csv"):
+                eval_name = Path(eval_name).stem
+            eval_name_finger = f"{eval_name}_{finger}"
+            candidate = next((t for t in trajectories if t.name == eval_name_finger), None)
+            if candidate is None:
+                print(f"[skip] {finger}: eval demo '{args.eval_demo}' not found")
+                continue
+            train_traj = [t for t in trajectories if t.name != candidate.name]
+            if not train_traj:
+                print(f"[skip] {finger}: need at least one trajectory for training")
+                continue
+            test_traj = [candidate]
+        else:
+            train_traj, test_traj = split_train_test(trajectories, args.test_size, args.seed)
+        
+        train_obs, train_act = flatten_trajectories(train_traj)
+        test_obs, test_act = flatten_trajectories(test_traj)
+        
+        print(f"[{finger}] Train: {train_obs.shape[0]} samples ({len(train_traj)} demos), Test: {test_obs.shape[0]} samples ({len(test_traj)} demos)")
+        print(f"[{finger}] Obs dim: {train_obs.shape[1]}D, Act dim: {train_act.shape[1]}D")
+        
+        # Scaling
+        obs_scaler = StandardScaler()
+        act_scaler = StandardScaler()
+        train_obs_s = obs_scaler.fit_transform(train_obs)
+        test_obs_s = obs_scaler.transform(test_obs)
+        train_act_s = act_scaler.fit_transform(train_act)
+        test_act_s = act_scaler.transform(test_act)
+        
+        finger_results = {}
+        
+        # Train BC model (fastest baseline for quick testing)
+        if "bc" in models_requested:
+            print(f"[{finger}] training behavior cloning baseline ...")
+            try:
+                bc_policy = BehaviorCloningBaseline(
+                    obs_dim=train_obs_s.shape[1],
+                    act_dim=train_act_s.shape[1],
+                    hidden_dim=args.bc_hidden,
+                    depth=args.bc_depth,
+                    lr=args.bc_lr,
+                    batch_size=args.bc_batch,
+                    epochs=args.bc_epochs,
+                    weight_decay=args.bc_weight_decay,
+                    log_name=f"bc_{finger}",
+                )
+                bc_policy.fit(train_obs_s, train_act_s, verbose=False)
+                pred_act_s = bc_policy.predict(test_obs_s)
+                pred_act = act_scaler.inverse_transform(pred_act_s)
+                
+                metrics = compute_metrics(test_act, pred_act)
+                print(f"[{finger}] bc rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
+                finger_results["bc"] = metrics
+            except Exception as exc:
+                print(f"[{finger}] bc training failed: {exc}")
+        
+        # Store results
+        all_results[finger] = finger_results
+    
+    # Save combined summary
+    summary = {
+        "mode": "per-finger",
+        "timestamp": timestamp,
+        "results_per_finger": all_results,
+        "config": {
+            "test_size": args.test_size,
+            "seed": args.seed,
+            "stride": args.stride,
+            "bc_epochs": args.bc_epochs,
+            "bc_hidden": args.bc_hidden,
+            "bc_depth": args.bc_depth,
+            "bc_batch": args.bc_batch,
+            "bc_lr": args.bc_lr,
+        },
+    }
+    
+    out_json = args.output_dir / f"benchmark_summary_per_finger_{timestamp}.json"
+    with out_json.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
+    print(f"\n[done] per-finger summary saved to {out_json}")
+    
+    # Print aggregate results
+    print(f"\n{'='*80}")
+    print("AGGREGATE RESULTS (per-finger mode)")
+    print(f"{'='*80}")
+    for finger in ["th", "if", "mf"]:
+        if finger in all_results and "bc" in all_results[finger]:
+            m = all_results[finger]["bc"]
+            print(f"{finger.upper()}: RMSE={m['rmse']:.2f}, MAE={m['mae']:.2f}, R²={m['r2']:.4f}")
+
+
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()
+

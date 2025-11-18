@@ -41,6 +41,8 @@ EPS = 1e-8
 # 패키지 내부 outputs/logs/success 만 대상으로 사용
 DEFAULT_INPUT = (PKG_DIR / "outputs" / "logs" / "success")
 K_INIT = 200.0
+K_MIN = 50.0  # 물리적으로 유효한 최소 강성 (N/m)
+VALIDATE_RESULTS = True  # set True via --validate flag
 
 # ---------------------------------------------------------------------------
 # CSV utilities
@@ -122,12 +124,10 @@ def _center_signal(signal: np.ndarray, baseline_fraction: float = 0.1) -> np.nda
 # ---------------------------------------------------------------------------
 
 def _compute_signed_force(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract force and return both negative (for calculation) and positive (for plotting).
+    """Extract force and return absolute values for both calculation and plotting.
     
     Returns:
-        Tuple of (forces_negative, forces_positive)
-        - forces_negative: baseline-subtracted, sign preserved (negative values)
-        - forces_positive: absolute value for plotting
+        Tuple of (forces_for_calc, forces_for_plot) - both are absolute values
     """
     force_prefixes = ("force_3", "s3", "force3")
     picked: Optional[List[str]] = None
@@ -142,11 +142,10 @@ def _compute_signed_force(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     rest_samples = max(1, int(len(force_raw) * 0.1))
     baseline = np.mean(force_raw[:rest_samples, :], axis=0, keepdims=True)
     forces_centered = force_raw - baseline
-    # Negative for calculation (sign preserved)
-    forces_negative = forces_centered
-    # Positive for plotting (absolute value)
-    forces_positive = np.abs(forces_centered)
-    return forces_negative, forces_positive
+    
+    # Use absolute value for both calculation and plotting
+    forces_abs = np.abs(forces_centered)
+    return forces_abs, forces_abs
 
 
 def _smooth_force(force: np.ndarray, fs: Optional[float], cutoff_hz: float = 3.0, order: int = 2) -> Optional[np.ndarray]:
@@ -160,6 +159,43 @@ def _smooth_force(force: np.ndarray, fs: Optional[float], cutoff_hz: float = 3.0
         return sosfiltfilt(sos, force, axis=0)
     except ValueError:
         return None
+
+
+def _compute_normal_force(
+    df: pd.DataFrame,
+    prefix: Optional[str] = None,
+    n: Tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> np.ndarray:
+    """Compute baseline-removed normal force component Fn (signed) for given sensor prefix.
+
+    Args:
+        df: input dataframe
+        prefix: e.g., 's3', 's1', 'force_3'. If None, tries common prefixes.
+        n: normal vector to project onto (will be normalized)
+
+    Returns:
+        Fn: (N,) signed normal force component after baseline removal.
+    """
+    cand_prefixes = ("force_3", "s3", "force3") if prefix is None else (prefix,)
+    picked_cols: Optional[List[str]] = None
+    for p in cand_prefixes:
+        cols = [f"{p}_fx", f"{p}_fy", f"{p}_fz"]
+        if all(c in df.columns for c in cols):
+            picked_cols = cols
+            break
+    if picked_cols is None:
+        raise KeyError(f"No force columns found for prefix={prefix or cand_prefixes}")
+    F = df[picked_cols].to_numpy(dtype=float)
+    rest = max(1, int(len(F) * 0.1))
+    Fc = F - F[:rest].mean(axis=0, keepdims=True)
+    n_vec = np.asarray(n, dtype=float)
+    n_norm = np.linalg.norm(n_vec)
+    if not np.isfinite(n_norm) or n_norm < 1e-12:
+        n_vec = np.array([0.0, 0.0, 1.0], dtype=float)
+        n_norm = 1.0
+    n_hat = n_vec / n_norm
+    Fn = Fc @ n_hat  # (N,)
+    return Fn
 
 
 # ---------------------------------------------------------------------------
@@ -227,38 +263,32 @@ def _ultra_smooth_strong_emg(
     sg_window_sec: float = 0.6,
     sg_poly: int = 3,
 ) -> Optional[np.ndarray]:
+    """Strong smoothing: LPF -> moving average -> Savitzky–Golay polish -> ReLU."""
     if emg_mag is None or emg_mag.size == 0:
         return None
-    smoothed = np.asarray(emg_mag, dtype=float)
-    # Lower cutoff LPF
+    sm = np.asarray(emg_mag, dtype=float)
+    # LPF
     if fs is not None and fs > 0 and cutoff_hz > 0 and fs > 2 * cutoff_hz:
         try:
             sos = butter(2, cutoff_hz, btype="low", fs=fs, output="sos")
-            smoothed = sosfiltfilt(sos, smoothed, axis=0)
+            sm = sosfiltfilt(sos, sm, axis=0)
         except ValueError:
             pass
-    # Longer moving average
-    effective_fs = fs if fs is not None and fs > 0 else 200.0
-    window = max(1, int(round(window_sec * effective_fs)))
-    if window > 1:
-        smoothed = uniform_filter1d(smoothed, size=window, axis=0, mode="nearest")
-    # Savitzky–Golay as a final polish
-    sg_window = max(5, int(round(sg_window_sec * effective_fs)))
-    if sg_window % 2 == 0:
-        sg_window += 1
-    if sg_window > sg_poly + 2:
+    # Moving average
+    eff_fs = fs if fs is not None and fs > 0 else 200.0
+    win = max(1, int(round(window_sec * eff_fs)))
+    if win > 1:
+        sm = uniform_filter1d(sm, size=win, axis=0, mode="nearest")
+    # Savitzky–Golay polish
+    sgw = max(5, int(round(sg_window_sec * eff_fs)))
+    if sgw % 2 == 0:
+        sgw += 1
+    if sgw > sg_poly + 2:
         try:
-            smoothed = savgol_filter(
-                smoothed,
-                window_length=sg_window,
-                polyorder=sg_poly,
-                axis=0,
-                mode="interp",
-            )
+            sm = savgol_filter(sm, window_length=sgw, polyorder=sg_poly, axis=0, mode="interp")
         except Exception:
             pass
-    smoothed = np.maximum(smoothed, 0.0)
-    return smoothed
+    return np.maximum(sm, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -273,32 +303,239 @@ def compute_tf(P: np.ndarray, F: np.ndarray, reg: float = 1e-6) -> np.ndarray:
 
 
 def compute_projection_from_tf(T_F: np.ndarray, reg: float = 1e-6) -> np.ndarray:
+    """Return force subspace projector H_F from T_F with numerical symmetrization.
+
+    We compute H_F = T_F^T (T_F T_F^T + λI)^{-1} T_F (ridge regularized) and then
+    symmetrize to mitigate floating point drift from exact idempotence.
+    """
     TF_TF_T = T_F @ T_F.T
     reg_eye = reg * np.eye(TF_TF_T.shape[0])
     inv_term = np.linalg.inv(TF_TF_T + reg_eye)
-    return T_F.T @ inv_term @ T_F
+    H_F = T_F.T @ inv_term @ T_F
+    # Symmetrize for numerical stability
+    H_F = 0.5 * (H_F + H_F.T)
+    return H_F
 
 
-def compute_tk_from_projection(H_F: np.ndarray, target_rank: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+def compute_k_basis_from_force_projector(
+    H_F: np.ndarray,
+    target_rank: int = 3,
+    eig_threshold: float = 0.5,
+    near_one_tol: float = 1e-6,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute orthogonal complement basis ("stiffness subspace") of force projector.
+
+    Args:
+        H_F: (d,d) approximate projector onto force subspace (should be symmetric).
+        target_rank: number of basis vectors to return for stiffness subspace.
+        eig_threshold: lower bound separating 0 vs 1 eigenvalues (use >0.5 by default).
+        near_one_tol: tolerance when checking eigenvalues close to 1.
+
+    Returns:
+        basis: (r,d) row-orthonormal basis vectors spanning complement subspace.
+        H_K: (d,d) projector onto complement (I - H_F) symmetrized.
+    """
     dim = H_F.shape[0]
+    # 1) 대칭화 (수치 안정)
+    H_F = 0.5 * (H_F + H_F.T)
+    # 2) 보완 사영
     H_K = np.eye(dim) - H_F
-    eigvals, eigvecs = np.linalg.eigh(H_K)
-    idx = np.argsort(eigvals)[::-1]
-    significant = [i for i in idx if eigvals[i] > 1e-6]
-    if len(significant) < target_rank:
-        raise ValueError("Complementary subspace has insufficient rank for T_K")
-    basis = eigvecs[:, significant[:target_rank]].T
+    H_K = 0.5 * (H_K + H_K.T)
+
+    # 3) 고유분해 (대칭 행렬)
+    eigvals, eigvecs = np.linalg.eigh(H_K)  # 오름차순
+    idx = np.argsort(eigvals)[::-1]         # 내림차순 정렬
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+
+    # 4) 고유값이 1에 가깝거나, 0.5 초과인 성분 선택 (둘 중 하나라도 True)
+    keep_mask = (eigvals > eig_threshold) | (np.isclose(eigvals, 1.0, atol=near_one_tol))
+    kept = np.count_nonzero(keep_mask)
+    if kept < target_rank:
+        raise ValueError(f"Complementary subspace insufficient rank: have {kept}, need {target_rank}.")
+
+    basis_full = eigvecs[:, keep_mask]   # (d, r_full), 열 직교 정규
+    basis = basis_full[:, :target_rank].T  # (r, d) 행 직교 정규 (행들이 기저 벡터)
+
     return basis, H_K
 
 
+def compute_tk_from_projection(H_F: np.ndarray, target_rank: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    """Backward-compatible wrapper calling improved basis computation.
+
+    Existing code expects (T_K_basis, H_K). Here we delegate to
+    compute_k_basis_from_force_projector with stable eigen threshold.
+    """
+    return compute_k_basis_from_force_projector(H_F, target_rank=target_rank)
+
+
+def compute_scalar_stiffness_map(
+    basis: np.ndarray,
+    P: np.ndarray,
+    kappa: np.ndarray,
+) -> np.ndarray:
+    """Estimate scalar stiffness linear map T_K (1,d) from subspace basis.
+
+    Args:
+        basis: (r,d) row-orthonormal basis vectors for stiffness subspace.
+        P: (d,N) EMG feature matrix.
+        kappa: (N,) target scalar stiffness samples (e.g., log(K) or raw K).
+
+    Returns:
+        T_K: (1,d) linear map so that T_K @ P ≈ kappa.
+
+    Procedure:
+        1) Project features: Z = basis @ P (r,N).
+        2) Solve least squares Z.T w ≈ kappa for w (r,).
+        3) Expand back to original space: T_K = w^T basis.
+    """
+    if basis.ndim != 2:
+        raise ValueError("basis must be 2D (r,d)")
+    if P.ndim != 2:
+        raise ValueError("P must be 2D (d,N)")
+    if kappa.ndim != 1 or kappa.shape[0] != P.shape[1]:
+        raise ValueError("kappa shape mismatch with P's sample count")
+    Z = basis @ P  # (r,N)
+    # Least squares solve
+    w, *_ = np.linalg.lstsq(Z.T, kappa, rcond=None)
+    T_K_row = w @ basis  # (d,)
+    return T_K_row[None, :]
+
+
 # ---------------------------------------------------------------------------
-# Plotting
+# Validation helpers
 # ---------------------------------------------------------------------------
+
+def validate_stiffness_physics(stiffness: np.ndarray, forces: np.ndarray) -> Dict[str, float]:
+    """Basic physical sanity checks for stiffness time series.
+
+    Returns keys:
+        - frac_positive: fraction of entries >= 0
+        - in_range_frac: fraction within [50, 2000] N/m (heuristic)
+        - corr_force_stiff: Pearson correlation between scalarized F and K
+          (use norms to avoid axis mismatch)
+        - smooth_p95: 95th percentile of |ΔK| per-step (lower is smoother),
+          computed after a light MAD-based outlier rejection
+    """
+    out: Dict[str, float] = {}
+    if stiffness is None or forces is None:
+        return {"frac_positive": 0.0, "in_range_frac": 0.0, "corr_force_stiff": 0.0, "smooth_p95": float("inf")}
+    K = np.asarray(stiffness, dtype=float)
+    F = np.asarray(forces, dtype=float)
+
+    # Scalarize K and F for correlation and smoothness metrics
+    K_scalar = np.linalg.norm(K, axis=1) if K.ndim == 2 else K.reshape(-1)
+    F_scalar = np.linalg.norm(F, axis=1) if F.ndim == 2 else np.abs(F).reshape(-1)
+
+    total = K_scalar.size if K_scalar.size > 0 else 1
+    out["frac_positive"] = float(np.count_nonzero(K_scalar >= 0) / total)
+    in_rng = (K_scalar >= 50.0) & (K_scalar <= 2000.0)
+    out["in_range_frac"] = float(np.count_nonzero(in_rng) / total)
+
+    # Scalar correlation (robust to axis mismatch)
+    if K_scalar.size > 3 and np.std(F_scalar) > 1e-9 and np.std(K_scalar) > 1e-9:
+        try:
+            corr = float(np.corrcoef(F_scalar, K_scalar)[0, 1])
+        except Exception:
+            corr = 0.0
+    else:
+        corr = 0.0
+    out["corr_force_stiff"] = corr if np.isfinite(corr) else 0.0
+
+    # Robust smoothness: compute p95 of |ΔK| after MAD-based outlier rejection
+    dK = np.diff(K_scalar, axis=0)
+    if dK.size:
+        med = float(np.median(dK))
+        mad = float(np.median(np.abs(dK - med))) + 1e-9
+        # Consistent MAD scale factor for normal distribution
+        thresh = 3.0 * 1.4826 * mad
+        keep = np.abs(dK - med) <= thresh
+        vals = np.abs(dK[keep]) if np.any(keep) else np.abs(dK)
+        out["smooth_p95"] = float(np.percentile(vals, 95)) if vals.size else 0.0
+    else:
+        out["smooth_p95"] = 0.0
+    return out
+
+
+def validate_emg_stiffness_mapping(emg: np.ndarray, stiffness: np.ndarray) -> float:
+    """Return correlation between EMG magnitude and stiffness magnitude over time."""
+    if emg is None or stiffness is None:
+        return 0.0
+    E = np.asarray(emg, dtype=float)
+    K = np.asarray(stiffness, dtype=float)
+    if E.ndim != 2 or K.ndim != 2 or E.shape[0] != K.shape[0]:
+        n = min(E.shape[0] if E.ndim > 0 else 0, K.shape[0] if K.ndim > 0 else 0)
+        E = E[:n]
+        K = K[:n]
+    Emag = np.linalg.norm(E, axis=1)
+    Kmag = np.linalg.norm(K, axis=1)
+    if len(Emag) < 3 or np.std(Emag) < 1e-9 or np.std(Kmag) < 1e-9:
+        return 0.0
+    corr = float(np.corrcoef(Emag, Kmag)[0, 1])
+    return corr if np.isfinite(corr) else 0.0
+
+
+def validate_projection_quality(H_F: np.ndarray, H_K: np.ndarray) -> Dict[str, float]:
+    """Check projector properties for H_F and H_K (idempotence, orthogonality, completeness)."""
+    out: Dict[str, float] = {}
+    if H_F is None or H_K is None:
+        return {"idemp_F": float("inf"), "idemp_K": float("inf"), "orth": float("inf"), "comp": float("inf")}
+    idemp_F = np.linalg.norm(H_F @ H_F - H_F, ord="fro")
+    idemp_K = np.linalg.norm(H_K @ H_K - H_K, ord="fro")
+    orth = np.linalg.norm(H_F @ H_K, ord="fro")
+    comp = np.linalg.norm(H_F + H_K - np.eye(H_F.shape[0]), ord="fro")
+    out["idemp_F"] = float(idemp_F)
+    out["idemp_K"] = float(idemp_K)
+    out["orth"] = float(orth)
+    out["comp"] = float(comp)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Least-squares fit diagnostics (for T_F estimation)
+# ---------------------------------------------------------------------------
+
+def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """Compute basic regression metrics for a 1D fit.
+
+    Returns keys:
+        - rmse: root mean squared error
+        - mae: mean absolute error
+        - r2: coefficient of determination
+        - nrmse_std: RMSE normalized by std(y_true)
+    """
+    out: Dict[str, float] = {"rmse": float("nan"), "mae": float("nan"), "r2": float("nan"), "nrmse_std": float("nan")}
+    if y_true is None or y_pred is None:
+        return out
+    yt = np.asarray(y_true, dtype=float).reshape(-1)
+    yp = np.asarray(y_pred, dtype=float).reshape(-1)
+    n = min(yt.size, yp.size)
+    if n == 0:
+        return out
+    yt = yt[:n]
+    yp = yp[:n]
+    if not np.all(np.isfinite(yt)) or not np.all(np.isfinite(yp)):
+        return out
+    err = yp - yt
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mae = float(np.mean(np.abs(err)))
+    var = float(np.var(yt))
+    r2 = float("nan")
+    if var > 1e-12:
+        sse = float(np.sum(err ** 2))
+        sst = float(np.sum((yt - float(np.mean(yt))) ** 2)) + 1e-12
+        r2 = float(1.0 - sse / sst)
+    std = float(np.std(yt))
+    nrmse_std = float(rmse / std) if std > 1e-12 else float("nan")
+    out.update({"rmse": rmse, "mae": mae, "r2": r2, "nrmse_std": nrmse_std})
+    return out
+ 
 
 def _plot_variant(
     time: np.ndarray,
     forces_signed: np.ndarray,
     forces_smoothed: np.ndarray,
+    force_normal_abs: Optional[np.ndarray],
     stiffness_raw: np.ndarray,
     stiffness_filtered: np.ndarray,
     emg_raw: np.ndarray,
@@ -312,10 +549,12 @@ def _plot_variant(
     fig, axes = plt.subplots(3, 1, figsize=(12, 8.0), sharex=True)
     ax_force, ax_stiff, ax_emg = axes
 
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+    colors = ["red", "green", "blue"]  # RGB
+    axis_labels = ["x", "y", "z"]
 
     for axis in range(min(3, forces_signed.shape[1])):
         color = colors[axis % len(colors)]
+        label = axis_labels[axis % len(axis_labels)]
         # Plot raw force as dashed line
         ax_force.plot(
             time,
@@ -324,7 +563,7 @@ def _plot_variant(
             linewidth=0.8,
             linestyle="--",
             alpha=0.3,
-            label=f"|F{axis + 1}| raw" if axis == 0 else None,
+            label=f"|F_{label}| raw" if axis == 0 else None,
         )
         # Plot smoothed force as solid line
         ax_force.plot(
@@ -332,16 +571,29 @@ def _plot_variant(
             forces_smoothed[:, axis],
             color=color,
             linewidth=1.2,
-            label=f"|F{axis + 1}| smoothed",
+            label=f"|F_{label}| smoothed",
         )
-    ax_force.set_ylabel("Force magnitude [N]")
+    # Overlay |F_n| if provided
+    if force_normal_abs is not None and force_normal_abs.size == time.size:
+        ax_force.plot(
+            time,
+            force_normal_abs,
+            color="black",
+            linewidth=1.0,
+            linestyle=":",
+            alpha=0.9,
+            label="|F_n|",
+        )
+
+    ax_force.set_ylabel("Force [N]")
     ax_force.grid(alpha=0.3)
     ax_force.legend(loc="upper right", fontsize=8)
 
     for axis in range(min(3, stiffness_raw.shape[1])):
         color = colors[axis % len(colors)]
-        ax_stiff.plot(time, stiffness_raw[:, axis], color=color, linewidth=1.0, linestyle="--", alpha=0.1, label=f"K{axis + 1} raw")
-        ax_stiff.plot(time, stiffness_filtered[:, axis], color=color, linewidth=1.3, linestyle="-", label=f"K{axis + 1} {filter_label}")
+        label = axis_labels[axis % len(axis_labels)]
+        ax_stiff.plot(time, stiffness_raw[:, axis], color=color, linewidth=1.0, linestyle="--", alpha=0.1, label=f"K_{label} raw")
+        ax_stiff.plot(time, stiffness_filtered[:, axis], color=color, linewidth=1.3, linestyle="-", label=f"K_{label} {filter_label}")
     ax_stiff.set_ylabel("Stiffness [N/m]")
     ax_stiff.grid(alpha=0.3)
     ax_stiff.legend(loc="upper right", fontsize=8)
@@ -422,21 +674,32 @@ def process_file(csv_path: Path, output_dir: Path) -> Optional[List[Path]]:
         fs = 200.0
         print(f"[warn] {csv_path.name}: sampling rate unknown, assuming {fs:.1f} Hz")
 
-    try:
-        forces_negative, forces_positive = _compute_signed_force(df)
-    except Exception as exc:
-        print(f"[skip] {csv_path.name}: force extraction failed ({exc})")
-        return None
+    # Extract deformation and end-effector position data if available
+    deform_circ = df["deform_circ"].values if "deform_circ" in df.columns else np.zeros(len(df))
+    deform_ecc = df["deform_ecc"].values if "deform_ecc" in df.columns else np.zeros(len(df))
+    # IF finger (ee_if_px/py/pz, fallback to old ee_px/py/pz for backward compatibility)
+    ee_if_px = df["ee_if_px"].values if "ee_if_px" in df.columns else (df["ee_px"].values if "ee_px" in df.columns else np.zeros(len(df)))
+    ee_if_py = df["ee_if_py"].values if "ee_if_py" in df.columns else (df["ee_py"].values if "ee_py" in df.columns else np.zeros(len(df)))
+    ee_if_pz = df["ee_if_pz"].values if "ee_if_pz" in df.columns else (df["ee_pz"].values if "ee_pz" in df.columns else np.zeros(len(df)))
+    # MF finger (ee_mf_px/py/pz)
+    ee_mf_px = df["ee_mf_px"].values if "ee_mf_px" in df.columns else np.zeros(len(df))
+    ee_mf_py = df["ee_mf_py"].values if "ee_mf_py" in df.columns else np.zeros(len(df))
+    ee_mf_pz = df["ee_mf_pz"].values if "ee_mf_pz" in df.columns else np.zeros(len(df))
+    # TH finger (ee_th_px/py/pz)
+    ee_th_px = df["ee_th_px"].values if "ee_th_px" in df.columns else np.zeros(len(df))
+    ee_th_py = df["ee_th_py"].values if "ee_th_py" in df.columns else np.zeros(len(df))
+    ee_th_pz = df["ee_th_pz"].values if "ee_th_pz" in df.columns else np.zeros(len(df))
 
-    # Smooth force (both negative for calculation and positive for plotting)
-    forces_negative_smoothed = _smooth_force(forces_negative, fs)
-    if forces_negative_smoothed is None:
-        print(f"[warn] {csv_path.name}: force smoothing failed, using raw force")
-        forces_negative_smoothed = forces_negative
-    
-    forces_positive_smoothed = _smooth_force(forces_positive, fs)
-    if forces_positive_smoothed is None:
-        forces_positive_smoothed = forces_positive
+    # Compute signed normal component Fn for main force (uses any available prefix)
+    try:
+        Fn_main = _compute_normal_force(df, prefix=None, n=(0.0, 0.0, 1.0))  # (N,)
+    except Exception as exc:
+        print(f"[skip] {csv_path.name}: normal force extraction failed ({exc})")
+        return None
+    forces_calc_smoothed = _smooth_force(Fn_main, fs)
+    if forces_calc_smoothed is None:
+        print(f"[warn] {csv_path.name}: normal force smoothing failed, using raw normal force")
+        forces_calc_smoothed = Fn_main
 
     emg_cols = _guess_emg_columns(df)
     if not emg_cols:
@@ -457,83 +720,179 @@ def process_file(csv_path: Path, output_dir: Path) -> Optional[List[Path]]:
     emg_centered = _center_signal(aligned_emg)
     emg_magnitude = np.abs(emg_centered)
 
-    lp_emg = _lowpass_emg(emg_centered, fs)
-    if lp_emg is not None:
-        lp_emg = np.abs(lp_emg)
-
-    ma_emg = _moving_average_emg(emg_centered, fs)
-    if ma_emg is not None:
-        ma_emg = np.abs(ma_emg)
-
-    bp_emg = _bandpass_emg(emg_centered, fs)
-    if bp_emg is not None:
-        bp_emg = np.abs(bp_emg)
-
-    ultra_emg = _ultra_smooth_emg(emg_magnitude, fs)
+    # ultra_smooth_strong variant만 처리
     ultra_strong_emg = _ultra_smooth_strong_emg(emg_magnitude, fs)
-
-    variants: Dict[str, np.ndarray] = {}
-    variants["lowpass"] = lp_emg if lp_emg is not None else emg_magnitude
-    variants["moving_avg"] = ma_emg if ma_emg is not None else emg_magnitude
-    if bp_emg is not None:
-        variants["bandpass"] = bp_emg
-    else:
-        print(f"[warn] {csv_path.name}: band-pass filter unavailable (fs={fs:.2f} Hz)")
-    variants["ultra_smooth"] = ultra_emg if ultra_emg is not None else emg_magnitude
-    variants["ultra_smooth_strong"] = ultra_strong_emg if ultra_strong_emg is not None else (ultra_emg if ultra_emg is not None else emg_magnitude)
+    emg_variant = ultra_strong_emg if ultra_strong_emg is not None else emg_magnitude
 
     P_raw = emg_magnitude.T
-    # Use NEGATIVE force for T_F calculation
-    F_mat = forces_negative_smoothed.T
+    # Use signed normal force (row vector) for T_F calculation
+    F_mat = np.asarray(forces_calc_smoothed, dtype=float)[None, :]
 
     try:
         T_F = compute_tf(P_raw, F_mat)
         H_F = compute_projection_from_tf(T_F)
-        T_K, _ = compute_tk_from_projection(H_F)
+        T_K, H_K = compute_k_basis_from_force_projector(H_F, target_rank=3)
     except Exception as exc:
         print(f"[skip] {csv_path.name}: projection computation failed ({exc})")
         return None
 
-    stiffness_raw = (T_K @ P_raw).T + K_INIT
+    # ultra_smooth_strong variant로 stiffness 계산
+    P_variant = emg_variant.T
+    stiffness_variant = np.maximum(K_MIN, (T_K @ P_variant).T + K_INIT)
+    stiffness_raw = np.maximum(K_MIN, (T_K @ P_raw).T + K_INIT)
+
+    # Optional validation printouts
+    if VALIDATE_RESULTS:
+        print(f"\n[Validation] {csv_path.name}:")
+        physics = validate_stiffness_physics(stiffness_variant, forces_calc_smoothed)
+        print(
+            f"  Physics: frac_positive={physics['frac_positive']:.2f}, in_range_frac={physics['in_range_frac']:.2f}, "
+            f"corr_force_stiff={physics['corr_force_stiff']:.3f}, smooth_p95={physics['smooth_p95']:.2f}"
+        )
+        proj = validate_projection_quality(H_F, H_K)
+        print(
+            f"  Projection: idemp_F={proj['idemp_F']:.2e}, idemp_K={proj['idemp_K']:.2e}, "
+            f"orth={proj['orth']:.2e}, comp={proj['comp']:.2e}"
+        )
+        # LS diagnostics for F ≈ T_F·P
+        F_fit = (T_F @ P_raw).reshape(-1)
+        tf_metrics = _regression_metrics(Fn_main, F_fit)
+        print(
+            "  T_F fit (main normal): "
+            f"RMSE={tf_metrics['rmse']:.3f} NRMSE(std)={tf_metrics['nrmse_std']:.3f} R²={tf_metrics['r2']:.3f}"
+        )
+        emg_corr = validate_emg_stiffness_mapping(emg_variant, stiffness_variant)
+        print(f"  EMG-Stiff correlation (mag): {emg_corr:.3f}")
 
     out_paths: List[Path] = []
 
-    for variant_name, emg_variant in variants.items():
-        P_variant = emg_variant.T
-        stiffness_variant = (T_K @ P_variant).T + K_INIT
-        out_png = output_dir / f"{csv_path.stem}_{variant_name}_paper.png"
-        label = {
-            "lowpass": "low-pass",
-            "moving_avg": "moving-avg",
-            "bandpass": "band-pass",
-            "ultra_smooth": "ultra-smooth",
-            "ultra_smooth_strong": "ultra-smooth-strong",
-        }.get(variant_name, variant_name)
+    # 각 손가락별로 force와 stiffness 처리
+    finger_names = ["th", "if", "mf"]  # thumb, index, middle
+    sensor_names = ["s1", "s2", "s3"]
+    all_forces = []
+    all_forces_for_csv = []  # 원본 부호 유지 (CSV 저장용)
+    all_stiffness = []
+    all_fn_abs = []
+    
+    per_finger_metrics: List[Tuple[str, Dict[str, float]]] = []
+    for sensor in sensor_names:
+        force_cols = [f"{sensor}_fx", f"{sensor}_fy", f"{sensor}_fz"]
+        if all(col in df.columns for col in force_cols):
+            # Baseline removal (preserves sign)
+            forces_finger = df[force_cols].to_numpy(dtype=float)
+            rest_samples = max(1, int(len(forces_finger) * 0.1))
+            baseline = np.mean(forces_finger[:rest_samples, :], axis=0, keepdims=True)
+            forces_finger_centered = forces_finger - baseline
+            
+            # For CSV: smooth the signed centered force
+            forces_finger_smoothed_signed = _smooth_force(forces_finger_centered, fs)
+            if forces_finger_smoothed_signed is None:
+                forces_finger_smoothed_signed = forces_finger_centered
+            all_forces_for_csv.append(forces_finger_smoothed_signed)
+            
+            # For plotting: use absolute values
+            forces_finger_abs = np.abs(forces_finger_centered)
+            forces_finger_smoothed_abs = _smooth_force(forces_finger_abs, fs)
+            if forces_finger_smoothed_abs is None:
+                forces_finger_smoothed_abs = forces_finger_abs
+            all_forces.append(forces_finger_smoothed_abs)
+
+            # For calculation: signed normal force component per finger
+            Fn_finger = _compute_normal_force(df, prefix=sensor, n=(0.0, 0.0, 1.0))
+            Fn_finger_smoothed = _smooth_force(Fn_finger, fs)
+            if Fn_finger_smoothed is None:
+                Fn_finger_smoothed = Fn_finger
+            all_fn_abs.append(np.abs(Fn_finger_smoothed))
+
+            F_finger = np.asarray(Fn_finger_smoothed, dtype=float)[None, :]
+            try:
+                T_F_finger = compute_tf(P_raw, F_finger)
+                H_F_finger = compute_projection_from_tf(T_F_finger)
+                T_K_finger, _ = compute_k_basis_from_force_projector(H_F_finger, target_rank=3)
+                stiffness_finger = np.maximum(K_MIN, (T_K_finger @ P_variant).T + K_INIT)
+                all_stiffness.append(stiffness_finger)
+                if VALIDATE_RESULTS:
+                    F_fit_f = (T_F_finger @ P_raw).reshape(-1)
+                    per_finger_metrics.append((sensor, _regression_metrics(Fn_finger_smoothed, F_fit_f)))
+            except Exception:
+                # 실패 시 기본 stiffness 사용
+                all_stiffness.append(stiffness_variant)
+        else:
+            all_forces.append(np.zeros((len(time), 3)))
+            all_forces_for_csv.append(np.zeros((len(time), 3)))
+            all_stiffness.append(stiffness_variant)
+            all_fn_abs.append(np.zeros(len(time)))
+
+    # Print per-finger LS diagnostics together
+    if VALIDATE_RESULTS and per_finger_metrics:
+        msg = []
+        for sensor, m in per_finger_metrics:
+            try:
+                msg.append(
+                    f"{sensor}: RMSE={m['rmse']:.3f} NRMSE(std)={m['nrmse_std']:.3f} R²={m['r2']:.3f}"
+                )
+            except Exception:
+                pass
+        if msg:
+            print("  T_F fit per finger: " + " | ".join(msg))
+    
+    # PNG 플롯 3개 생성 (각 손가락별) - 양수 force 사용
+    for idx, (finger_name, sensor) in enumerate(zip(finger_names, sensor_names)):
+        out_png = output_dir / f"{csv_path.stem}_{finger_name}_smooth.png"
         try:
             _plot_variant(
                 time,
-                forces_positive,  # Use POSITIVE force for plotting
-                forces_positive_smoothed,
+                all_forces[idx],  # plot (abs, per-axis)
+                all_forces[idx],  # plot (abs, per-axis smoothed)
+                all_fn_abs[idx],  # overlay |F_n|
                 stiffness_raw,
-                stiffness_variant,
+                all_stiffness[idx],
                 emg_magnitude,
                 emg_variant,
                 out_png,
                 csv_path.stem,
-                label,
+                f"{finger_name} ultra-smooth-strong",
             )
             out_paths.append(out_png)
         except Exception as exc:
-            print(f"[warn] {csv_path.name}: plot for {variant_name} failed ({exc})")
+            print(f"[warn] {csv_path.name}: PNG plot for {finger_name} failed ({exc})")
 
-        if variant_name == "lowpass":
-            out_csv = output_dir / f"{csv_path.stem}_paper_profile.csv"
-            try:
-                # Save POSITIVE force in CSV for readability
-                _save_profile_csv(out_csv, time, forces_positive_smoothed, stiffness_variant)
-                out_paths.append(out_csv)
-            except Exception as exc:
-                print(f"[warn] {csv_path.name}: CSV save failed ({exc})")
+    # 하나의 CSV 파일 생성 (모든 손가락 데이터 포함)
+    # Use signed smoothed forces for CSV (consistent with raw demo coordinate system)
+    all_forces_csv_combined = np.hstack(all_forces_for_csv)  # shape: (N, 9)
+    
+    # CSV 저장
+    out_csv = output_dir / f"{csv_path.stem}_paper_profile.csv"
+    try:
+        data = {"time_s": np.asarray(time, dtype=float)}
+        for i, (finger_name, sensor) in enumerate(zip(finger_names, sensor_names)):
+            data[f"{sensor}_fx"] = all_forces_csv_combined[:, i*3+0].astype(float)
+            data[f"{sensor}_fy"] = all_forces_csv_combined[:, i*3+1].astype(float)
+            data[f"{sensor}_fz"] = all_forces_csv_combined[:, i*3+2].astype(float)
+            data[f"{finger_name}_k1"] = all_stiffness[i][:, 0].astype(float)
+            data[f"{finger_name}_k2"] = all_stiffness[i][:, 1].astype(float)
+            data[f"{finger_name}_k3"] = all_stiffness[i][:, 2].astype(float)
+        # Add deformation and end-effector position columns
+        data["deform_circ"] = np.asarray(deform_circ, dtype=float)
+        data["deform_ecc"] = np.asarray(deform_ecc, dtype=float)
+        # IF finger EE position
+        data["ee_if_px"] = np.asarray(ee_if_px, dtype=float)
+        data["ee_if_py"] = np.asarray(ee_if_py, dtype=float)
+        data["ee_if_pz"] = np.asarray(ee_if_pz, dtype=float)
+        # MF finger EE position
+        data["ee_mf_px"] = np.asarray(ee_mf_px, dtype=float)
+        data["ee_mf_py"] = np.asarray(ee_mf_py, dtype=float)
+        data["ee_mf_pz"] = np.asarray(ee_mf_pz, dtype=float)
+        # TH finger EE position
+        data["ee_th_px"] = np.asarray(ee_th_px, dtype=float)
+        data["ee_th_py"] = np.asarray(ee_th_py, dtype=float)
+        data["ee_th_pz"] = np.asarray(ee_th_pz, dtype=float)
+        out_df = pd.DataFrame(data)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        out_df.to_csv(out_csv, index=False)
+        out_paths.append(out_csv)
+    except Exception as exc:
+        print(f"[warn] {csv_path.name}: CSV save failed ({exc})")
 
     print(f"[ok] {csv_path.name}: generated {len(out_paths)} artifact(s)")
     for path in out_paths:
@@ -574,11 +933,19 @@ def parse_args() -> argparse.Namespace:
         default=(PKG_DIR / "outputs" / "analysis" / "stiffness_profiles"),
         help="Directory for output artifacts (defaults to <pkg>/outputs/analysis/stiffness_profiles)",
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Print validation metrics (physics, projection, EMG-stiffness) per file.",
+        default=True,
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    global VALIDATE_RESULTS
+    VALIDATE_RESULTS = bool(getattr(args, "validate", False))
     csv_files = gather_csvs(args.input)
     if not csv_files:
         raise SystemExit(f"No CSV files found under {args.input}")

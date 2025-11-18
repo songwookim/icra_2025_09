@@ -1,0 +1,17 @@
+# Gaussian Process Regression configuration
+# Best for: small data, uncertainty quantification, interpretability
+
+# Kernel configuration
+kernel_type: rbf_ard  # rbf, rbf_ard (automatic relevance determination), matern
+length_scale_bounds: [0.01, 100.0]  # Search range for length scales
+nu: 1.5  # Only for Matern kernel (1.5 or 2.5 recommended)
+
+# Noise and regularization
+alpha: 1e-4  # Noise level (Ridge regularization on diagonal)
+normalize_y: true  # Zero-mean normalize targets
+
+# Optimizer
+n_restarts_optimizer: 5  # Number of random restarts for hyperparameter optimization
+
+# Output
+output_std: true  # Return predictive standard deviation

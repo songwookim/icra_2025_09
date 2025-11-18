@@ -20,6 +20,8 @@ from typing import IO, Any, Dict, List, Optional, Sequence, Tuple, cast
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
 
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32MultiArray, String, Bool
@@ -154,6 +156,8 @@ class SenseGloveMJNode(Node):
         self.declare_parameter("clamp_qpos_max", 1.57)
         self.declare_parameter("global_qpos_sign", -1.0)
         self.declare_parameter("units_output_sign", -1.0)
+    # Per-joint movement weights (follow COMMAND_ORDER; default 1.0)
+        self.declare_parameter("joint_weights", [1.0] * COMMAND_COUNT)
 
         # MuJoCo / EE pose configuration (optional)
         self.declare_parameter("run_mujoco", True)
@@ -216,6 +220,12 @@ class SenseGloveMJNode(Node):
         self.ee_pose_mj_body = self.get_parameter("ee_pose_mj_body").get_parameter_value().string_value
         self.ee_pose_mj_site_th = self.get_parameter("ee_pose_mj_site_th").get_parameter_value().string_value
         self.terminal_status_interval_sec = max(0.0, self.get_parameter("terminal_status_interval_sec").get_parameter_value().double_value)
+
+        # Parse per-joint movement weights (0.0..1.0)
+        raw_joint_weights = self.get_parameter("joint_weights").value
+        self.joint_weights: List[float] = [
+            clamp(v, 0.0, 1.0) for v in self._ensure_float_list(raw_joint_weights, COMMAND_COUNT, [1.0] * COMMAND_COUNT)
+        ]
 
         # Internal state
         # Per-finger orientation overrides (mirrors hand_tracker defaults)
@@ -338,6 +348,12 @@ class SenseGloveMJNode(Node):
         self._log_key_shortcuts()
         self._publish_units_state(initial=True)
         self._publish_baseline_units(initial=True)
+
+        # Enable runtime parameter updates for joint_weights
+        try:
+            self.add_on_set_parameters_callback(self._on_set_parameters)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -700,16 +716,24 @@ class SenseGloveMJNode(Node):
                 continue
 
             any_valid = True
-            raw_qpos[f_idx][j_idx] = mapped_qpos
-            
-            # Use raw_angle directly as qpos (no transformation)
-            final_qpos = mapped_qpos
+            # Apply per-joint weight around zero reference to reduce motion amplitude
+            try:
+                zero_ref = float(self._zero_qpos_ref[f_idx][j_idx])
+            except (IndexError, TypeError, ValueError):
+                zero_ref = 0.0
+            try:
+                weight = float(self.joint_weights[cmd_idx])
+            except Exception:
+                weight = 1.0
+            weight = clamp(weight, 0.0, 1.0)
+            final_qpos = zero_ref + weight * (mapped_qpos - zero_ref)
+            raw_qpos[f_idx][j_idx] = final_qpos
         
 
             self._prev_qpos_cmd[f_idx][j_idx] = final_qpos
             smoothed_qpos[f_idx][j_idx] = final_qpos
 
-            raw_angle = raw_qpos[f_idx][j_idx]
+            raw_angle = final_qpos
             offset = 1.57 if cmd_idx in (0, 3, 6) else 3.14
             adjusted = raw_angle - offset
             units_calc = adjusted * self.units_per_rad * self.units_motion_scale_qpos
@@ -792,6 +816,40 @@ class SenseGloveMJNode(Node):
             self.get_logger().info("SenseGlove qpos(rad): " + ", ".join(entries))
             self._first_pose_logged = True
             self._last_pose_log_time = now
+
+    def _on_set_parameters(self, params: List[Parameter]) -> SetParametersResult:
+        """Handle runtime updates for selected parameters (e.g., joint_weights)."""
+        success = True
+        reason = ""
+        try:
+            for p in params:
+                if p.name == "joint_weights":
+                    values: List[float] = []
+                    if isinstance(p.value, (list, tuple)):
+                        for el in p.value:
+                            try:
+                                values.append(float(el))
+                            except (TypeError, ValueError):
+                                continue
+                    elif isinstance(p.value, (int, float)):
+                        values = [float(p.value)]
+                    if not values:
+                        values = [1.0] * COMMAND_COUNT
+                    if len(values) < COMMAND_COUNT:
+                        values.extend([values[-1]] * (COMMAND_COUNT - len(values)))
+                    self.joint_weights = [clamp(v, 0.0, 1.0) for v in values[:COMMAND_COUNT]]
+                    # Log a concise summary for quick verification
+                    try:
+                        thumb = tuple(round(v, 2) for v in self.joint_weights[0:3])
+                        index = tuple(round(v, 2) for v in self.joint_weights[3:6])
+                        middle = tuple(round(v, 2) for v in self.joint_weights[6:9])
+                        self.get_logger().info(f"[Weights] THUMB={thumb} INDEX={index} MIDDLE={middle}")
+                    except Exception:
+                        pass
+        except Exception as exc:
+            success = False
+            reason = str(exc)
+        return SetParametersResult(successful=success, reason=reason)
 
     # ------------------------------------------------------------------
     # Key handling helpers

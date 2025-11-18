@@ -1,0 +1,13 @@
+# 피드포워드 BC 베이스라인 조정용. CLI에서는 --bc-* 인자로 연결됩니다.
+# hidden_dim: MLP 은닉폭. 크게 하면 표현력↑, VRAM/과적합 위험↑.
+hidden_dim: 256
+# hidden_layers: 은닉층 개수. 깊어질수록 복잡한 함수 학습 가능, 학습 난이도도 상승.
+hidden_layers: 3
+# batch_size: 배치 크기. 크게 하면 업데이트가 안정적이지만 메모리 사용 증가.
+batch_size: 256
+# learning_rate: 학습률. 발산하면 낮추고, 수렴이 느리면 조금 높입니다.
+learning_rate: 1.0e-3
+# epochs: 전체 에폭 수. 데이터가 적으면 100 이하도 충분, 더 복잡하면 늘립니다.
+epochs: 200
+# weight_decay: L2 정규화 계수. 과적합 억제용이며 지나치면 성능 하락.
+weight_decay: 1.0e-4

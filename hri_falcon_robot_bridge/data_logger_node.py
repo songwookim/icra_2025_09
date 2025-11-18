@@ -137,7 +137,7 @@ class DataLoggerNode(Node):
         self._current_csv_path: Optional[str] = None
         self._last_closed_csv_path: Optional[str] = None
 
-        # Subscriptions: force sensors 2..3 (s1은 저장하지 않음)
+        # Subscriptions: force sensors 1,2,3
         self._force_topics = (
             ('/force_sensor/s1/wrench', 0),
             ('/force_sensor/s2/wrench', 1),
@@ -286,8 +286,8 @@ class DataLoggerNode(Node):
                     f'{label}_tx', f'{label}_ty', f'{label}_tz',
                     f'{label}_stamp_sec', f'{label}_stamp_nsec'
                 ]
-            header += ['ee_px','ee_py','ee_pz','ee_stamp_sec','ee_stamp_nsec']
-            # 추가: MF / TH EE 위치
+            # IF / MF / TH EE 위치
+            header += ['ee_if_px','ee_if_py','ee_if_pz','ee_if_stamp_sec','ee_if_stamp_nsec']
             header += ['ee_mf_px','ee_mf_py','ee_mf_pz','ee_mf_stamp_sec','ee_mf_stamp_nsec']
             header += ['ee_th_px','ee_th_py','ee_th_pz','ee_th_stamp_sec','ee_th_stamp_nsec']
             header += ['deform_circ','deform_circ_stamp_sec','deform_circ_stamp_nsec']

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Visualise saved stiffness policy predictions on a held-out demonstration."""
+"""Visualise saved stiffness policy predictions on a held-out demonstration.
+
+Outputs
+- Console: per-model RMSE/MAE/R² and per-finger RMSE/MAE
+- Figure: grid plot of GT vs predictions for selected models and action dims
+- Artifact discovery: supports both 'artifacts' and 'artifacts_global' roots
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,10 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import os
+if os.environ.get("DISPLAY", "") == "":  # headless-safe backend
+    import matplotlib
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -42,19 +52,84 @@ DEFAULT_ARTIFACT_ROOT = DEFAULT_OUTPUT_DIR / "artifacts"
 DEFAULT_PLOT_DIR = DEFAULT_OUTPUT_DIR / "plots"
 
 
-def _ensure_baseline_available(name: str, cls: Any) -> None:
+def _normalise_finger_token(token: str) -> str:
+    return token.strip().lower()
+
+
+def _group_action_columns(action_columns: Sequence[str]) -> Dict[str, List[int]]:
+    groups: Dict[str, List[int]] = {}
+    for idx, col in enumerate(action_columns):
+        prefix = _normalise_finger_token(col.split("_", 1)[0]) if "_" in col else _normalise_finger_token(col)
+        groups.setdefault(prefix, []).append(idx)
+    return groups
+
+
+def _resolve_finger_selection(spec: Optional[str], available: Sequence[str]) -> List[str]:
+    if not available:
+        raise RuntimeError("No finger groups available for selection.")
+    tokens = [] if spec is None else [t for t in spec.split(",") if t.strip()]
+    if not tokens:
+        return list(available)
+    normalized = [_normalise_finger_token(tok) for tok in tokens]
+    if "all" in normalized:
+        return list(available)
+    selection: List[str] = []
+    missing: List[str] = []
+    for token in normalized:
+        if token in available and token not in selection:
+            selection.append(token)
+        elif token not in available:
+            missing.append(token)
+    if missing:
+        print(
+            "[warn] skipping unavailable fingers: {} (available: {})".format(
+                ", ".join(sorted(set(missing))), ", ".join(available)
+            )
+        )
+    if not selection:
+        raise RuntimeError("Finger selection matched no available groups.")
+    return selection
+
+
+def _fingerwise_metrics(target: np.ndarray, pred: np.ndarray, finger_slices: Dict[str, List[int]]) -> Dict[str, Dict[str, float]]:
+    summary: Dict[str, Dict[str, float]] = {}
+    for finger, rel_indices in finger_slices.items():
+        if not rel_indices:
+            continue
+        finger_target = target[:, rel_indices]
+        finger_pred = pred[:, rel_indices]
+        mask = np.isfinite(finger_pred).all(axis=1)
+        valid = int(np.count_nonzero(mask))
+        if valid == 0:
+            summary[finger] = {"rmse": float("nan"), "mae": float("nan"), "count": 0.0}
+            continue
+        diff = finger_target[mask] - finger_pred[mask]
+        summary[finger] = {
+            "rmse": float(np.sqrt(np.mean(diff ** 2))),
+            "mae": float(np.mean(np.abs(diff))),
+            "count": float(valid),
+        }
+    return summary
+
+
+def _ensure_baseline_available(name: str, cls: Any) -> Any:
     if cls is None or torch is None:
         raise RuntimeError(f"{name} baseline is unavailable. Install PyTorch to evaluate this model.")
+    return cls
 
 
 def _latest_artifact_dir(base_dir: Path) -> Path:
-    if not base_dir.exists():
-        raise RuntimeError(
-            f"Artifact directory '{base_dir}' does not exist. Run the benchmark script before evaluating."
-        )
-    candidates = [p for p in base_dir.iterdir() if p.is_dir()]
+    """Return latest run directory under 'artifacts' or fallback to 'artifacts_global'."""
+    candidates: list[Path] = []
+    if base_dir.exists():
+        candidates.extend([p for p in base_dir.iterdir() if p.is_dir()])
+    alt = base_dir.with_name(base_dir.name + "_global")
+    if alt.exists():
+        candidates.extend([p for p in alt.iterdir() if p.is_dir()])
     if not candidates:
-        raise RuntimeError(f"No saved model runs found under '{base_dir}'.")
+        raise RuntimeError(
+            f"No saved model runs found under '{base_dir}' or '{alt}'. Run benchmarks first or pass --artifact-dir."
+        )
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates[0]
 
@@ -81,8 +156,22 @@ def _select_eval_demo(
 ) -> str:
     if desired:
         eval_name = Path(desired).stem
+        
+        # Direct match
         if any(t.name == eval_name for t in trajectories):
             return eval_name
+        
+        # Try to match base name (remove augmentation suffix like _aug1, _aug2, etc.)
+        # This allows using augmented demos for evaluation
+        if '_aug' in eval_name:
+            # Extract base name (e.g., "demo_aug2" -> "demo")
+            base_name = eval_name.rsplit('_aug', 1)[0]
+            matches = [t.name for t in trajectories if t.name == base_name or t.name.startswith(base_name + '_aug')]
+            if matches:
+                print(f"[info] Augmented demo '{eval_name}' requested but using closest match: '{matches[0]}'")
+                return matches[0]
+        
+        # No match found
         available = ", ".join(sorted(t.name for t in trajectories))
         raise RuntimeError(f"Requested evaluation demo '{desired}' not available. Options: {available}")
 
@@ -155,6 +244,31 @@ def _torch_load(path: Path) -> Dict[str, Any]:
 def evaluate_models(args: argparse.Namespace) -> None:
     artifact_dir = args.artifact_dir if args.artifact_dir else _latest_artifact_dir(DEFAULT_ARTIFACT_ROOT)
     manifest = _load_manifest(artifact_dir)
+    action_columns = manifest.get("action_columns", ACTION_COLUMNS)
+    if not action_columns:
+        raise RuntimeError("Manifest does not describe any action columns to evaluate.")
+    finger_groups = _group_action_columns(action_columns)
+    if not finger_groups:
+        raise RuntimeError("Could not determine finger groups from provided action columns.")
+    available_fingers = list(finger_groups.keys())
+    selected_fingers = _resolve_finger_selection(args.fingers, available_fingers)
+    selected_indices_abs: List[int] = []
+    selected_labels: List[str] = []
+    for finger in selected_fingers:
+        idxs = finger_groups.get(finger)
+        if not idxs:
+            continue
+        selected_indices_abs.extend(idxs)
+        selected_labels.extend(action_columns[i] for i in idxs)
+    if not selected_indices_abs:
+        raise RuntimeError("Finger selection resulted in zero action dimensions.")
+    finger_slices_rel: Dict[str, List[int]] = {}
+    for rel_idx, label in enumerate(selected_labels):
+        prefix = _normalise_finger_token(label.split("_", 1)[0]) if "_" in label else _normalise_finger_token(label)
+        finger_slices_rel.setdefault(prefix, []).append(rel_idx)
+    # Preserve requested order
+    finger_slices_rel = {finger: finger_slices_rel.get(finger, []) for finger in selected_fingers}
+
     obs_scaler, act_scaler = _load_scalers(artifact_dir, manifest)
     window = int(manifest.get("sequence_window", 1))
     diffusion_sampler = args.diffusion_sampler.lower()
@@ -172,7 +286,7 @@ def evaluate_models(args: argparse.Namespace) -> None:
         raise RuntimeError(f"Evaluation trajectory '{eval_name}' could not be loaded.") from exc
 
     test_obs = test_traj.observations
-    test_act = test_traj.actions
+    test_act_full = test_traj.actions
     test_obs_s = obs_scaler.transform(test_obs)
 
     test_scaled = scale_trajectories([test_traj], obs_scaler, act_scaler)
@@ -202,8 +316,10 @@ def evaluate_models(args: argparse.Namespace) -> None:
 
     predictions: Dict[str, np.ndarray] = {}
     metrics_summary: Dict[str, Dict[str, float]] = {}
+    finger_metrics_summary: Dict[str, Dict[str, Dict[str, float]]] = {}
     gmm_cache: Dict[str, GMMConditional] = {}
-    time_idx = np.arange(test_act.shape[0])
+    time_idx = np.arange(test_act_full.shape[0])
+    target_subset = test_act_full[:, selected_indices_abs]
 
     for model_name in model_order:
         entry = manifest["models"][model_name]
@@ -229,17 +345,19 @@ def evaluate_models(args: argparse.Namespace) -> None:
                 n_samples = int(entry.get("n_samples", 16))
             pred_scaled = gmm_model.predict(test_obs_s, mode=mode, n_samples=n_samples)
             pred = act_scaler.inverse_transform(pred_scaled)
-            predictions[model_name] = pred
-            metrics_summary[model_name] = compute_metrics(test_act, pred)
+            pred_subset = pred[:, selected_indices_abs]
+            predictions[model_name] = pred_subset
+            metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+            finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             continue
 
         if kind == "bc":
-            _ensure_baseline_available("Behavior cloning", BehaviorCloningBaseline)
+            bc_cls = _ensure_baseline_available("Behavior cloning", BehaviorCloningBaseline)
             state = _torch_load(artifact_path)
             config = state.get("config", {})
-            bc = BehaviorCloningBaseline(
+            bc = bc_cls(
                 obs_dim=int(config.get("obs_dim", test_obs_s.shape[1])),
-                act_dim=int(config.get("act_dim", test_act.shape[1])),
+                act_dim=int(config.get("act_dim", test_act_full.shape[1])),
                 hidden_dim=int(config.get("hidden_dim", 256)),
                 depth=int(config.get("depth", 3)),
                 lr=float(config.get("lr", 1e-3)),
@@ -252,17 +370,19 @@ def evaluate_models(args: argparse.Namespace) -> None:
             bc.model.load_state_dict(state["state_dict"])
             pred_scaled = bc.predict(test_obs_s)
             pred = act_scaler.inverse_transform(pred_scaled)
-            predictions[model_name] = pred
-            metrics_summary[model_name] = compute_metrics(test_act, pred)
+            pred_subset = pred[:, selected_indices_abs]
+            predictions[model_name] = pred_subset
+            metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+            finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             continue
 
         if kind == "ibc":
-            _ensure_baseline_available("IBC", IBCBaseline)
+            ibc_cls = _ensure_baseline_available("IBC", IBCBaseline)
             state = _torch_load(artifact_path)
             config = state.get("config", {})
-            ibc = IBCBaseline(
+            ibc = ibc_cls(
                 obs_dim=int(config.get("obs_dim", test_obs_s.shape[1])),
-                act_dim=int(config.get("act_dim", test_act.shape[1])),
+                act_dim=int(config.get("act_dim", test_act_full.shape[1])),
                 hidden_dim=int(config.get("hidden_dim", 256)),
                 depth=int(config.get("depth", 3)),
                 lr=float(config.get("lr", 1e-3)),
@@ -278,23 +398,25 @@ def evaluate_models(args: argparse.Namespace) -> None:
             ibc.model.load_state_dict(state["state_dict"])
             pred_scaled = ibc.predict(test_obs_s, n_samples=int(entry.get("n_samples", 1)))
             pred = act_scaler.inverse_transform(pred_scaled)
-            predictions[model_name] = pred
-            metrics_summary[model_name] = compute_metrics(test_act, pred)
+            pred_subset = pred[:, selected_indices_abs]
+            predictions[model_name] = pred_subset
+            metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+            finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             continue
 
         if kind == "diffusion":
-            _ensure_baseline_available("Diffusion policy", DiffusionPolicyBaseline)
+            diff_cls = _ensure_baseline_available("Diffusion policy", DiffusionPolicyBaseline)
             state = _torch_load(artifact_path)
             config = state.get("config", {})
             temporal = bool(config.get("temporal", entry.get("temporal", False)))
-            diff = DiffusionPolicyBaseline(
+            diff = diff_cls(
                 obs_dim=int(
                     config.get(
                         "obs_dim",
                         seq_obs.shape[-1] if temporal and seq_obs.size else test_obs_s.shape[1],
                     )
                 ),
-                act_dim=int(config.get("act_dim", test_act.shape[1])),
+                act_dim=int(config.get("act_dim", test_act_full.shape[1])),
                 timesteps=int(config.get("timesteps", 50)),
                 hidden_dim=int(config.get("hidden_dim", 256)),
                 time_dim=int(config.get("time_dim", 64)),
@@ -310,7 +432,7 @@ def evaluate_models(args: argparse.Namespace) -> None:
             sample_count = int(entry.get("n_samples", 4))
             if temporal:
                 if seq_obs.shape[0] == 0:
-                    full_pred = np.full_like(test_act, np.nan)
+                    full_pred = np.full_like(test_act_full, np.nan)
                 else:
                     pred_seq_scaled = diff.predict(
                         seq_obs,
@@ -319,30 +441,34 @@ def evaluate_models(args: argparse.Namespace) -> None:
                         eta=diffusion_eta,
                     )
                     pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
-                    full_pred = np.full_like(test_act, np.nan)
+                    full_pred = np.full_like(test_act_full, np.nan)
                     full_pred[seq_indices] = pred_seq
-                predictions[model_name] = full_pred
-                metrics_summary[model_name] = _metrics_with_mask(test_act, full_pred)
+                pred_subset = full_pred[:, selected_indices_abs]
+                predictions[model_name] = pred_subset
+                metrics_summary[model_name] = _metrics_with_mask(target_subset, pred_subset)
+                finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             else:
                 pred_scaled = diff.predict(test_obs_s, n_samples=sample_count)
                 pred = act_scaler.inverse_transform(pred_scaled)
-                predictions[model_name] = pred
-                metrics_summary[model_name] = compute_metrics(test_act, pred)
+                pred_subset = pred[:, selected_indices_abs]
+                predictions[model_name] = pred_subset
+                metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+                finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             continue
 
         if kind == "lstm_gmm":
-            _ensure_baseline_available("LSTM-GMM", LSTMGMMBaseline)
+            lstm_cls = _ensure_baseline_available("LSTM-GMM", LSTMGMMBaseline)
             state = _torch_load(artifact_path)
             config = state.get("config", {})
             seq_len = int(config.get("seq_len", entry.get("seq_len", window)))
-            lstm = LSTMGMMBaseline(
+            lstm = lstm_cls(
                 obs_dim=int(
                     config.get(
                         "obs_dim",
                         seq_obs.shape[-1] if seq_obs.size else test_obs_s.shape[1],
                     )
                 ),
-                act_dim=int(config.get("act_dim", test_act.shape[1])),
+                act_dim=int(config.get("act_dim", test_act_full.shape[1])),
                 seq_len=seq_len,
                 n_components=int(config.get("n_components", 5)),
                 hidden_dim=int(config.get("hidden_dim", 256)),
@@ -357,21 +483,23 @@ def evaluate_models(args: argparse.Namespace) -> None:
             lstm.model.load_state_dict(state["state_dict"])
             sample_count = int(entry.get("n_samples", config.get("n_components", 5)))
             if seq_obs.shape[0] == 0:
-                full_pred = np.full_like(test_act, np.nan)
+                full_pred = np.full_like(test_act_full, np.nan)
             else:
                 pred_seq_scaled = lstm.predict(seq_obs, mode="mean", n_samples=sample_count)
                 pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
-                full_pred = np.full_like(test_act, np.nan)
+                full_pred = np.full_like(test_act_full, np.nan)
                 full_pred[seq_indices] = pred_seq
-            predictions[model_name] = full_pred
-            metrics_summary[model_name] = _metrics_with_mask(test_act, full_pred)
+            pred_subset = full_pred[:, selected_indices_abs]
+            predictions[model_name] = pred_subset
+            metrics_summary[model_name] = _metrics_with_mask(target_subset, pred_subset)
+            finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             continue
 
         raise RuntimeError(f"Unsupported model entry '{model_name}' (kind='{kind}') in manifest.")
 
     plot_dir = args.output_dir if args.output_dir else (artifact_dir / "plots")
     plot_path = plot_dir / f"{eval_name}_comparison.png"
-    _plot_model_grid(time_idx, test_act, predictions, model_order, ACTION_COLUMNS, plot_path)
+    _plot_model_grid(time_idx, target_subset, predictions, model_order, selected_labels, plot_path)
 
     for model_name in model_order:
         metrics = metrics_summary.get(
@@ -382,6 +510,15 @@ def evaluate_models(args: argparse.Namespace) -> None:
             f"[{model_name}] rmse={metrics['rmse']:.4f} "
             f"mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}"
         )
+        finger_stats = finger_metrics_summary.get(model_name, {})
+        for finger in selected_fingers:
+            stats = finger_stats.get(finger)
+            if not stats:
+                continue
+            print(
+                f"    ({finger.upper()}) rmse={stats['rmse']:.4f} "
+                f"mae={stats['mae']:.4f} samples={int(stats['count'])}"
+            )
     print(f"[done] plot saved to {plot_path}")
 
 
@@ -400,6 +537,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="all",
         help="Comma separated list of model names to plot (or 'all').",
+    )
+    parser.add_argument(
+        "--fingers",
+        type=str,
+        default="all",
+        help="Comma separated finger codes to visualise (e.g., 'th,if,mf'). Defaults to all available.",
     )
     parser.add_argument(
         "--diffusion-sampler",

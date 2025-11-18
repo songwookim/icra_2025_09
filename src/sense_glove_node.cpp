@@ -9,7 +9,6 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -89,12 +88,19 @@ constexpr std::array<std::pair<const char *, const char *>, 9> kCommandOrder{{
 }};
 
 constexpr std::array<ForceCalibrationSample, 6> kCalibrationTable{{
+  // {1.0f, 0.0f},
+  // {2.5f, 0.25f},
+  // {4.0f, 0.4f},
+  // {6.5f, 0.6f},
+  // {8.0f, 0.85f},
+  // {9.5f, 1.0f},
+
   {1.0f, 0.0f},
-  {2.5f, 0.25f},
-  {4.0f, 0.4f},
-  {6.5f, 0.6f},
-  {8.0f, 0.85f},
-  {9.5f, 1.0f},
+  {4.0f, 0.2f},
+  {8.0f, 0.4f},
+  {12.0f, 0.6f},
+  {16.0f, 0.8f},
+  {20.0f, 1.0f},
 }};
 
 inline double clamp(double value, double min_value, double max_value)
@@ -102,18 +108,14 @@ inline double clamp(double value, double min_value, double max_value)
   return std::max(min_value, std::min(max_value, value));
 }
 
-inline std::array<double, 3> cross_product(const std::array<double, 3> & a, const std::array<double, 3> & b)
+// Convenience helpers for 6-axis wrench arrays (fxyz, txyz)
+inline double magnitude_force(const std::array<double, kAxesPerSensor> & w)
 {
-  return std::array<double, 3>{
-    a[1] * b[2] - a[2] * b[1],
-    a[2] * b[0] - a[0] * b[2],
-    a[0] * b[1] - a[1] * b[0]
-  };
+  return std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
 }
-
-inline double magnitude3(const std::array<double, 3> & v)
+inline double magnitude_torque(const std::array<double, kAxesPerSensor> & w)
 {
-  return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  return std::sqrt(w[3]*w[3] + w[4]*w[4] + w[5]*w[5]);
 }
 
 inline int finger_index(const std::string & finger)
@@ -188,7 +190,7 @@ public:
     clamp_qpos_symm_(true),
     clamp_qpos_min_(-1.57),
     clamp_qpos_max_(1.57),
-    use_right_hand_(true),
+    use_right_hand_(false),
     global_qpos_sign_(-1.0),
     glove_connected_logged_(false),
     latest_qpos_valid_(false),
@@ -245,7 +247,14 @@ public:
     declare_parameter("force_feedback_lambda", force_feedback_lambda_);
     declare_parameter("force_feedback_force_norm", force_feedback_force_norm_);
     declare_parameter("force_feedback_torque_norm", force_feedback_torque_norm_);
-    declare_parameter("force_feedback_publish_rate", force_feedback_publish_rate_);
+  declare_parameter("force_feedback_publish_rate", force_feedback_publish_rate_);
+  declare_parameter("force_feedback_print_enabled", true);
+  declare_parameter("force_feedback_print_rate", 1.0);
+  // Pulse test parameters (disabled by default)
+  declare_parameter("force_feedback_pulse_enabled", false);
+  declare_parameter("force_feedback_pulse_level", 0.5);
+  declare_parameter("force_feedback_pulse_hold_sec", 0.5);
+  declare_parameter("force_feedback_pulse_interval_sec", 3.0);
     log_interval_sec_ = std::max(0.0, get_parameter("pose_log_interval_sec").as_double());
 
     const double raw_update_rate = get_parameter("update_rate_hz").as_double();
@@ -254,7 +263,57 @@ public:
     const auto hand_side_raw = get_parameter("hand_side").as_string();
     std::string hand_side_lower = hand_side_raw;
     std::transform(hand_side_lower.begin(), hand_side_lower.end(), hand_side_lower.begin(), ::tolower);
-    use_right_hand_ = !(hand_side_lower == "left" || hand_side_lower == "l");
+    
+    // Default: try right first
+    bool prefer_right = !(hand_side_lower == "left" || hand_side_lower == "l");
+    
+#ifdef HAVE_SENSEGLOVE_SDK
+    // Auto-detect: prefer right, fallback to left if right not available
+    const int total_connected = SGCore::HandLayer::GlovesConnected();
+    if (total_connected > 0)
+    {
+      const bool right_available = SGCore::HandLayer::DeviceConnected(true);
+      const bool left_available = SGCore::HandLayer::DeviceConnected(false);
+      
+      if (prefer_right && right_available)
+      {
+        use_right_hand_ = true;
+        RCLCPP_INFO(get_logger(), "Using RIGHT hand (preferred and available)");
+      }
+      else if (!prefer_right && left_available)
+      {
+        use_right_hand_ = false;
+        RCLCPP_INFO(get_logger(), "Using LEFT hand (preferred and available)");
+      }
+      else if (right_available)
+      {
+        use_right_hand_ = true;
+        RCLCPP_INFO(get_logger(), "Using RIGHT hand (fallback, left not available)");
+      }
+      else if (left_available)
+      {
+        use_right_hand_ = false;
+        RCLCPP_INFO(get_logger(), "Using LEFT hand (fallback, right not available)");
+      }
+      else
+      {
+        use_right_hand_ = prefer_right;
+        RCLCPP_WARN(get_logger(), 
+          "No glove detected as available, using %s (total connected: %d)",
+          use_right_hand_ ? "RIGHT" : "LEFT", total_connected);
+      }
+    }
+    else
+    {
+      use_right_hand_ = prefer_right;
+      RCLCPP_WARN(get_logger(), "No gloves connected; defaulting to %s hand",
+        use_right_hand_ ? "RIGHT" : "LEFT");
+    }
+#else
+    use_right_hand_ = prefer_right;
+    RCLCPP_INFO(get_logger(), "Using %s hand (SDK not available, using parameter)",
+      use_right_hand_ ? "RIGHT" : "LEFT");
+#endif
 
     publish_joint_state_ = get_parameter("publish_joint_state").as_bool();
     joint_state_topic_ = get_parameter("joint_state_topic").as_string();
@@ -406,6 +465,32 @@ public:
       {
         RCLCPP_INFO(get_logger(), "Haptics synchronized with main update loop (rate=%.1f Hz)", update_rate_hz_);
       }
+
+      // Periodic printout of latest wrench values for each subscribed sensor
+      force_feedback_print_enabled_ = get_parameter("force_feedback_print_enabled").as_bool();
+      force_feedback_print_rate_hz_ = get_parameter("force_feedback_print_rate").as_double();
+      if (force_feedback_print_rate_hz_ < 0.1) { force_feedback_print_rate_hz_ = 0.1; }
+      force_feedback_print_period_ = 1.0 / force_feedback_print_rate_hz_;
+      if (force_feedback_print_enabled_)
+      {
+        force_feedback_print_timer_ = create_wall_timer(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(force_feedback_print_period_)),
+          std::bind(&SenseGloveNode::print_force_feedback_status, this));
+      }
+
+      // Load pulse test configuration
+      force_feedback_pulse_enabled_ = get_parameter("force_feedback_pulse_enabled").as_bool();
+      force_feedback_pulse_level_ = clamp(get_parameter("force_feedback_pulse_level").as_double(), 0.0, 1.0);
+      force_feedback_pulse_hold_sec_ = std::max(0.0, get_parameter("force_feedback_pulse_hold_sec").as_double());
+      force_feedback_pulse_interval_sec_ = std::max(force_feedback_pulse_hold_sec_ + 0.01,
+        get_parameter("force_feedback_pulse_interval_sec").as_double());
+      if (force_feedback_pulse_enabled_)
+      {
+        RCLCPP_INFO(get_logger(),
+          "Force feedback pulse mode enabled: level=%.2f hold=%.2fs interval=%.2fs", 
+          force_feedback_pulse_level_, force_feedback_pulse_hold_sec_, force_feedback_pulse_interval_sec_);
+      }
     }
 
 #ifdef HAVE_SENSEGLOVE_SDK
@@ -438,6 +523,7 @@ private:
   void on_force_wrench(std::size_t sensor_index, const geometry_msgs::msg::WrenchStamped::SharedPtr msg);
   void send_force_feedback();
   std::string resolve_force_feedback_topic(int sensor_index) const;
+  void print_force_feedback_status();
 
   void handle_zero_request(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> & /*request*/,
@@ -506,90 +592,7 @@ private:
     }
   }
 
-  void process_command_stream(const FingerJointMatrix & angles)
-  {
-    FingerJointMatrix output_qpos = latest_smoothed_qpos_;
-
-    for (const auto & entry : kCommandOrder)
-    {
-      const int f_idx = finger_index(entry.first);
-      const int j_idx = f_idx >= 0 ? joint_index(static_cast<std::size_t>(f_idx), entry.second) : -1;
-      double raw_angle_rad = std::numeric_limits<double>::quiet_NaN();
-      if (f_idx >= 0 && j_idx >= 0)
-      {
-        raw_angle_rad = angles[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
-      }
-
-      double qpos = map_angle_to_qpos(f_idx, j_idx, raw_angle_rad);
-      if (f_idx >= 0 && j_idx >= 0)
-      {
-        const double zero_offset = zero_qpos_ref_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
-        
-        // Pass through raw angle directly without any transformation
-        double final_qpos = raw_angle_rad;
-
-        // Debug logging for THUMB joints - show GetY() raw value
-        if (f_idx == 0)  // THUMB
-        {
-          RCLCPP_INFO(
-            get_logger(),
-            "[THUMB/%s] GetY()=%.6f | zero_ref=%.6f | final_qpos=%.6f (raw passthrough)",
-            entry.second,
-            raw_angle_rad,
-            zero_offset,
-            final_qpos
-          );
-        }
-
-        prev_qpos_cmd_[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)] = final_qpos;
-        output_qpos[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)] = final_qpos;
-      }
-    }
-
-    latest_smoothed_qpos_ = output_qpos;
-    latest_qpos_valid_ = true;
-
-    const auto now = get_clock()->now();
-    const bool should_log_pose =
-      (!first_pose_logged_) ||
-      ((log_interval_sec_ > 0.0) && (last_pose_log_time_.nanoseconds() > 0) &&
-       ((now - last_pose_log_time_).seconds() >= log_interval_sec_));
-
-    if (should_log_pose)
-    {
-      std::ostringstream oss;
-      bool any = false;
-      for (std::size_t idx = 0; idx < kCommandOrder.size(); ++idx)
-      {
-        const auto & entry = kCommandOrder[idx];
-        const int f_idx = finger_index(entry.first);
-        const int j_idx = f_idx >= 0 ? joint_index(static_cast<std::size_t>(f_idx), entry.second) : -1;
-        if (f_idx < 0 || j_idx < 0)
-        {
-          continue;
-        }
-        const double angle_rad = angles[static_cast<std::size_t>(f_idx)][static_cast<std::size_t>(j_idx)];
-        if (std::isnan(angle_rad))
-        {
-          continue;
-        }
-        if (any)
-        {
-          oss << ", ";
-        }
-        oss << entry.first << '_' << entry.second << '=' << std::fixed << std::setprecision(3) << angle_rad;
-        any = true;
-      }
-      if (any)
-      {
-        system("clear");
-        RCLCPP_INFO(get_logger(), "SenseGlove angles(rad): %s", oss.str().c_str());
-        NULL;
-      }
-      first_pose_logged_ = true;
-      last_pose_log_time_ = now;
-    }
-  }
+  // Legacy processing function removed (raw angles published directly).
 
   std::optional<FingerJointMatrix> read_joint_angles()
   {
@@ -641,31 +644,7 @@ private:
 #endif
   }
 
-  FingerJointMatrix flex_to_angles(const std::array<double, 4> & flex) const
-  {
-    FingerJointMatrix result;
-    for (auto & row : result)
-    {
-      row.fill(std::numeric_limits<double>::quiet_NaN());
-    }
-
-    for (std::size_t f = 0; f < kFingerCount; ++f)
-    {
-      const double flex_val = flex[f];
-      if (flex_val < 0.0)
-      {
-        continue;
-      }
-      for (std::size_t j = 0; j < kJointsPerFinger; ++j)
-      {
-        const auto & limits = kJointLimits[f][j];
-        const double angle_rad = limits.open_rad + flex_val * (limits.closed_rad - limits.open_rad);
-        result[f][j] = angle_rad;
-      }
-    }
-
-    return result;
-  }
+  // flex_to_angles removed (unused in current raw publication flow)
 
   double map_force_to_level(double force_newton) const
   {
@@ -705,32 +684,7 @@ private:
     return clamp(normalized, 0.0, 1.0);
   }
 
-  double map_angle_to_qpos(int finger_idx, int joint_idx, double raw_angle_rad) const
-  {
-    if (finger_idx < 0 || joint_idx < 0 || std::isnan(raw_angle_rad))
-    {
-      return 0.0;
-    }
-
-    double centered_rad = raw_angle_rad;
-    if (raw_angle_rad > M_PI || raw_angle_rad < -M_PI)
-    {
-      centered_rad = std::fmod(raw_angle_rad + M_PI, 2.0 * M_PI);
-      if (centered_rad < 0.0)
-      {
-        centered_rad += 2.0 * M_PI;
-      }
-      centered_rad -= M_PI;
-    }
-    const double direction = joint_orientation_[static_cast<std::size_t>(finger_idx)][static_cast<std::size_t>(joint_idx)];
-    double qpos = centered_rad * direction * global_qpos_sign_;
-    qpos *= qpos_gain_;
-    if (clamp_qpos_symm_)
-    {
-      qpos = clamp(qpos, clamp_qpos_min_, clamp_qpos_max_);
-    }
-    return raw_angle_rad;
-  }
+  // map_angle_to_qpos removed (angles used directly)
 
   // Parameters & state
   double update_rate_hz_;
@@ -779,16 +733,28 @@ private:
   bool all_sensors_ready_logged_;
   std::vector<std::pair<double, double>> force_feedback_calibration_;
 
-  FingerJointMatrix joint_orientation_{};
+  // Pulse test mode (optional – overrides sensor-derived levels when enabled)
+  bool force_feedback_pulse_enabled_{};
+  double force_feedback_pulse_level_{};          // level (0..1) applied during pulse window
+  double force_feedback_pulse_hold_sec_{};       // duration to hold the level
+  double force_feedback_pulse_interval_sec_{};   // total cycle period (pulse + wait)
+  rclcpp::Time force_feedback_pulse_cycle_start_{0,0,RCL_ROS_TIME};
+
+  FingerJointMatrix joint_orientation_{}; // retained for potential future use
   FingerJointMatrix zero_qpos_ref_{};
-  FingerJointMatrix prev_qpos_cmd_{};
-  FingerJointMatrix latest_smoothed_qpos_{};
+  FingerJointMatrix prev_qpos_cmd_{}; // legacy smoothing removed
+  FingerJointMatrix latest_smoothed_qpos_{}; // legacy smoothing removed
 
   std::string force_feedback_topic_template_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr zero_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr force_feedback_timer_;
+  // Debug print timer and settings for subscribed force sensor values
+  bool force_feedback_print_enabled_{};
+  double force_feedback_print_rate_hz_{};
+  double force_feedback_print_period_{};
+  rclcpp::TimerBase::SharedPtr force_feedback_print_timer_;
   std::mutex force_feedback_mutex_;
 };
 
@@ -796,9 +762,20 @@ std::string SenseGloveNode::resolve_force_feedback_topic(int sensor_index) const
 {
   std::string resolved = force_feedback_topic_template_;
   const std::string placeholder = "{index}";
+  const std::string hand_placeholder = "{hand}";
   const int one_based = sensor_index + 1;
   bool replaced = false;
 
+  // Replace {hand} placeholder with left or right
+  std::size_t hand_pos = resolved.find(hand_placeholder);
+  while (hand_pos != std::string::npos)
+  {
+    const std::string hand_side = use_right_hand_ ? "right" : "left";
+    resolved.replace(hand_pos, hand_placeholder.size(), hand_side);
+    hand_pos = resolved.find(hand_placeholder, hand_pos + hand_side.size());
+  }
+
+  // Replace {index} placeholder with sensor number
   std::size_t pos = resolved.find(placeholder);
   while (pos != std::string::npos)
   {
@@ -809,21 +786,71 @@ std::string SenseGloveNode::resolve_force_feedback_topic(int sensor_index) const
 
   if (!replaced)
   {
+    const std::string hand_prefix = use_right_hand_ ? "right" : "left";
     if (resolved.empty())
     {
-      resolved = "/force_sensor/s" + std::to_string(one_based) + "/wrench";
+      resolved = "/force_sensor/" + hand_prefix + "/s" + std::to_string(one_based) + "/wrench";
     }
     else if (resolved.back() == '/')
     {
-      resolved += "s" + std::to_string(one_based) + "/wrench";
+      resolved += hand_prefix + "/s" + std::to_string(one_based) + "/wrench";
     }
     else
     {
-      resolved += "/s" + std::to_string(one_based) + "/wrench";
+      resolved += "/" + hand_prefix + "/s" + std::to_string(one_based) + "/wrench";
     }
   }
 
   return resolved;
+}
+
+void SenseGloveNode::print_force_feedback_status()
+{
+  if (!force_feedback_enabled_)
+  {
+    return;
+  }
+
+  const auto now = get_clock()->now();
+
+  std::ostringstream oss;
+  bool any = false;
+
+  {
+    std::lock_guard<std::mutex> guard(force_feedback_mutex_);
+    const std::size_t count = filtered_sensor_ft_.size();
+    for (std::size_t idx = 0; idx < count; ++idx)
+    {
+      const std::size_t finger = std::min(idx, static_cast<std::size_t>(kFingerCount - 1));
+      const double age = (now - last_sensor_update_[idx]).seconds();
+
+      if (idx > 0) oss << " | ";
+      oss << "s" << (idx + 1) << "->" << kFingerNames[finger] << " ";
+
+      if (sensor_initialized_[idx])
+      {
+        const auto &ft = filtered_sensor_ft_[idx];
+        oss << std::fixed << std::setprecision(3)
+            << "age=" << age << "s "
+            << "f(" << ft[0] << ", " << ft[1] << ", " << ft[2] << ") "
+            << "t(" << ft[3] << ", " << ft[4] << ", " << ft[5] << ")";
+      }
+      else
+      {
+        oss << "no data";
+      }
+      any = true;
+    }
+  }
+
+  if (any)
+  {
+    RCLCPP_INFO(get_logger(), "Force sensors: %s", oss.str().c_str());
+  }
+  else
+  {
+    RCLCPP_INFO(get_logger(), "Force sensors: no subscriptions configured");
+  }
 }
 
 void SenseGloveNode::on_force_wrench(
@@ -870,14 +897,8 @@ void SenseGloveNode::on_force_wrench(
 
     last_sensor_update_[sensor_index] = now;
 
-    const double force_mag = std::sqrt(
-      std::abs(filtered_sample[0]) * std::abs(filtered_sample[0]) +
-      std::abs(filtered_sample[1]) * std::abs(filtered_sample[1]) +
-      std::abs(filtered_sample[2]) * std::abs(filtered_sample[2]));
-    const double torque_mag = std::sqrt(
-      std::abs(filtered_sample[3]) * std::abs(filtered_sample[3]) +
-      std::abs(filtered_sample[4]) * std::abs(filtered_sample[4]) +
-      std::abs(filtered_sample[5]) * std::abs(filtered_sample[5]));
+    const double force_mag = magnitude_force(filtered_sample);
+    const double torque_mag = magnitude_torque(filtered_sample);
 
     const double target_level = static_cast<double>(map_force_to_haptic_level(static_cast<float>(force_mag)));
     const double normalized_torque = clamp(torque_mag, 0.0, 1.0);
@@ -896,14 +917,8 @@ void SenseGloveNode::on_force_wrench(
         continue;
       }
       const auto & ft = filtered_sensor_ft_[idx];
-      aggregated_force += std::sqrt(
-        std::abs(ft[0]) * std::abs(ft[0]) + 
-        std::abs(ft[1]) * std::abs(ft[1]) + 
-        std::abs(ft[2]) * std::abs(ft[2]));
-      aggregated_torque += std::sqrt(
-        std::abs(ft[3]) * std::abs(ft[3]) + 
-        std::abs(ft[4]) * std::abs(ft[4]) + 
-        std::abs(ft[5]) * std::abs(ft[5]));
+      aggregated_force += magnitude_force(ft);
+      aggregated_torque += magnitude_torque(ft);
       ++active_count;
     }
 
@@ -951,12 +966,12 @@ void SenseGloveNode::on_force_wrench(
     }
   }
 
-  // RCLCPP_INFO(
-  //   get_logger(),
-  //   "Force sensor[%zu -> %s] wrench: f(%.3f, %.3f, %.3f) t(%.3f, %.3f, %.3f)",
-  //   sensor_index + 1,
-  //   kFingerNames[target_finger],
-  //   sample[0], sample[1], sample[2], sample[3], sample[4], sample[5]);
+  RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 1000,
+    "Force sensor[%zu -> %s] wrench: f(%.3f, %.3f, %.3f) t(%.3f, %.3f, %.3f)",
+    sensor_index + 1,
+    kFingerNames[target_finger],
+    sample[0], sample[1], sample[2], sample[3], sample[4], sample[5]);
 }
 
 void SenseGloveNode::send_force_feedback()
@@ -999,10 +1014,7 @@ void SenseGloveNode::send_force_feedback()
       any_active = true;
       
       const auto & ft = filtered_sensor_ft_[idx];
-      forces_newton[finger] = std::sqrt(
-        std::abs(ft[0]) * std::abs(ft[0]) + 
-        std::abs(ft[1]) * std::abs(ft[1]) + 
-        std::abs(ft[2]) * std::abs(ft[2]));
+      forces_newton[finger] = magnitude_force(ft);
     }
 
     if (!any_active)
@@ -1017,6 +1029,30 @@ void SenseGloveNode::send_force_feedback()
     levels = filtered_levels_;
     strap_level = filtered_strap_;
     vibe_level = filtered_vibe_;
+  }
+
+  // Override with pulse test levels if enabled
+  if (force_feedback_pulse_enabled_)
+  {
+    if (force_feedback_pulse_cycle_start_.nanoseconds() == 0)
+    {
+      force_feedback_pulse_cycle_start_ = now;
+    }
+    const double elapsed = (now - force_feedback_pulse_cycle_start_).seconds();
+    const double cycle = force_feedback_pulse_interval_sec_;
+    double local_t = elapsed;
+    if (elapsed >= cycle)
+    {
+      // restart cycle
+      force_feedback_pulse_cycle_start_ = now;
+      local_t = 0.0;
+    }
+    const bool in_pulse = local_t < force_feedback_pulse_hold_sec_;
+    const double lvl = in_pulse ? force_feedback_pulse_level_ : 0.0;
+    for (std::size_t f = 0; f < kFingerCount; ++f)
+    {
+      levels[f] = lvl;
+    }
   }
 
 #ifndef HAVE_SENSEGLOVE_SDK
@@ -1035,46 +1071,33 @@ void SenseGloveNode::send_force_feedback()
 #else
   try
   {
-    bool queued_thumb = SGCore::HandLayer::QueueCommand_ForceFeedbackLevel(
-      use_right_hand_, 0, static_cast<float>(clamp(levels[0], 0.0, 1.0)), false);
-    
-    bool queued_index = true;
-    if (kFingerCount > 1)
+    struct HandLayerHapticsProxy
     {
-      queued_index = SGCore::HandLayer::QueueCommand_ForceFeedbackLevel(
-        use_right_hand_, 1, static_cast<float>(clamp(levels[1], 0.0, 1.0)), false);
-    }
-    
-    bool queued_middle = true;
-    if (kFingerCount > 2)
-    {
-      queued_middle = SGCore::HandLayer::QueueCommand_ForceFeedbackLevel(
-        use_right_hand_, 2, static_cast<float>(clamp(levels[2], 0.0, 1.0)), false);
-    }
+      explicit HandLayerHapticsProxy(bool use_right) : use_right(use_right) {}
 
+      bool QueueForceFeedbackLevel(int channel, float level) const
+      {
+        return SGCore::HandLayer::QueueCommand_ForceFeedbackLevel(use_right, channel, level, false);
+      }
+
+      bool SendHaptics() const
+      {
+        return SGCore::HandLayer::SendHaptics(use_right);
+      }
+
+      bool use_right;
+    } glove(use_right_hand_);
+
+    const float thumb_lvl  = static_cast<float>(clamp(levels[0], 0.0, 1.0));
+    const float index_lvl  = static_cast<float>(clamp(kFingerCount > 1 ? levels[1] : 0.0, 0.0, 1.0));
+    const float middle_lvl = static_cast<float>(clamp(kFingerCount > 2 ? levels[2] : 0.0, 0.0, 1.0));
+
+    bool queued_thumb  = glove.QueueForceFeedbackLevel(0, thumb_lvl);
+    bool queued_index  = glove.QueueForceFeedbackLevel(1, index_lvl);
+    bool queued_middle = glove.QueueForceFeedbackLevel(2, middle_lvl);
     const bool all_queued = queued_thumb && queued_index && queued_middle;
 
-    bool sent = SGCore::HandLayer::SendHaptics(use_right_hand_);
-    // if (!all_queued || !sent)
-    // {
-    //   RCLCPP_WARN_THROTTLE(
-    //     get_logger(), *get_clock(), 2000,
-    //     "Haptics queue/send fail detail: queued_thumb=%d queued_index=%d queued_middle=%d sent=%d glovesConnected=%d deviceConnected=%d",
-    //     queued_thumb, queued_index, queued_middle, sent ? 1 : 0,
-    //     SGCore::HandLayer::GlovesConnected(),
-    //     SGCore::HandLayer::DeviceConnected(use_right_hand_) ? 1 : 0);
-    //   RCLCPP_WARN_THROTTLE(
-    //     get_logger(), *get_clock(), 2000,
-    //     "Failed to queue or send haptic commands.");
-    //   return;
-    // }
-
-    // RCLCPP_INFO_THROTTLE(
-    //   get_logger(), *get_clock(), 500,
-    //   "Target fingertip forces (N): thumb=%.2f, index=%.2f, middle=%.2f",
-    //   forces_newton[0],
-    //   forces_newton[1],
-    //   forces_newton[2]);
+    bool sent = glove.SendHaptics();
 
     last_haptics_send_ = now;
   }

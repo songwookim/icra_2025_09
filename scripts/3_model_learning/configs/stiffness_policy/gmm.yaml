@@ -1,0 +1,9 @@
+# GMM / GMR 하이퍼파라미터. 스크립트 실행 시 대응되는 CLI 옵션으로 전달해야 적용됩니다.
+# components: 혼합 성분 개수. 늘리면 표현력↑, 계산량↑, 과적합 위험도↑.
+components: 8
+# covariance_type: 공분산 형태. full은 축 간 상관을 살리고 diag/spherical은 빠르지만 단순합니다.
+covariance_type: full
+# reg_covar: 수치 안정화를 위한 대각선 자코비안. 너무 낮으면 분해 실패, 너무 높으면 분산 과대.
+reg_covar: 1.0e-5
+# samples: gmm 모드에서 예측 시 샘플링할 횟수. 높일수록 평균이 매끄럽지만 느려집니다.
+samples: 16

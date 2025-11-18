@@ -1,0 +1,13 @@
+[1/4] GP+MDN (unified, original)
+[info] Standard mode: Using sensor observations (20D)
+[info] Running in unified mode (single model: 20D obs -> 9D act)
+
+================================================================================
+DATA AUGMENTATION ENABLED
+================================================================================
+Original:   90 demos, 480,630 samples
+Augmented:  180 demos, 961,202 samples
+Factor:     2.0x demos, 2.0x samples
+================================================================================
+
+[info] training GP baseline ...
