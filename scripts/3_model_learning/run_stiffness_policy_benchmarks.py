@@ -1092,7 +1092,13 @@ if torch is not None:
 
 
 class GPBaseline:
-    """Gaussian Process Regression for stiffness prediction with uncertainty quantification."""
+    """Gaussian Process Regression for stiffness prediction with uncertainty quantification.
+
+    Notes on scalability:
+    - Exact GPR has O(N^2) memory and O(N^3) time. We therefore cap the number of
+      training points by random subsampling (subset-of-data) and perform batched prediction
+      to avoid building an enormous K(X*, X_train) at once.
+    """
     
     def __init__(
         self,
@@ -1104,12 +1110,21 @@ class GPBaseline:
         alpha: float = 1e-4,
         normalize_y: bool = True,
         n_restarts_optimizer: int = 5,
+        # GP scalability guards
+        max_train_points: int = 4000,
+        subsample_strategy: str = "random",
+        batch_predict_size: int = 2048,
+        random_state: int = 42,
     ):
         from sklearn.gaussian_process import GaussianProcessRegressor
         from sklearn.gaussian_process.kernels import RBF, Matern, ConstantKernel as C
         
         self.obs_dim = obs_dim
         self.act_dim = act_dim
+        self.max_train_points = int(max(1, max_train_points))
+        self.subsample_strategy = str(subsample_strategy)
+        self.batch_predict_size = int(max(1, batch_predict_size))
+        self.random_state = int(random_state)
         # Coerce numeric parameters (YAML may parse scientific notation as string)
         try:
             alpha = float(alpha)
@@ -1164,23 +1179,52 @@ class GPBaseline:
             self.gps.append(gp)
     
     def fit(self, obs: np.ndarray, act: np.ndarray) -> None:
-        """Fit one GP per action dimension."""
+        """Fit one GP per action dimension with optional subsampling to cap memory/time."""
+        N = obs.shape[0]
+        if N > self.max_train_points:
+            # Subsample indices once and reuse for all output dimensions
+            if self.subsample_strategy == "random":
+                rng = np.random.RandomState(self.random_state)
+                idx = rng.choice(N, size=self.max_train_points, replace=False)
+            else:
+                # Fallback to random for now; can add KMeans-based coreset later
+                rng = np.random.RandomState(self.random_state)
+                idx = rng.choice(N, size=self.max_train_points, replace=False)
+            obs_fit = obs[idx]
+            act_fit = act[idx]
+            print(f"[gp] subsampling {N} -> {self.max_train_points} points to bound O(N^2) memory")
+        else:
+            obs_fit = obs
+            act_fit = act
+
         for i, gp in enumerate(self.gps):
-            gp.fit(obs, act[:, i])
+            gp.fit(obs_fit, act_fit[:, i])
     
     def predict(self, obs: np.ndarray, return_std: bool = False) -> np.ndarray:
-        """Predict with optional uncertainty."""
+        """Predict with optional uncertainty using batching to control memory usage."""
+        n = obs.shape[0]
+        BS = self.batch_predict_size
         if return_std:
-            means = []
-            stds = []
-            for gp in self.gps:
-                mean, std = gp.predict(obs, return_std=True)
-                means.append(mean)
-                stds.append(std)
-            return np.column_stack(means), np.column_stack(stds)
+            means_per_dim = [np.empty((n,), dtype=np.float64) for _ in self.gps]
+            stds_per_dim = [np.empty((n,), dtype=np.float64) for _ in self.gps]
+            for start in range(0, n, BS):
+                end = min(n, start + BS)
+                Xb = obs[start:end]
+                for d, gp in enumerate(self.gps):
+                    mean_b, std_b = gp.predict(Xb, return_std=True)
+                    means_per_dim[d][start:end] = mean_b
+                    stds_per_dim[d][start:end] = std_b
+            means = np.column_stack(means_per_dim)
+            stds = np.column_stack(stds_per_dim)
+            return means, stds
         else:
-            preds = [gp.predict(obs) for gp in self.gps]
-            return np.column_stack(preds)
+            preds_per_dim = [np.empty((n,), dtype=np.float64) for _ in self.gps]
+            for start in range(0, n, BS):
+                end = min(n, start + BS)
+                Xb = obs[start:end]
+                for d, gp in enumerate(self.gps):
+                    preds_per_dim[d][start:end] = gp.predict(Xb)
+            return np.column_stack(preds_per_dim)
     
     def nll(self, obs: np.ndarray, act: np.ndarray) -> float:
         """Negative log likelihood (sum across action dimensions)."""
@@ -2125,6 +2169,10 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             alpha=gp_config.get("alpha", 1e-4),
             normalize_y=gp_config.get("normalize_y", True),
             n_restarts_optimizer=gp_config.get("n_restarts_optimizer", 5),
+            max_train_points=int(gp_config.get("max_train_points", 4000)),
+            subsample_strategy=str(gp_config.get("subsample_strategy", "random")),
+            batch_predict_size=int(gp_config.get("batch_predict_size", 2048)),
+            random_state=int(getattr(args, "seed", 42)),
         )
         gp.fit(train_obs, train_act)
         
