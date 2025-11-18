@@ -1,0 +1,13 @@
+# LSTM 인코더 + GMM 디코더 베이스라인. CLI에서는 --lstm-gmm-*와 --sequence-window로 연동됩니다.
+# hidden_dim: LSTM 은닉 크기이자 GMM 헤드 폭. 크게 하면 장기 패턴 포착력↑, 메모리↑.
+hidden_dim: 256
+# lstm_layers: LSTM 층 수. 2 이상이면 더 깊은 시간 관계를 학습하지만 훈련 난이도가 높아집니다.
+lstm_layers: 1
+# epochs: 학습 에폭. 데이터가 많으면 늘리고, 오버피팅 시 줄입니다.
+epochs: 200
+# components: 디코더 GMM 성분 수. 늘리면 복잡한 분포를 모델링하지만 불안정해질 수 있습니다.
+components: 5
+# sequence_window: 입력 시퀀스 길이. 길수록 컨텍스트 정보↑, GPU 메모리와 계산량도↑.
+sequence_window: 5
+# learning_rate: 학습률. 발산 시 감소, 수렴 지연 시 소폭 증가.
+learning_rate: 1.0e-3

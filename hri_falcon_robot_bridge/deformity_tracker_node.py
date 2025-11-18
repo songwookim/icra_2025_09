@@ -156,6 +156,7 @@ class DeformityTrackerNode(Node):
         # Local state tracking (for overlay display)
         # These will be updated both by local key presses and remote topic subscriptions
         self._logger_active = False
+        self._logger_start_time: Optional[float] = None  # Logger 시작 시간 추적
         self._units_enabled = False
         self._zero_captured = False
         self._calibration_mode: bool = False  # /force_sensor/calibration_mode Bool 토픽 반영
@@ -378,7 +379,7 @@ class DeformityTrackerNode(Node):
             else:
                 self.get_logger().info(f"[CAPTURE] saved frames -> {self._record_dir}")
         else:
-            self.get_logger().info('[CAPTURE] stop (no active recording)')
+            self.get_logger().info('[CAPTURE] stop (no active recording)')    
         self._record_dir = None
         self._frame_counter = 0
         self._recording = False
@@ -388,6 +389,17 @@ class DeformityTrackerNode(Node):
             active = bool(msg.data)
         except Exception:
             active = False
+        
+        # Logger 상태 변경 감지 및 시작 시간 기록
+        if active and not self._logger_active:
+            # Logger가 꺼진 상태에서 켜진 경우
+            self._logger_start_time = time.time()
+            self.get_logger().info(f"[Overlay] logger started at {self._logger_start_time}")
+        elif not active and self._logger_active:
+            # Logger가 꺼진 경우
+            self._logger_start_time = None
+            self.get_logger().info(f"[Overlay] logger stopped")
+        
         self._logger_active = active
         self.get_logger().info(f"[Overlay] logger_active updated -> {self._logger_active}")
 
@@ -409,6 +421,7 @@ class DeformityTrackerNode(Node):
                 mask, masks_by_color, cnts = self._extract_mask_and_contours(frame)
                 best = None
                 color_label = None
+                point_text = ""
                 if len(cnts) > 0:
                     c = max(cnts, key=cv2.contourArea)
                     best = self._measure_contour(c)
@@ -423,7 +436,25 @@ class DeformityTrackerNode(Node):
                                 best_name = name
                         color_label = best_name
                         if best['center'] is not None and best['radius'] >= 10.0:
-                            cv2.circle(vis, best['center'], 5, (0, 0, 255), -1)
+                            # Choose dot color by eccentricity window [0.495, 0.505]
+                            ecc_for_color = 0.0
+                            try:
+                                ecc_for_color = float(best.get('eccentricity', 0.0))
+                            except Exception:
+                                ecc_for_color = 0.0
+                            dot_color = (0, 255, 0) if (0.495 <= ecc_for_color <= 0.505) else (0, 0, 255)
+                            # Draw dot
+                            cv2.circle(vis, best['center'], 5, dot_color, -1)
+                            # Prepare and draw coordinate label near the dot
+                            try:
+                                cx, cy = int(best['center'][0]), int(best['center'][1])
+                                point_text = f"pt:({cx},{cy})"
+                                tx, ty = cx + 8, max(12, cy - 8)
+                                # Shadow for readability
+                                cv2.putText(vis, point_text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
+                                cv2.putText(vis, point_text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+                            except Exception:
+                                pass
                         # If ellipse data (a,b) present, draw approximate ellipse outline (use minEnclosingCircle already for circle) - optional
                         # Could extend: cv2.ellipse(...)
                 circ_val = best['circularity'] if best else 0.0
@@ -458,50 +489,59 @@ class DeformityTrackerNode(Node):
                 h_txt = 'ON' if (self._units_enabled is True) else 'OFF'
                 h_color = (0, 255, 0) if (self._units_enabled is True) else (0, 0, 255)  # Green if ON, Red if OFF
                 
-                s_txt = 'ON' if (self._logger_active is True) else 'OFF'
+                # Logger 상태 텍스트 (경과 시간 포함)
+                if self._logger_active and self._logger_start_time is not None:
+                    elapsed_sec = time.time() - self._logger_start_time
+                    s_txt = f'ON ({elapsed_sec:.1f}s)'
+                else:
+                    s_txt = 'OFF'
                 s_color = (0, 255, 0) if (self._logger_active is True) else (0, 0, 255)
                 
                 # Force calibration mode: ON when True, OFF when False
                 f_txt = 'ON' if self._calibration_mode else 'OFF'
                 f_color = (0, 255, 0) if self._calibration_mode else (0, 0, 255)  # Green if ON, Red if OFF
                     
-                line1 = f"{prefix}circ:{circ_val:.3f} ecc:{ecc_val:.3f} FPS:{self._fps_val:.1f}"
+                # Line 1: Eccentricity + point coordinates (if available)
+                line1 = f"{prefix}ecc:{ecc_val:.3f}"
+                if point_text:
+                    line1 += f" | {point_text}"
                 line2_label = "| publish_robot(h):"
                 line3_label = "| data_logger(s):"
                 line4_label = "| force_calibration(f):"
                 
-                # Multi-line overlay with white text for line1
-                cv2.putText(vis, line1, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, line1, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                # Multi-line overlay with larger text for line1 (eccentricity)
+                cv2.putText(vis, line1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+                line1_color = (0, 255, 0) if (0.495 <= float(ecc_val) <= 0.505) else (255, 255, 255)
+                cv2.putText(vis, line1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, line1_color, 1, cv2.LINE_AA)
                 
                 # Line 2: publish_robot with colored status
-                cv2.putText(vis, line2_label, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, line2_label, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(vis, line2_label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(vis, line2_label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
                 h_x_offset = cv2.getTextSize(line2_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0][0]
-                cv2.putText(vis, h_txt, (10 + h_x_offset, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, h_txt, (10 + h_x_offset, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, h_color, 1, cv2.LINE_AA)
+                cv2.putText(vis, h_txt, (10 + h_x_offset, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(vis, h_txt, (10 + h_x_offset, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, h_color, 1, cv2.LINE_AA)
                 
                 # Line 3: data_logger with colored status
-                cv2.putText(vis, line3_label, (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, line3_label, (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(vis, line3_label, (10, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(vis, line3_label, (10, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
                 s_x_offset = cv2.getTextSize(line3_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0][0]
-                cv2.putText(vis, s_txt, (10 + s_x_offset, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, s_txt, (10 + s_x_offset, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, s_color, 1, cv2.LINE_AA)
+                cv2.putText(vis, s_txt, (10 + s_x_offset, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(vis, s_txt, (10 + s_x_offset, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.6, s_color, 1, cv2.LINE_AA)
                 
                 # Line 4: force_calibration with colored status
-                cv2.putText(vis, line4_label, (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, line4_label, (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(vis, line4_label, (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(vis, line4_label, (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
                 f_x_offset = cv2.getTextSize(line4_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0][0]
-                cv2.putText(vis, f_txt, (10 + f_x_offset, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(vis, f_txt, (10 + f_x_offset, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.6, f_color, 1, cv2.LINE_AA)
+                cv2.putText(vis, f_txt, (10 + f_x_offset, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(vis, f_txt, (10 + f_x_offset, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, f_color, 1, cv2.LINE_AA)
                 
                 # 녹화 상태 오버레이 표시
                 try:
                     if self._recording:
                         rec_txt = 'REC'
                         color = (0, 0, 255) if self.capture_mode == 'video' else (0, 200, 255)
-                        cv2.putText(vis, rec_txt, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
-                        cv2.putText(vis, rec_txt, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
+                        cv2.putText(vis, rec_txt, (10, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+                        cv2.putText(vis, rec_txt, (10, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
                 except Exception:
                     pass
 
@@ -528,7 +568,15 @@ class DeformityTrackerNode(Node):
                     elif key == ord('s'):
                         # Toggle logger state and publish to data_logger_node
                         try:
-                            self._logger_active = not self._logger_active
+                            new_state = not self._logger_active
+                            if new_state and not self._logger_active:
+                                # Logger 켜기: 시작 시간 기록
+                                self._logger_start_time = time.time()
+                            elif not new_state and self._logger_active:
+                                # Logger 끄기: 시작 시간 초기화
+                                self._logger_start_time = None
+                            
+                            self._logger_active = new_state
                             state = "ON" if self._logger_active else "OFF"
                             self.get_logger().info(f"[Key/Logger] toggle -> {state}")
                             if self.key_pub is not None:

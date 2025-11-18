@@ -1,0 +1,17 @@
+# 시퀀스 정보를 사용하는 확산 정책. CLI에서는 --diffusion-* + --sequence-window로 제어합니다.
+# steps: 확산 단계 수. 클수록 고품질/고비용.
+steps: 75
+# hidden_dim: 네트워크 은닉폭. VRAM/파라미터 수에 직접 영향.
+hidden_dim: 256
+# batch_size: 학습 배치. 시퀀스 길이가 길수록 동일 배치에서도 메모리 부담이 큽니다.
+batch_size: 256
+# learning_rate: 학습률. 발산 시 감소, 수렴이 느리면 조금 증대.
+learning_rate: 1.0e-3
+# epochs: 학습 에폭. 시퀀스 데이터가 많지 않다면 150 이하로도 충분할 수 있습니다.
+epochs: 200
+# sequence_window: LSTM/Temporal 모델이 참고할 과거 길이. 길수록 장기 의존성 포착, 비용 증가.
+sequence_window: 5
+# sampler: ddpm 기본. DDIM 사용 시 eta와 함께 조절.
+sampler: ddpm
+# eta: DDIM 노이즈 계수. 0은 결정적, 양수는 랜덤성 추가. DDPM과는 무관합니다.
+eta: 0.0

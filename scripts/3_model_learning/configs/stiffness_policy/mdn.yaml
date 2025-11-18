@@ -1,0 +1,23 @@
+# Mixture Density Network configuration
+# Best for: multimodal distributions, combining GMM flexibility with deep network expressiveness
+
+# Network architecture
+hidden_units: [128, 128, 64]  # Hidden layer sizes
+activation: relu  # relu, tanh, elu
+dropout: 0.1  # Dropout probability (0.0 to disable)
+
+# Mixture configuration
+n_components: 5  # Number of Gaussian components
+covariance_type: diag  # diag (faster, stable) or full (more expressive)
+
+# Training
+epochs: 200
+batch_size: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+patience: 30  # Early stopping patience
+min_delta: 1e-4  # Minimum improvement for early stopping
+
+# Regularization
+mixture_reg: 0.01  # Regularization on mixture weights (entropy penalty)
+covariance_floor: 1e-4  # Minimum variance to prevent collapse
