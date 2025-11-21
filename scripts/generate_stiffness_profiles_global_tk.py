@@ -46,19 +46,22 @@ from generate_stiffness_profiles import (
 )
 
 EPS = 1e-8
+WORKSPACE_ROOT = PKG_DIR.parent.parent
 DEFAULT_INPUT = PKG_DIR / "outputs" / "logs" / "success"
 K_INIT = 200.0
-K_MIN = 50.0
+K_MIN = -200.0
 VALIDATE_RESULTS = True
 
 
-def compute_global_tk(input_dir: Path) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+def compute_global_tk(input_dir: Path) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Compute global T_K for each finger from all demonstrations combined.
     
     Returns:
-        Dict with keys 'th', 'if', 'mf', each containing (T_K, H_K) tuple
+        Dict with keys 'th', 'if', 'mf', each containing (T_K, H_K, T_F, H_F) tuple
         T_K: (3, d) transformation matrix from EMG to stiffness
         H_K: (d, d) stiffness subspace projector
+        T_F: (3, d) transformation matrix from EMG to force
+        H_F: (d, d) force subspace projector
     """
     print("\n[Phase 1] Computing global T_K per finger from all demonstrations...")
     
@@ -93,16 +96,20 @@ def compute_global_tk(input_dir: Path) -> Dict[str, Tuple[np.ndarray, np.ndarray
             if emg_smoothed is None:
                 emg_smoothed = emg_magnitude
             
-            # Extract force for each finger
+            # Extract full 3D force for each finger
             for finger, sensor in sensor_map.items():
                 try:
-                    Fn = _compute_normal_force(df, prefix=sensor, n=(0.0, 0.0, 1.0))
-                    Fn_smoothed = _smooth_force(Fn, fs)
-                    if Fn_smoothed is None:
-                        Fn_smoothed = Fn
-                    
-                    finger_data[finger]["emg"].append(emg_smoothed)
-                    finger_data[finger]["force"].append(Fn_smoothed)
+                    force_cols = [f"{sensor}_fx", f"{sensor}_fy", f"{sensor}_fz"]
+                    if all(c in df.columns for c in force_cols):
+                        forces = df[force_cols].to_numpy(dtype=float)
+                        rest = max(1, int(len(forces) * 0.1))
+                        baseline = np.mean(forces[:rest, :], axis=0, keepdims=True)
+                        forces_centered = forces - baseline
+                        forces_smoothed = _smooth_force(forces_centered, fs)
+                        if forces_smoothed is None:
+                            forces_smoothed = forces_centered
+                        finger_data[finger]["emg"].append(emg_smoothed)
+                        finger_data[finger]["force"].append(forces_smoothed)
                 except Exception:
                     continue
             
@@ -124,7 +131,8 @@ def compute_global_tk(input_dir: Path) -> Dict[str, Tuple[np.ndarray, np.ndarray
             raise ValueError(f"No data collected for finger {finger}")
         
         P_global = np.vstack(finger_data[finger]["emg"]).T  # (d, N_total)
-        F_global = np.concatenate(finger_data[finger]["force"])[None, :]  # (1, N_total)
+        F_list = finger_data[finger]["force"]  # each (N_i, 3)
+        F_global = np.vstack(F_list).T  # (3, N_total)
         
         print(f"[{finger}] Global data: EMG {P_global.shape}, Force {F_global.shape}")
         
@@ -132,7 +140,7 @@ def compute_global_tk(input_dir: Path) -> Dict[str, Tuple[np.ndarray, np.ndarray
         H_F = compute_projection_from_tf(T_F)
         T_K, H_K = compute_k_basis_from_force_projector(H_F, target_rank=3)
         
-        global_tk[finger] = (T_K, H_K)
+        global_tk[finger] = (T_K, H_K, T_F, H_F)
         print(f"[{finger}] T_K shape: {T_K.shape}, norm: {np.linalg.norm(T_K):.4f}")
     
     return global_tk
@@ -141,12 +149,12 @@ def compute_global_tk(input_dir: Path) -> Dict[str, Tuple[np.ndarray, np.ndarray
 def process_file_with_global_tk(
     csv_path: Path,
     output_dir: Path,
-    global_tk: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    global_tk: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
 ) -> Optional[List[Path]]:
     """Process single file using global T_K per finger.
     
     Args:
-        global_tk: Dict with keys 'th', 'if', 'mf', each containing (T_K, H_K)
+        global_tk: Dict with keys 'th', 'if', 'mf', each containing (T_K, H_K, T_F, H_F)
     """
     try:
         df = _load_csv(csv_path)
@@ -158,20 +166,20 @@ def process_file_with_global_tk(
     fs = _estimate_fs(time) or 200.0
 
     # Extract deformation and end-effector data
-    deform_circ = df.get("deform_circ", np.zeros(len(df))).values
-    deform_ecc = df.get("deform_ecc", np.zeros(len(df))).values
+    deform_circ = df["deform_circ"].to_numpy(dtype=float) if "deform_circ" in df else np.zeros(len(df), dtype=float)
+    deform_ecc = df["deform_ecc"].to_numpy(dtype=float) if "deform_ecc" in df else np.zeros(len(df), dtype=float)
     
-    ee_if_px = df.get("ee_if_px", df.get("ee_px", np.zeros(len(df)))).values
-    ee_if_py = df.get("ee_if_py", df.get("ee_py", np.zeros(len(df)))).values
-    ee_if_pz = df.get("ee_if_pz", df.get("ee_pz", np.zeros(len(df)))).values
+    ee_if_px = df["ee_if_px"].to_numpy(dtype=float) if "ee_if_px" in df else (df["ee_px"].to_numpy(dtype=float) if "ee_px" in df else np.zeros(len(df), dtype=float))
+    ee_if_py = df["ee_if_py"].to_numpy(dtype=float) if "ee_if_py" in df else (df["ee_py"].to_numpy(dtype=float) if "ee_py" in df else np.zeros(len(df), dtype=float))
+    ee_if_pz = df["ee_if_pz"].to_numpy(dtype=float) if "ee_if_pz" in df else (df["ee_pz"].to_numpy(dtype=float) if "ee_pz" in df else np.zeros(len(df), dtype=float))
     
-    ee_mf_px = df.get("ee_mf_px", np.zeros(len(df))).values
-    ee_mf_py = df.get("ee_mf_py", np.zeros(len(df))).values
-    ee_mf_pz = df.get("ee_mf_pz", np.zeros(len(df))).values
+    ee_mf_px = df["ee_mf_px"].to_numpy(dtype=float) if "ee_mf_px" in df else np.zeros(len(df), dtype=float)
+    ee_mf_py = df["ee_mf_py"].to_numpy(dtype=float) if "ee_mf_py" in df else np.zeros(len(df), dtype=float)
+    ee_mf_pz = df["ee_mf_pz"].to_numpy(dtype=float) if "ee_mf_pz" in df else np.zeros(len(df), dtype=float)
     
-    ee_th_px = df.get("ee_th_px", np.zeros(len(df))).values
-    ee_th_py = df.get("ee_th_py", np.zeros(len(df))).values
-    ee_th_pz = df.get("ee_th_pz", np.zeros(len(df))).values
+    ee_th_px = df["ee_th_px"].to_numpy(dtype=float) if "ee_th_px" in df else np.zeros(len(df), dtype=float)
+    ee_th_py = df["ee_th_py"].to_numpy(dtype=float) if "ee_th_py" in df else np.zeros(len(df), dtype=float)
+    ee_th_pz = df["ee_th_pz"].to_numpy(dtype=float) if "ee_th_pz" in df else np.zeros(len(df), dtype=float)
 
     # Extract EMG
     emg_cols = _guess_emg_columns(df)
@@ -203,11 +211,12 @@ def process_file_with_global_tk(
     all_forces = []
     all_forces_csv = []
     all_stiffness = []
+    all_stiffness_raw = []
     all_fn_abs = []
     
     for finger, sensor in zip(finger_names, sensor_names):
         # Get this finger's global T_K
-        T_K_finger, _ = global_tk[finger]
+        T_K_finger = global_tk[finger][0]
         
         # Compute stiffness for this finger using its T_K
         stiffness_finger = np.maximum(K_MIN, (T_K_finger @ P_variant).T + K_INIT)
@@ -237,17 +246,17 @@ def process_file_with_global_tk(
                 Fn_smoothed = Fn
             all_fn_abs.append(np.abs(Fn_smoothed))
             
-            # Use finger-specific stiffness
+            # Use finger-specific stiffness (both smoothed and raw)
             all_stiffness.append(stiffness_finger)
+            all_stiffness_raw.append(stiffness_finger_raw)
         else:
             all_forces.append(np.zeros((len(time), 3)))
             all_forces_csv.append(np.zeros((len(time), 3)))
             all_stiffness.append(stiffness_finger)
+            all_stiffness_raw.append(stiffness_finger_raw)
             all_fn_abs.append(np.zeros(len(time)))
     
-    # Generate plots (use first finger's raw stiffness for comparison)
-    stiffness_raw_ref = np.maximum(K_MIN, (global_tk["th"][0] @ P_raw).T + K_INIT)
-    
+    # Generate plots (use each finger's own raw stiffness for comparison)
     for idx, finger_name in enumerate(finger_names):
         out_png = output_dir / f"{csv_path.stem}_{finger_name}_global_tk.png"
         try:
@@ -256,7 +265,7 @@ def process_file_with_global_tk(
                 all_forces[idx],
                 all_forces[idx],
                 all_fn_abs[idx],
-                stiffness_raw_ref,  # raw (for comparison)
+                all_stiffness_raw[idx],  # raw (finger-specific, for comparison)
                 all_stiffness[idx],  # smoothed (finger-specific)
                 emg_magnitude,
                 emg_smoothed,
@@ -313,17 +322,64 @@ def main() -> None:
         type=Path,
         default=PKG_DIR / "outputs" / "analysis" / "stiffness_profiles_global_tk",
     )
+    parser.add_argument("--validate", action="store_true", help="Run geometric/projector validation and save metrics JSON")
     args = parser.parse_args()
     
-    if not args.input.is_dir():
+    # Resolve input directory with fallbacks
+    candidates: List[Path] = []
+    if isinstance(args.input, Path):
+        candidates.append(args.input)
+        if not args.input.is_absolute():
+            candidates.append(Path.cwd() / args.input)
+            candidates.append(PKG_DIR / args.input)
+            candidates.append(SCRIPT_DIR / args.input)
+            candidates.append(WORKSPACE_ROOT / args.input)
+    for c in candidates:
+        if c.is_dir():
+            input_dir = c
+            break
+    else:
         raise ValueError(f"Input must be directory: {args.input}")
     
     # Phase 1: Compute global T_K per finger
-    global_tk = compute_global_tk(args.input)
+    global_tk = compute_global_tk(input_dir)
+    
+    # Optional validation of subspace geometry
+    if args.validate:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        report = {}
+        for finger, (T_K, H_K, T_F, H_F) in global_tk.items():
+            # Orthogonality between force map and stiffness basis
+            ortho = np.linalg.norm(T_F @ T_K.T)
+            # Projector properties
+            HF_idem = np.linalg.norm(H_F @ H_F - H_F) / (np.linalg.norm(H_F) + EPS)
+            HK_idem = np.linalg.norm(H_K @ H_K - H_K) / (np.linalg.norm(H_K) + EPS)
+            HF_HK_orth = np.linalg.norm(H_F @ H_K) / ((np.linalg.norm(H_F) * np.linalg.norm(H_K)) + EPS)
+            # Complementarity
+            d = T_K.shape[1]
+            I = np.eye(d)
+            comp = np.linalg.norm((H_F + H_K) - I) / (np.linalg.norm(I) + EPS)
+            report[finger] = {
+                "norm_TF_TK_T": float(ortho),
+                "HF_idempotency": float(HF_idem),
+                "HK_idempotency": float(HK_idem),
+                "HF_HK_orthogonality": float(HF_HK_orth),
+                "complementarity_HF_plus_HK_approx_I": float(comp),
+                "shapes": {
+                    "T_F": list(T_F.shape),
+                    "T_K": list(T_K.shape),
+                    "H_F": list(H_F.shape),
+                    "H_K": list(H_K.shape),
+                },
+            }
+        import json
+        with open(args.output_dir / "global_tk_validation.json", "w") as f:
+            json.dump(report, f, indent=2)
+        print("[validate] Saved validation metrics to", args.output_dir / "global_tk_validation.json")
     
     # Phase 2: Process all files with global T_K
     print(f"\n[Phase 2] Processing files with global T_K...")
-    csv_files = [p for p in sorted(args.input.glob("*.csv")) if not p.name.endswith("_paper_profile.csv")]
+    csv_files = [p for p in sorted(input_dir.glob("*.csv")) if not p.name.endswith("_paper_profile.csv")]
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
     

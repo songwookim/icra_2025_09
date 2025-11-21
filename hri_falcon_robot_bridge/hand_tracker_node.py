@@ -290,14 +290,14 @@ class HandTrackerNode(Node):
             pass
         # EE pose publish/subscribe
         self._ee_pose = None
-        self.ee_pose_pub = None
+        self.ee_pose_pub_if = None
         self.ee_pose_pub_mf = None
         self.ee_pose_pub_th = None
         if self.ee_pose_topic_if:
             # 퍼블리시를 원하면 퍼블리셔 생성
             if self.ee_pose_publish_enabled:
                 try:
-                    self.ee_pose_pub = self.create_publisher(PoseStamped, self.ee_pose_topic_if, 10)
+                    self.ee_pose_pub_if = self.create_publisher(PoseStamped, self.ee_pose_topic_if, 10)
                     self.get_logger().info(f"EE Pose 퍼블리시: {self.ee_pose_topic_if} (source={self.ee_pose_source})")
                 except Exception as e:
                     self.get_logger().warn(f"EE pose publisher 생성 실패: {e}")
@@ -739,7 +739,7 @@ class HandTrackerNode(Node):
                                 # Publish EE pose from MuJoCo (site_xpos or body xpos)
                                 try:
                                     if (
-                                        self.ee_pose_publish_enabled and self.ee_pose_pub is not None and
+                                        self.ee_pose_publish_enabled and self.ee_pose_pub_if is not None and
                                         self.ee_pose_source == 'mujoco'
                                     ):
                                         px = py = pz = None
@@ -772,7 +772,7 @@ class HandTrackerNode(Node):
                                             msg.pose.orientation.z = 0.0
                                             msg.pose.orientation.w = 1.0
                                             try:
-                                                self.ee_pose_pub.publish(msg)
+                                                self.ee_pose_pub_if.publish(msg)
                                             except Exception:
                                                 pass
                                             # Overlay 표시용 내부 상태도 업데이트

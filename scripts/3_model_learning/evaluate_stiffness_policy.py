@@ -47,6 +47,8 @@ BehaviorCloningBaseline = getattr(benchmarks, "BehaviorCloningBaseline", None)
 IBCBaseline = getattr(benchmarks, "IBCBaseline", None)
 DiffusionPolicyBaseline = getattr(benchmarks, "DiffusionPolicyBaseline", None)
 LSTMGMMBaseline = getattr(benchmarks, "LSTMGMMBaseline", None)
+GPBaseline = getattr(benchmarks, "GPBaseline", None)
+MDNBaseline = getattr(benchmarks, "MDNBaseline", None)
 
 DEFAULT_ARTIFACT_ROOT = DEFAULT_OUTPUT_DIR / "artifacts"
 DEFAULT_PLOT_DIR = DEFAULT_OUTPUT_DIR / "plots"
@@ -203,15 +205,46 @@ def _plot_model_grid(
     model_order: Sequence[str],
     axes_labels: Sequence[str],
     out_path: Path,
+    observations: Optional[np.ndarray] = None,
+    obs_labels: Optional[Sequence[str]] = None,
 ) -> None:
+    """Plot grid of model predictions with optional observation subplot.
+    
+    Args:
+        observations: (T, obs_dim) observation array to display
+        obs_labels: Labels for observation dimensions
+    """
     rows = len(model_order)
     act_dim = target.shape[1]
-    fig, axes = plt.subplots(rows, act_dim, figsize=(4.2 * act_dim, 2.4 * rows), sharex=True)
+    
+    # Add extra row for observations if provided
+    total_rows = rows + 1 if observations is not None else rows
+    
+    fig, axes = plt.subplots(total_rows, act_dim, figsize=(4.2 * act_dim, 2.4 * total_rows), sharex=True)
     axes_array = np.atleast_2d(axes)
-    for row, model_name in enumerate(model_order):
+    
+    # Plot observations in first row if provided
+    row_offset = 0
+    if observations is not None and obs_labels is not None:
+        obs_to_plot = min(act_dim, observations.shape[1])  # Match action dimension count
         for col in range(act_dim):
-            ax = axes_array[row, col]
-            ax.plot(time_idx, target[:, col], label="target", linewidth=1.2)
+            ax = axes_array[0, col]
+            if col < obs_to_plot:
+                ax.plot(time_idx, observations[:, col], linewidth=1.0, color='gray', alpha=0.7)
+                ax.set_title(f"Obs: {obs_labels[col]}", fontsize=9)
+            else:
+                ax.axis('off')
+            ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.5)
+            if col == 0:
+                ax.set_ylabel("Observations", fontsize=9)
+        row_offset = 1
+    
+    # Plot model predictions
+    for row, model_name in enumerate(model_order):
+        plot_row = row + row_offset
+        for col in range(act_dim):
+            ax = axes_array[plot_row, col]
+            ax.plot(time_idx, target[:, col], label="GT (demo)", linewidth=1.2)
             ax.plot(
                 time_idx,
                 predictions[model_name][:, col],
@@ -220,15 +253,22 @@ def _plot_model_grid(
                 linestyle="--",
                 alpha=0.9,
             )
-            if row == 0:
+            if row_offset == 0 and row == 0:
                 ax.set_title(axes_labels[col])
-            if row == rows - 1:
+            elif row_offset > 0 and row == 0:
+                # Observations row already has title, so add action label
+                current_title = ax.get_title()
+                if current_title:
+                    ax.set_title(f"{current_title}\nAction: {axes_labels[col]}", fontsize=9)
+                else:
+                    ax.set_title(f"Action: {axes_labels[col]}", fontsize=9)
+            if plot_row == total_rows - 1:
                 ax.set_xlabel("sample index")
             if col == 0:
                 ax.set_ylabel(model_name)
             ax.grid(True, linestyle=":", linewidth=0.6)
             if row == 0 and col == act_dim - 1:
-                ax.legend(loc="upper right")
+                ax.legend(loc="upper right", fontsize=8)
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=200)
@@ -495,11 +535,68 @@ def evaluate_models(args: argparse.Namespace) -> None:
             finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             continue
 
+        if kind == "gp":
+            gp_cls = _ensure_baseline_available("Gaussian Process", GPBaseline)
+            with artifact_path.open("rb") as fh:
+                gp_data = pickle.load(fh)
+            gp_model = gp_data.get("model")
+            if gp_model is None:
+                raise RuntimeError(f"GP artifact '{artifact_path}' does not contain a 'model' key.")
+            # GP operates on raw (unscaled) observations
+            pred, pred_std = gp_model.predict(test_obs, return_std=True)
+            pred_subset = pred[:, selected_indices_abs]
+            predictions[model_name] = pred_subset
+            metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+            finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
+            continue
+
+        if kind == "mdn":
+            mdn_cls = _ensure_baseline_available("Mixture Density Network", MDNBaseline)
+            state = _torch_load(artifact_path)
+            config = state.get("config", {})
+            mdn = mdn_cls(
+                obs_dim=int(config.get("obs_dim", test_obs_s.shape[1])),
+                act_dim=int(config.get("act_dim", test_act_full.shape[1])),
+                hidden_units=config.get("hidden_units", [128, 128, 64]),
+                n_components=int(config.get("n_components", 5)),
+                covariance_type=str(config.get("covariance_type", "diag")),
+                activation=str(config.get("activation", "relu")),
+                dropout=float(config.get("dropout", 0.1)),
+                lr=float(config.get("lr", 1e-3)),
+                batch_size=int(config.get("batch_size", 256)),
+                epochs=int(config.get("epochs", 0)),
+                seed=int(config.get("seed", 0)),
+                device="cpu",
+                log_name="mdn_eval",
+            )
+            mdn.model.load_state_dict(state["model_state"])
+            pred_scaled = mdn.predict(test_obs_s, mode="mean", n_samples=int(entry.get("n_samples", 1)))
+            pred = act_scaler.inverse_transform(pred_scaled)
+            pred_subset = pred[:, selected_indices_abs]
+            predictions[model_name] = pred_subset
+            metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+            finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
+            continue
+
         raise RuntimeError(f"Unsupported model entry '{model_name}' (kind='{kind}') in manifest.")
 
+    # Prepare observation data for visualization
+    obs_columns = manifest.get("obs_columns", OBS_COLUMNS)
+    obs_subset_indices = list(range(min(len(selected_indices_abs), test_obs.shape[1])))
+    obs_subset_labels = [obs_columns[i] if i < len(obs_columns) else f"obs_{i}" for i in obs_subset_indices]
+    
     plot_dir = args.output_dir if args.output_dir else (artifact_dir / "plots")
     plot_path = plot_dir / f"{eval_name}_comparison.png"
-    _plot_model_grid(time_idx, target_subset, predictions, model_order, selected_labels, plot_path)
+    _plot_model_grid(
+        time_idx, 
+        target_subset, 
+        predictions, 
+        model_order, 
+        selected_labels, 
+        plot_path,
+        observations=test_obs[:, obs_subset_indices] if args.show_obs else None,
+        obs_labels=obs_subset_labels if args.show_obs else None,
+    )
 
     for model_name in model_order:
         metrics = metrics_summary.get(
@@ -543,6 +640,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="all",
         help="Comma separated finger codes to visualise (e.g., 'th,if,mf'). Defaults to all available.",
+    )
+    parser.add_argument(
+        "--show-obs",
+        action="store_true",
+        help="Display observations in the first row of the comparison plot.",
     )
     parser.add_argument(
         "--diffusion-sampler",

@@ -1,0 +1,24 @@
+[info] Standard mode: Using sensor observations (20D)
+[info] Running in unified mode (single model: 20D obs -> 9D act)
+
+================================================================================
+DATA AUGMENTATION ENABLED
+================================================================================
+Original:   90 demos, 480,630 samples
+Augmented:  180 demos, 961,202 samples
+Factor:     2.0x demos, 2.0x samples
+================================================================================
+
+[info] training behavior cloning baseline ...
+[bc] epoch 0001/200 - loss 0.140553
+[bc] epoch 0025/200 - loss 0.089568
+[bc] epoch 0050/200 - loss 0.087819
+[bc] epoch 0075/200 - loss 0.087026
+[bc] epoch 0100/200 - loss 0.086694
+[bc] epoch 0125/200 - loss 0.086374
+[bc] epoch 0150/200 - loss 0.086108
+[bc] epoch 0175/200 - loss 0.085102
+[bc] epoch 0200/200 - loss 0.083505
+[bc] rmse=14.0343 mae=9.3719 r2=0.8895
+[done] summary saved to /home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/stiffness_policies/benchmark_summary_20251119_163418.json
+[done] artifacts stored in /home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_global_tk_unified/artifacts/20251119_163418

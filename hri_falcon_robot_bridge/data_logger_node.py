@@ -27,7 +27,6 @@ Outputs CSV columns:
     t_sec, t_nanosec,
         s1_fx, ..., s3_tz, s3_stamp_sec, s3_stamp_nsec,
         ee_px, ee_py, ee_pz, ee_stamp_sec, ee_stamp_nsec,
-  deform_circ, deform_circ_stamp_sec, deform_circ_stamp_nsec,
   deform_ecc, deform_ecc_stamp_sec, deform_ecc_stamp_nsec,
   emg_ch1..emg_ch8, emg_stamp_sec, emg_stamp_nsec
 """
@@ -110,7 +109,8 @@ class DataLoggerNode(Node):
 
         # State holders (latest) - 타임스탬프는 기록 시점에 생성하므로 값만 저장
         self._force: List[Optional[Tuple[float,float,float,float,float,float]]] = [None, None, None]
-        self._deform_circ: Optional[float] = None
+        # circularity 제거됨: 더 이상 로깅/계산하지 않음
+        # self._deform_circ: Optional[float] = None
         self._deform_ecc: Optional[float] = None
         self._emg: Optional[List[float]] = None
         self._emg_recv_count: int = 0
@@ -147,7 +147,8 @@ class DataLoggerNode(Node):
             self.create_subscription(WrenchStamped, topic, lambda msg, i=idx: self._on_force(i, msg), 50)
 
         # Deformity metrics
-        self.create_subscription(Float32, '/deformity_tracker/circularity', self._on_deform_circ, 10)
+        # circularity 구독 제거 (/deformity_tracker/circularity 더 이상 사용하지 않음)
+        # self.create_subscription(Float32, '/deformity_tracker/circularity', self._on_deform_circ, 10)
         self.create_subscription(Float32, '/deformity_tracker/eccentricity', self._on_deform_ecc, 10)
 
         # EMG
@@ -290,7 +291,8 @@ class DataLoggerNode(Node):
             header += ['ee_if_px','ee_if_py','ee_if_pz','ee_if_stamp_sec','ee_if_stamp_nsec']
             header += ['ee_mf_px','ee_mf_py','ee_mf_pz','ee_mf_stamp_sec','ee_mf_stamp_nsec']
             header += ['ee_th_px','ee_th_py','ee_th_pz','ee_th_stamp_sec','ee_th_stamp_nsec']
-            header += ['deform_circ','deform_circ_stamp_sec','deform_circ_stamp_nsec']
+            # circularity 컬럼 제거
+            # header += ['deform_circ','deform_circ_stamp_sec','deform_circ_stamp_nsec']
             header += ['deform_ecc','deform_ecc_stamp_sec','deform_ecc_stamp_nsec']
             header += [f'emg_ch{i+1}' for i in range(8)] + ['emg_stamp_sec','emg_stamp_nsec']
             self._csv_writer.writerow(header)
@@ -342,11 +344,8 @@ class DataLoggerNode(Node):
         except Exception:
             pass
 
-    def _on_deform_circ(self, msg: Float32) -> None:
-        try:
-            self._deform_circ = float(msg.data)
-        except Exception:
-            pass
+    # def _on_deform_circ(self, msg: Float32) -> None:
+    #     pass  # circularity 사용 중단
 
     def _on_deform_ecc(self, msg: Float32) -> None:
         try:
@@ -468,12 +467,7 @@ class DataLoggerNode(Node):
         else:
             px,py,pz = self._ee_th
             row += [f"{px:.6f}", f"{py:.6f}", f"{pz:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
-        # Deform circ (타임스탬프는 현재 시각)
-        if self._deform_circ is None:
-            row += ['','','']
-        else:
-            circ = self._deform_circ
-            row += [f"{circ:.6f}", str(now_msg.sec), str(now_msg.nanosec)]
+        # circularity 제거: 빈 칸 추가하지 않고 건너뜀
         # Deform ecc (타임스탬프는 현재 시각)
         if self._deform_ecc is None:
             row += ['','','']

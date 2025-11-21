@@ -1,0 +1,25 @@
+{
+  "name": "hri_falcon_robot_bridge-dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": ["--network=host"],
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/workspace,type=bind"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-vscode.cpptools",
+        "ms-iot.vscode-ros"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/bin/python3"
+      }
+    }
+  },
+  "remoteUser": "root",
+  "postCreateCommand": "bash .devcontainer/post_create.sh"
+}

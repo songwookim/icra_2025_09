@@ -168,9 +168,13 @@ class SenseGloveMJNode(Node):
         self.declare_parameter("ee_pose_topic_th", "/ee_pose_th")
         self.declare_parameter("ee_pose_frame_id", "world")
         self.declare_parameter("ee_pose_source", "mujoco")
-        self.declare_parameter("ee_pose_mj_site", "MFtip")
+        # Backward compatibility: original IF site param name was ee_pose_mj_site.
+        # New explicit per-finger naming adds ee_pose_mj_site_if to match mf/th pattern.
+        self.declare_parameter("ee_pose_mj_site", "FFtip")  # (legacy) IF finger tip (actual MuJoCo site name)
+        self.declare_parameter("ee_pose_mj_site_if", "FFtip")  # (preferred) IF finger tip (actual MuJoCo site name)
         self.declare_parameter("ee_pose_mj_body", "")
-        self.declare_parameter("ee_pose_mj_site_th", "THtip")
+        self.declare_parameter("ee_pose_mj_site_mf", "MFtip")  # MF finger tip
+        self.declare_parameter("ee_pose_mj_site_th", "THtip")  # TH finger tip
         self.declare_parameter("terminal_status_interval_sec", 1.0)
 
         self.joint_state_topic = self.get_parameter("joint_state_topic").get_parameter_value().string_value
@@ -216,9 +220,14 @@ class SenseGloveMJNode(Node):
         self.ee_pose_topic_th = self.get_parameter("ee_pose_topic_th").get_parameter_value().string_value
         self.ee_pose_frame_id = self.get_parameter("ee_pose_frame_id").get_parameter_value().string_value
         self.ee_pose_source = self.get_parameter("ee_pose_source").get_parameter_value().string_value.lower().strip()
-        self.ee_pose_mj_site = self.get_parameter("ee_pose_mj_site").get_parameter_value().string_value
+        # Prefer new explicit IF site parameter; fallback to legacy if unset or empty.
+        _site_if_new = self.get_parameter("ee_pose_mj_site_if").get_parameter_value().string_value
+        _site_if_legacy = self.get_parameter("ee_pose_mj_site").get_parameter_value().string_value
+        self.ee_pose_mj_site_if = _site_if_new if _site_if_new else _site_if_legacy
+        self.ee_pose_mj_site = self.ee_pose_mj_site_if  # alias for existing internal usage
         self.ee_pose_mj_body = self.get_parameter("ee_pose_mj_body").get_parameter_value().string_value
-        self.ee_pose_mj_site_th = self.get_parameter("ee_pose_mj_site_th").get_parameter_value().string_value
+        self.ee_pose_mj_site_mf = self.get_parameter("ee_pose_mj_site_mf").get_parameter_value().string_value  # MF
+        self.ee_pose_mj_site_th = self.get_parameter("ee_pose_mj_site_th").get_parameter_value().string_value  # TH
         self.terminal_status_interval_sec = max(0.0, self.get_parameter("terminal_status_interval_sec").get_parameter_value().double_value)
 
         # Parse per-joint movement weights (0.0..1.0)
@@ -281,11 +290,11 @@ class SenseGloveMJNode(Node):
         self.qpos_topic = "/hand_tracker/qpos"
         self.qpos_pub = self.create_publisher(JointState, self.qpos_topic, 10)
 
-        self.ee_pose_pub = None
+        self.ee_pose_pub_if = None
         self.ee_pose_pub_mf = None
         self.ee_pose_pub_th = None
         if self.ee_pose_publish_enabled and self.ee_pose_topic_if:
-            self.ee_pose_pub = self.create_publisher(PoseStamped, self.ee_pose_topic_if, 10)
+            self.ee_pose_pub_if = self.create_publisher(PoseStamped, self.ee_pose_topic_if, 10)
         if self.ee_pose_publish_enabled and self.ee_pose_topic_mf:
             self.ee_pose_pub_mf = self.create_publisher(PoseStamped, self.ee_pose_topic_mf, 10)
         if self.ee_pose_publish_enabled and self.ee_pose_topic_th:
@@ -321,9 +330,10 @@ class SenseGloveMJNode(Node):
         self._mj_data = None
         self._mj_viewer = None
         self._mj_qpos_adr: Dict[str, int] = {}
-        self._ee_site_id: Optional[int] = None
+        self._ee_site_id: Optional[int] = None  # IF finger
         self._ee_body_id: Optional[int] = None
-        self._ee_site_id_th: Optional[int] = None
+        self._ee_site_id_mf: Optional[int] = None  # MF finger
+        self._ee_site_id_th: Optional[int] = None  # TH finger
         self._ee_mj_warned = False
         self._mj_forward_warned = False
 
@@ -1089,16 +1099,23 @@ class SenseGloveMJNode(Node):
         # Identify EE pose handles if requested
         if self.ee_pose_publish_enabled:
             try:
-                if self.ee_pose_mj_site:
-                    sid = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site)  # type: ignore[attr-defined]
+                if self.ee_pose_mj_site_if:
+                    sid = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_if)  # type: ignore[attr-defined]
                     if sid >= 0:
                         self._ee_site_id = int(sid)
-                        self.get_logger().info(f"[EE] MuJoCo site: {self.ee_pose_mj_site} (id={self._ee_site_id})")
+                        self.get_logger().info(f"[EE] MuJoCo site(IF): {self.ee_pose_mj_site_if} (id={self._ee_site_id})")
                 if self._ee_site_id is None and self.ee_pose_mj_body:
                     bid = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_BODY, self.ee_pose_mj_body)  # type: ignore[attr-defined]
                     if bid >= 0:
                         self._ee_body_id = int(bid)
                         self.get_logger().info(f"[EE] MuJoCo body: {self.ee_pose_mj_body} (id={self._ee_body_id})")
+                # MF site ID lookup
+                if self.ee_pose_mj_site_mf:
+                    sid_mf = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_mf)  # type: ignore[attr-defined]
+                    if sid_mf >= 0:
+                        self._ee_site_id_mf = int(sid_mf)
+                        self.get_logger().info(f"[EE] MuJoCo site(MF): {self.ee_pose_mj_site_mf} (id={self._ee_site_id_mf})")
+                # Thumb site ID lookup
                 if self.ee_pose_mj_site_th:
                     sid_th = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_th)  # type: ignore[attr-defined]
                     if sid_th >= 0:
@@ -1249,9 +1266,18 @@ class SenseGloveMJNode(Node):
         else:
             self._last_ee_pose = None
 
-        _send_pose(self.ee_pose_pub, main_pose)
-        _send_pose(self.ee_pose_pub_mf, main_pose)
+        _send_pose(self.ee_pose_pub_if, main_pose)
 
+        # MF finger pose (separate from IF)
+        mf_pose: Optional[Sequence[float]] = None
+        if self._ee_site_id_mf is not None:
+            try:
+                mf_pose = self._mj_data.site_xpos[self._ee_site_id_mf]
+            except Exception:
+                mf_pose = None
+        _send_pose(self.ee_pose_pub_mf, mf_pose)
+
+        # Thumb pose
         thumb_pose: Optional[Sequence[float]] = None
         if self._ee_site_id_th is not None:
             try:

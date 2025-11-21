@@ -153,8 +153,8 @@ _LOG_CANDIDATES = [
     _PROJECT_ROOT / "outputs" / "logs" / "success",
 ]
 _STIFF_CANDIDATES = [
-    _PKG_ROOT / "outputs" / "analysis" / "stiffness_profiles",
-    _PROJECT_ROOT / "outputs" / "analysis" / "stiffness_profiles",
+    _PKG_ROOT / "outputs" / "analysis" / "stiffness_profiles_global_tk",
+    _PROJECT_ROOT / "outputs" / "analysis" / "stiffness_profiles_global_tk",
 ]
 _OUT_CANDIDATES = [
     _PKG_ROOT / "outputs" / "models" / "stiffness_policies",
@@ -237,7 +237,6 @@ OBS_COLUMNS = [
     "s3_fx",
     "s3_fy",
     "s3_fz",
-    "deform_circ",
     "deform_ecc",
     "ee_if_px",
     "ee_if_py",
@@ -265,15 +264,15 @@ ACTION_COLUMNS = [
 # Per-finger observation and action columns (for independent models)
 FINGER_CONFIG = {
     "th": {
-        "obs": ["s1_fx", "s1_fy", "s1_fz", "ee_th_px", "ee_th_py", "ee_th_pz", "deform_circ", "deform_ecc"],
+        "obs": ["s1_fx", "s1_fy", "s1_fz", "ee_th_px", "ee_th_py", "ee_th_pz", "deform_ecc"],
         "act": ["th_k1", "th_k2", "th_k3"],
     },
     "if": {
-        "obs": ["s2_fx", "s2_fy", "s2_fz", "ee_if_px", "ee_if_py", "ee_if_pz", "deform_circ", "deform_ecc"],
+        "obs": ["s2_fx", "s2_fy", "s2_fz", "ee_if_px", "ee_if_py", "ee_if_pz", "deform_ecc"],
         "act": ["if_k1", "if_k2", "if_k3"],
     },
     "mf": {
-        "obs": ["s3_fx", "s3_fy", "s3_fz", "ee_mf_px", "ee_mf_py", "ee_mf_pz", "deform_circ", "deform_ecc"],
+        "obs": ["s3_fx", "s3_fy", "s3_fz", "ee_mf_px", "ee_mf_py", "ee_mf_pz", "deform_ecc"],
         "act": ["mf_k1", "mf_k2", "mf_k3"],
     },
 }
@@ -1227,11 +1226,39 @@ class GPBaseline:
             return np.column_stack(preds_per_dim)
     
     def nll(self, obs: np.ndarray, act: np.ndarray) -> float:
-        """Negative log likelihood (sum across action dimensions)."""
+        """Compute test-set negative log likelihood using predictive distribution.
+        
+        For each test point, computes -log p(y* | x*, D) where D is the training data.
+        This is the proper test NLL for comparison with other models.
+        
+        Note: This is computationally more expensive than the previous version which
+        only returned the training log marginal likelihood -log p(y | X, theta).
+        """
         total_nll = 0.0
-        for i, gp in enumerate(self.gps):
-            total_nll += -gp.log_marginal_likelihood(gp.kernel_.theta)
-        return float(total_nll)
+        n_test = obs.shape[0]
+        
+        # Batch predictions to avoid memory issues
+        BS = self.batch_predict_size
+        for start in range(0, n_test, BS):
+            end = min(n_test, start + BS)
+            obs_batch = obs[start:end]
+            act_batch = act[start:end]
+            
+            for i, gp in enumerate(self.gps):
+                # Get predictive mean and std for this dimension
+                mean_pred, std_pred = gp.predict(obs_batch, return_std=True)
+                
+                # Compute Gaussian log likelihood: -log N(y | mu, sigma^2)
+                # = -0.5 * [(y - mu)^2 / sigma^2 + log(sigma^2) + log(2*pi)]
+                variance = std_pred ** 2 + 1e-8  # Add small noise for numerical stability
+                log_prob = -0.5 * (
+                    ((act_batch[:, i] - mean_pred) ** 2) / variance
+                    + np.log(variance)
+                    + np.log(2 * np.pi)
+                )
+                total_nll += -np.sum(log_prob)
+        
+        return float(total_nll / n_test)  # Average NLL per test point
 
 
 if torch is not None:
@@ -1317,8 +1344,15 @@ if torch is not None:
             self.covariance_type = covariance_type
             self.lr = learning_rate
             self.weight_decay = weight_decay
-            self.mixture_reg = mixture_reg
-            self.covariance_floor = covariance_floor
+            # Robust numeric coercion (config 값이 문자열로 들어오는 경우 대비)
+            try:
+                self.mixture_reg = float(mixture_reg)
+            except Exception:
+                self.mixture_reg = 0.01
+            try:
+                self.covariance_floor = float(covariance_floor)
+            except Exception:
+                self.covariance_floor = 1e-4
             
             # Build encoder
             layers: List[nn.Module] = []
@@ -1353,19 +1387,26 @@ if torch is not None:
             sigma: torch.Tensor,
             target: torch.Tensor,
         ) -> torch.Tensor:
-            """Negative log likelihood for MDN (diagonal covariance)."""
+            """Negative log likelihood for MDN (diagonal covariance).
+            
+            Treats sigma as standard deviation (std) for consistency with sampling.
+            """
             # pi: (batch, K)
             # mu: (batch, K, D)
-            # sigma: (batch, K, D)
+            # sigma: (batch, K, D) - interpreted as STANDARD DEVIATION
             # target: (batch, D)
             
             target = target.unsqueeze(1)  # (batch, 1, D)
             
             # Gaussian log prob per component
             diff = target - mu  # (batch, K, D)
+            # Clamp sigma (std) to avoid numerical issues
+            sigma_safe = torch.clamp(sigma, min=self.covariance_floor)
+            # Convert std to variance for log probability calculation
+            variance = sigma_safe ** 2
             log_prob = -0.5 * (
-                diff**2 / (sigma + self.covariance_floor)
-                + torch.log(sigma + self.covariance_floor)
+                diff**2 / variance
+                + torch.log(variance)
                 + math.log(2 * math.pi)
             ).sum(dim=-1)  # (batch, K)
             
@@ -1495,14 +1536,27 @@ def compute_metrics(target: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
 
 def evaluate_gmm(
     model: GMMConditional,
-    obs_test: np.ndarray,
-    act_test: np.ndarray,
+    obs_test_scaled: np.ndarray,
+    act_test_scaled: np.ndarray,
     mode: str,
     n_samples: int,
+    act_scaler: Optional[StandardScaler] = None,
+    act_test_raw: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    pred = model.predict(obs_test, mode=mode, n_samples=n_samples)
-    metrics = compute_metrics(act_test, pred)
-    metrics["nll"] = model.nll(obs_test, act_test)
+    """Evaluate GMM/GMR predictions.
+
+    Metrics are reported in the ORIGINAL (unscaled) action space when both
+    ``act_scaler`` and ``act_test_raw`` are provided. Otherwise they fall back
+    to the scaled space (legacy behaviour).
+    Negative log-likelihood (nll) remains computed in the scaled space (model space).
+    """
+    pred_scaled = model.predict(obs_test_scaled, mode=mode, n_samples=n_samples)
+    if act_scaler is not None and act_test_raw is not None:
+        pred_raw = act_scaler.inverse_transform(pred_scaled)
+        metrics = compute_metrics(act_test_raw, pred_raw)
+    else:
+        metrics = compute_metrics(act_test_scaled, pred_scaled)
+    metrics["nll"] = model.nll(obs_test_scaled, act_test_scaled)
     return metrics
 
 
@@ -1604,7 +1658,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         type=str,
-        default="per-finger",
+        default="unified",
         choices=["unified", "per-finger"],
         help="Training mode: 'unified' (all obs->all act, 20D->9D) or 'per-finger' (3 independent models, 8D->3D each)",
     )
@@ -1746,6 +1800,23 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Max temporal jitter in timesteps (default: 3)",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="이미 존재하는 모델 아티팩트가 있으면 학습을 건너뛰고 로드하여 평가만 수행합니다.",
+    )
+    parser.add_argument(
+        "--resume-artifact-dir",
+        type=Path,
+        default=None,
+        help="중단된 실행을 재개할 기존 artifact 디렉터리 경로 (예: artifacts/20251119_XXXXXX).",
+    )
+    parser.add_argument(
+        "--exclude-models",
+        type=str,
+        default="",
+        help="실행에서 제외할 모델들 (콤마 구분). 예: gp,mdn",
+    )
     return parser.parse_args()
 
 
@@ -1755,9 +1826,13 @@ def main() -> None:
     # Configure observation columns based on --use-emg flag
     global OBS_COLUMNS
     if args.use_emg:
-        OBS_COLUMNS = OBS_COLUMNS_WITH_EMG
-        print(f"[info] ⚡ ORACLE MODE: Using EMG observations ({len(OBS_COLUMNS)}D)")
-        print(f"[info] Expected: High R² if model architecture is correct")
+        try:
+            OBS_COLUMNS = OBS_COLUMNS_WITH_EMG  # type: ignore[name-defined]
+            print(f"[info] ⚡ ORACLE MODE: Using EMG observations ({len(OBS_COLUMNS)}D)")
+            print(f"[info] Expected: High R² if model architecture is correct")
+        except NameError:
+            print("[warn] EMG column list OBS_COLUMNS_WITH_EMG 미정의 → EMG 비활성화 후 계속 진행")
+            args.use_emg = False
     else:
         print(f"[info] Standard mode: Using sensor observations ({len(OBS_COLUMNS)}D)")
     
@@ -1771,11 +1846,19 @@ def main() -> None:
 
     set_global_seed(int(args.seed))
     models_requested = {m.strip().lower() for m in args.models.split(",") if m.strip()}
+    exclude_requested = {m.strip().lower() for m in str(getattr(args, "exclude_models", "")).split(",") if m.strip()}
     if "diffusion" in models_requested:
         models_requested.remove("diffusion")
         models_requested.add("diffusion_c")
     if "all" in models_requested or not models_requested:
         models_requested = {"gmm", "gmr", "bc", "ibc", "diffusion_c", "diffusion_t", "lstm_gmm", "gp", "mdn"}
+    # Exclude any requested heavy models
+    if exclude_requested:
+        before = sorted(models_requested)
+        models_requested -= exclude_requested
+        after = sorted(models_requested)
+        removed = sorted(exclude_requested)
+        print(f"[info] Excluding models: {', '.join(removed)} (remaining: {', '.join(after)})")
 
     # Branch based on mode
     obs_dim = len(OBS_COLUMNS)
@@ -1799,27 +1882,45 @@ def _is_global_stiffness_dir(stiffness_dir: Path) -> bool:
     return ("global_tk" in name) or ("global_tk" in full) or (name.endswith("_global") or "_global" in name)
 
 
-def _resolve_artifact_and_tb_dirs(base_output: Path, base_tb: Path, stiffness_dir: Path, timestamp: str) -> Tuple[Path, Optional[Path]]:
-    """Return artifact root and tensorboard run dir based on whether stiffness_dir is global.
+def _resolve_artifact_and_tb_dirs(
+    base_output: Path,
+    base_tb: Path,
+    stiffness_dir: Path,
+    timestamp: str,
+    mode: str,
+) -> Tuple[Path, Optional[Path]]:
+    """Return artifact root and tensorboard run dir.
 
-    - Artifacts: outputs/.../policy_learning_global_tk/artifacts or policy_learning/artifacts
-    - TensorBoard: outputs/.../policy_learning_global_tk/tensorboard/<ts> or policy_learning/tensorboard/<ts>
+    New 4-way directory separation (unified/per-finger × original/global_TK):
+        policy_learning_unified/
+        policy_learning_global_tk_unified/
+        policy_learning_per_finger/
+        policy_learning_global_tk_per_finger/
+
+    Backwards compatibility:
+        Create symlinks 'policy_learning' -> 'policy_learning_unified' and
+        'policy_learning_global_tk' -> 'policy_learning_global_tk_unified' when possible.
     """
     is_global = _is_global_stiffness_dir(stiffness_dir)
-    
-    if is_global:
-        # Use separate output directory for global_tk results
-        policy_learning_dir = base_output.parent / "policy_learning_global_tk"
-        ensure_dir(policy_learning_dir)
-        artifacts_root = ensure_dir(policy_learning_dir / "artifacts" / timestamp)
-        tb_parent = policy_learning_dir / "tensorboard"
-    else:
-        # Use default output directory for per-demo results
-        policy_learning_dir = base_output.parent / "policy_learning"
-        ensure_dir(policy_learning_dir)
-        artifacts_root = ensure_dir(policy_learning_dir / "artifacts" / timestamp)
-        tb_parent = policy_learning_dir / "tensorboard"
-    
+    base_name = "policy_learning_global_tk" if is_global else "policy_learning"
+    # Append mode suffix for new structure
+    mode_suffix = "per_finger" if mode == "per-finger" else "unified"
+    full_dir_name = f"{base_name}_{mode_suffix}"
+
+    policy_learning_dir = base_output.parent / full_dir_name
+    ensure_dir(policy_learning_dir)
+    artifacts_root = ensure_dir(policy_learning_dir / "artifacts" / timestamp)
+    tb_parent = policy_learning_dir / "tensorboard"
+
+    # Backwards compatibility symlinks (best-effort, ignore failures)
+    try:
+        if mode == "unified":
+            legacy = base_output.parent / base_name  # e.g. policy_learning or policy_learning_global_tk
+            if not legacy.exists():
+                legacy.symlink_to(policy_learning_dir, target_is_directory=True)
+    except Exception:
+        pass
+
     tb_run = ensure_dir(tb_parent / timestamp) if SummaryWriter is not None else None
     return artifacts_root, tb_run
 
@@ -1932,51 +2033,104 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
     )
 
     results: Dict[str, Dict[str, float]] = {}
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
     diffusion_eta = max(0.0, float(args.diffusion_eta))
     run_tensorboard_dir: Optional[Path] = None
     ensure_dir(args.output_dir)
-    # Resolve artifact/tensorboard dirs depending on global vs local stiffness profiles
-    if args.tensorboard:
-        if torch is None or SummaryWriter is None:
-            print("[warn] tensorboard requested but unavailable; proceeding without logs.")
-            args.tensorboard = False
-    artifacts_root, run_tensorboard_dir = _resolve_artifact_and_tb_dirs(
-        base_output=args.output_dir,
-        base_tb=args.tensorboard_dir,
-        stiffness_dir=args.stiffness_dir,
-        timestamp=timestamp,
-    )
-    scalers_path = artifacts_root / "scalers.pkl"
-    with scalers_path.open("wb") as fh:
-        pickle.dump({"obs_scaler": obs_scaler, "act_scaler": act_scaler}, fh)
-    manifest: Dict[str, Any] = {
-        "timestamp": timestamp,
-        "scalers": scalers_path.name,
-        "sequence_window": window,
-        "models": {},
-        "train_trajectories": [t.name for t in train_traj],
-        "test_trajectories": [t.name for t in test_traj],
-        "obs_columns": OBS_COLUMNS,
-        "action_columns": ACTION_COLUMNS,
-    }
+    resume_dir: Optional[Path] = args.resume_artifact_dir
+    if resume_dir is not None:
+        if not resume_dir.exists():
+            raise RuntimeError(f"--resume-artifact-dir not found: {resume_dir}")
+        artifacts_root = resume_dir
+        timestamp = artifacts_root.name
+        print(f"[resume] Using existing artifact directory: {artifacts_root}")
+        scalers_path = artifacts_root / "scalers.pkl"
+        if not scalers_path.exists():
+            raise RuntimeError(f"Missing scalers.pkl in resume dir: {scalers_path}")
+        with scalers_path.open("rb") as fh:
+            scalers_loaded = pickle.load(fh)
+        obs_scaler = scalers_loaded["obs_scaler"]
+        act_scaler = scalers_loaded["act_scaler"]
+        # 재계산(안전): 이미 있는 스케일러로 테스트셋 transform 보장
+        test_obs_s = obs_scaler.transform(test_obs)
+        test_act_s = act_scaler.transform(test_act)
+        train_traj_scaled = scale_trajectories(train_traj, obs_scaler, act_scaler)
+        test_traj_scaled = scale_trajectories(test_traj, obs_scaler, act_scaler)
+        # TensorBoard 재시작은 생략 (기존 로그 유지)
+        run_tensorboard_dir = None
+        manifest_path_existing = artifacts_root / "manifest.json"
+        if manifest_path_existing.exists():
+            with manifest_path_existing.open("r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            # timestamp 동기화
+            manifest["timestamp"] = timestamp
+            print(f"[resume] Loaded manifest models: {', '.join(manifest.get('models', {}).keys())}")
+        else:
+            manifest = {
+                "timestamp": timestamp,
+                "scalers": "scalers.pkl",
+                "sequence_window": window,
+                "models": {},
+                "train_trajectories": [t.name for t in train_traj],
+                "test_trajectories": [t.name for t in test_traj],
+                "obs_columns": OBS_COLUMNS,
+                "action_columns": ACTION_COLUMNS,
+            }
+    else:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        if args.tensorboard:
+            if torch is None or SummaryWriter is None:
+                print("[warn] tensorboard requested but unavailable; proceeding without logs.")
+                args.tensorboard = False
+        artifacts_root, run_tensorboard_dir = _resolve_artifact_and_tb_dirs(
+            base_output=args.output_dir,
+            base_tb=args.tensorboard_dir,
+            stiffness_dir=args.stiffness_dir,
+            timestamp=timestamp,
+            mode="unified",
+        )
+        scalers_path = artifacts_root / "scalers.pkl"
+        with scalers_path.open("wb") as fh:
+            pickle.dump({"obs_scaler": obs_scaler, "act_scaler": act_scaler}, fh)
+        manifest: Dict[str, Any] = {
+            "timestamp": timestamp,
+            "scalers": scalers_path.name,
+            "sequence_window": window,
+            "models": {},
+            "train_trajectories": [t.name for t in train_traj],
+            "test_trajectories": [t.name for t in test_traj],
+            "obs_columns": OBS_COLUMNS,
+            "action_columns": ACTION_COLUMNS,
+        }
 
     if {"gmm", "gmr"} & models_requested:
-        print("[info] training Gaussian mixture on joint space ...")
-        gmm_model = GMMConditional(
-            obs_dim=train_obs_s.shape[1],
-            act_dim=train_act_s.shape[1],
-            n_components=args.gmm_components,
-            covariance_type=args.gmm_covariance,
-            reg_covar=args.gmm_reg_covar,
-        )
-        gmm_model.fit(train_obs_s, train_act_s)
         gmm_artifact = artifacts_root / "gmm.pkl"
-        with gmm_artifact.open("wb") as fh:
-            pickle.dump(gmm_model, fh)
+        if args.skip_existing and gmm_artifact.exists():
+            print(f"[skip] GMM artifact exists → load {gmm_artifact.name}")
+            with gmm_artifact.open("rb") as fh:
+                gmm_model = pickle.load(fh)
+        else:
+            print("[info] training Gaussian mixture on joint space ...")
+            gmm_model = GMMConditional(
+                obs_dim=train_obs_s.shape[1],
+                act_dim=train_act_s.shape[1],
+                n_components=args.gmm_components,
+                covariance_type=args.gmm_covariance,
+                reg_covar=args.gmm_reg_covar,
+            )
+            gmm_model.fit(train_obs_s, train_act_s)
+            with gmm_artifact.open("wb") as fh:
+                pickle.dump(gmm_model, fh)
 
         if "gmr" in models_requested:
-            metrics = evaluate_gmm(gmm_model, test_obs_s, test_act_s, mode="mean", n_samples=1)
+            metrics = evaluate_gmm(
+                gmm_model,
+                test_obs_s,
+                test_act_s,
+                mode="mean",
+                n_samples=1,
+                act_scaler=act_scaler,
+                act_test_raw=test_act,
+            )
             results["gmr"] = metrics
             print(
                 f"[gmr] rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} "
@@ -1999,7 +2153,15 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             }
 
         if "gmm" in models_requested:
-            metrics = evaluate_gmm(gmm_model, test_obs_s, test_act_s, mode="sample", n_samples=args.gmm_samples)
+            metrics = evaluate_gmm(
+                gmm_model,
+                test_obs_s,
+                test_act_s,
+                mode="sample",
+                n_samples=args.gmm_samples,
+                act_scaler=act_scaler,
+                act_test_raw=test_act,
+            )
             results["gmm"] = metrics
             print(
                 f"[gmm] rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} "
@@ -2028,40 +2190,55 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
     if "bc" in models_requested:
         if torch is None:
             raise RuntimeError("Behavior cloning baseline requires PyTorch.")
-        print("[info] training behavior cloning baseline ...")
-        bc_config = {
-            "obs_dim": train_obs_s.shape[1],
-            "act_dim": train_act_s.shape[1],
-            "hidden_dim": args.bc_hidden,
-            "depth": args.bc_depth,
-            "lr": args.bc_lr,
-            "batch_size": args.bc_batch,
-            "epochs": args.bc_epochs,
-            "weight_decay": args.bc_weight_decay,
-            "seed": args.seed,
-        }
-        bc = BehaviorCloningBaseline(
-            obs_dim=bc_config["obs_dim"],
-            act_dim=bc_config["act_dim"],
-            hidden_dim=bc_config["hidden_dim"],
-            depth=bc_config["depth"],
-            lr=bc_config["lr"],
-            batch_size=bc_config["batch_size"],
-            epochs=bc_config["epochs"],
-            weight_decay=bc_config["weight_decay"],
-            seed=bc_config["seed"],
-            log_name="bc",
-        )
-        bc_writer = make_writer(run_tensorboard_dir, "bc")
-        bc.fit(train_obs_s, train_act_s, writer=bc_writer)
         bc_artifact = artifacts_root / "bc.pt"
-        torch.save(
-            {
-                "config": bc_config,
-                "state_dict": {k: v.cpu() for k, v in bc.model.state_dict().items()},
-            },
-            bc_artifact,
-        )
+        bc_writer = None
+        if args.skip_existing and bc_artifact.exists():
+            print(f"[skip] BC artifact exists → load {bc_artifact.name}")
+            checkpoint = torch.load(bc_artifact, map_location="cpu")
+            bc_config = checkpoint.get("config", {})
+            bc = BehaviorCloningBaseline(
+                obs_dim=bc_config.get("obs_dim", train_obs_s.shape[1]),
+                act_dim=bc_config.get("act_dim", train_act_s.shape[1]),
+                hidden_dim=bc_config.get("hidden_dim", args.bc_hidden),
+                depth=bc_config.get("depth", args.bc_depth),
+                lr=bc_config.get("lr", args.bc_lr),
+                batch_size=bc_config.get("batch_size", args.bc_batch),
+                epochs=0,
+                weight_decay=bc_config.get("weight_decay", args.bc_weight_decay),
+                seed=bc_config.get("seed", args.seed),
+                log_name="bc",
+            )
+            bc.model.load_state_dict(checkpoint["state_dict"])  # type: ignore
+        else:
+            print("[info] training behavior cloning baseline ...")
+            bc_config = {
+                "obs_dim": train_obs_s.shape[1],
+                "act_dim": train_act_s.shape[1],
+                "hidden_dim": args.bc_hidden,
+                "depth": args.bc_depth,
+                "lr": args.bc_lr,
+                "batch_size": args.bc_batch,
+                "epochs": args.bc_epochs,
+                "weight_decay": args.bc_weight_decay,
+                "seed": args.seed,
+            }
+            bc = BehaviorCloningBaseline(
+                obs_dim=bc_config["obs_dim"],
+                act_dim=bc_config["act_dim"],
+                hidden_dim=bc_config["hidden_dim"],
+                depth=bc_config["depth"],
+                lr=bc_config["lr"],
+                batch_size=bc_config["batch_size"],
+                epochs=bc_config["epochs"],
+                weight_decay=bc_config["weight_decay"],
+                seed=bc_config["seed"],
+                log_name="bc",
+            )
+            bc_writer = make_writer(run_tensorboard_dir, "bc")
+            bc.fit(train_obs_s, train_act_s, writer=bc_writer)
+            torch.save({"config": bc_config, "state_dict": {k: v.cpu() for k, v in bc.model.state_dict().items()}}, bc_artifact)
+            if bc_writer is not None:
+                bc_writer.flush(); bc_writer.close()
         manifest["models"]["bc"] = {
             "kind": "bc",
             "path": bc_artifact.name,
@@ -2091,45 +2268,63 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
     if "ibc" in models_requested:
         if torch is None:
             raise RuntimeError("IBC baseline requires PyTorch.")
-        print("[info] training IBC baseline ...")
-        ibc_batch = args.ibc_batch if args.ibc_batch is not None else args.bc_batch
-        ibc_config = {
-            "obs_dim": train_obs_s.shape[1],
-            "act_dim": train_act_s.shape[1],
-            "hidden_dim": args.ibc_hidden,
-            "depth": args.ibc_depth,
-            "lr": args.ibc_lr,
-            "batch_size": ibc_batch,
-            "epochs": args.ibc_epochs,
-            "noise_std": args.ibc_noise_std,
-            "langevin_steps": args.ibc_langevin_steps,
-            "step_size": args.ibc_step_size,
-            "seed": args.seed,
-        }
-        ibc = IBCBaseline(
-            obs_dim=ibc_config["obs_dim"],
-            act_dim=ibc_config["act_dim"],
-            hidden_dim=ibc_config["hidden_dim"],
-            depth=ibc_config["depth"],
-            lr=ibc_config["lr"],
-            batch_size=ibc_config["batch_size"],
-            epochs=ibc_config["epochs"],
-            noise_std=ibc_config["noise_std"],
-            langevin_steps=ibc_config["langevin_steps"],
-            step_size=ibc_config["step_size"],
-            seed=ibc_config["seed"],
-            log_name="ibc",
-        )
-        ibc_writer = make_writer(run_tensorboard_dir, "ibc")
-        ibc.fit(train_obs_s, train_act_s, writer=ibc_writer)
         ibc_artifact = artifacts_root / "ibc.pt"
-        torch.save(
-            {
-                "config": ibc_config,
-                "state_dict": {k: v.cpu() for k, v in ibc.model.state_dict().items()},
-            },
-            ibc_artifact,
-        )
+        ibc_writer = None
+        if args.skip_existing and ibc_artifact.exists():
+            print(f"[skip] IBC artifact exists → load {ibc_artifact.name}")
+            checkpoint = torch.load(ibc_artifact, map_location="cpu")
+            ibc_config = checkpoint.get("config", {})
+            ibc_batch = ibc_config.get("batch_size", args.ibc_batch if args.ibc_batch is not None else args.bc_batch)
+            ibc = IBCBaseline(
+                obs_dim=ibc_config.get("obs_dim", train_obs_s.shape[1]),
+                act_dim=ibc_config.get("act_dim", train_act_s.shape[1]),
+                hidden_dim=ibc_config.get("hidden_dim", args.ibc_hidden),
+                depth=ibc_config.get("depth", args.ibc_depth),
+                lr=ibc_config.get("lr", args.ibc_lr),
+                batch_size=ibc_batch,
+                epochs=0,
+                noise_std=ibc_config.get("noise_std", args.ibc_noise_std),
+                langevin_steps=ibc_config.get("langevin_steps", args.ibc_langevin_steps),
+                step_size=ibc_config.get("step_size", args.ibc_step_size),
+                seed=ibc_config.get("seed", args.seed),
+                log_name="ibc",
+            )
+            ibc.model.load_state_dict(checkpoint["state_dict"])  # type: ignore
+        else:
+            print("[info] training IBC baseline ...")
+            ibc_batch = args.ibc_batch if args.ibc_batch is not None else args.bc_batch
+            ibc_config = {
+                "obs_dim": train_obs_s.shape[1],
+                "act_dim": train_act_s.shape[1],
+                "hidden_dim": args.ibc_hidden,
+                "depth": args.ibc_depth,
+                "lr": args.ibc_lr,
+                "batch_size": ibc_batch,
+                "epochs": args.ibc_epochs,
+                "noise_std": args.ibc_noise_std,
+                "langevin_steps": args.ibc_langevin_steps,
+                "step_size": args.ibc_step_size,
+                "seed": args.seed,
+            }
+            ibc = IBCBaseline(
+                obs_dim=ibc_config["obs_dim"],
+                act_dim=ibc_config["act_dim"],
+                hidden_dim=ibc_config["hidden_dim"],
+                depth=ibc_config["depth"],
+                lr=ibc_config["lr"],
+                batch_size=ibc_config["batch_size"],
+                epochs=ibc_config["epochs"],
+                noise_std=ibc_config["noise_std"],
+                langevin_steps=ibc_config["langevin_steps"],
+                step_size=ibc_config["step_size"],
+                seed=ibc_config["seed"],
+                log_name="ibc",
+            )
+            ibc_writer = make_writer(run_tensorboard_dir, "ibc")
+            ibc.fit(train_obs_s, train_act_s, writer=ibc_writer)
+            torch.save({"config": ibc_config, "state_dict": {k: v.cpu() for k, v in ibc.model.state_dict().items()}}, ibc_artifact)
+            if ibc_writer is not None:
+                ibc_writer.flush(); ibc_writer.close()
         manifest["models"]["ibc"] = {
             "kind": "ibc",
             "path": ibc_artifact.name,
@@ -2160,21 +2355,35 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
     if "gp" in models_requested:
         print("[info] training GP baseline ...")
         gp_config = GP_CONFIG or {}
-        gp = GPBaseline(
-            obs_dim=train_obs.shape[1],
-            act_dim=train_act.shape[1],
-            kernel_type=gp_config.get("kernel_type", "rbf_ard"),
-            length_scale_bounds=tuple(gp_config.get("length_scale_bounds", [0.01, 100.0])),
-            nu=gp_config.get("nu", 1.5),
-            alpha=gp_config.get("alpha", 1e-4),
-            normalize_y=gp_config.get("normalize_y", True),
-            n_restarts_optimizer=gp_config.get("n_restarts_optimizer", 5),
-            max_train_points=int(gp_config.get("max_train_points", 4000)),
-            subsample_strategy=str(gp_config.get("subsample_strategy", "random")),
-            batch_predict_size=int(gp_config.get("batch_predict_size", 2048)),
-            random_state=int(getattr(args, "seed", 42)),
-        )
-        gp.fit(train_obs, train_act)
+        # Reduce GP training time: fewer restarts and smaller subsample for large datasets
+        n_samples = train_obs.shape[0]
+        max_gp_points = min(2000, int(gp_config.get("max_train_points", 4000)))
+        n_restarts = 0 if n_samples > 100000 else gp_config.get("n_restarts_optimizer", 2)
+        
+        print(f"[gp] using max_train_points={max_gp_points}, n_restarts={n_restarts} (dataset size: {n_samples})")
+        
+        gp_artifact = artifacts_root / "gp.pkl"
+        if args.skip_existing and gp_artifact.exists():
+            print(f"[skip] GP artifact exists → load {gp_artifact.name}")
+            with gp_artifact.open("rb") as fh:
+                gp_loaded = pickle.load(fh)
+            gp = gp_loaded["model"]
+        else:
+            gp = GPBaseline(
+                obs_dim=train_obs.shape[1],
+                act_dim=train_act.shape[1],
+                kernel_type=gp_config.get("kernel_type", "rbf_ard"),
+                length_scale_bounds=tuple(gp_config.get("length_scale_bounds", [0.01, 100.0])),
+                nu=gp_config.get("nu", 1.5),
+                alpha=gp_config.get("alpha", 1e-4),
+                normalize_y=gp_config.get("normalize_y", True),
+                n_restarts_optimizer=n_restarts,
+                max_train_points=max_gp_points,
+                subsample_strategy=str(gp_config.get("subsample_strategy", "random")),
+                batch_predict_size=int(gp_config.get("batch_predict_size", 2048)),
+                random_state=int(getattr(args, "seed", 42)),
+            )
+            gp.fit(train_obs, train_act)
         
         # Predict
         pred_gp, pred_gp_std = gp.predict(test_obs, return_std=True)
@@ -2189,9 +2398,9 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
         )
         
         # Save model
-        gp_artifact = artifacts_root / "gp.pkl"
-        with gp_artifact.open("wb") as fh:
-            pickle.dump({"model": gp, "config": gp_config}, fh)
+        if not (args.skip_existing and gp_artifact.exists()):
+            with gp_artifact.open("wb") as fh:
+                pickle.dump({"model": gp, "config": gp_config}, fh)
         
         if args.save_predictions:
             save_predictions(
@@ -2207,34 +2416,63 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
     if "mdn" in models_requested:
         if torch is None:
             raise RuntimeError("MDN baseline requires PyTorch.")
-        print("[info] training MDN baseline ...")
+        mdn_artifact = artifacts_root / "mdn.pt"
         mdn_config = MDN_CONFIG or {}
-        mdn = MDNBaseline(
-            obs_dim=train_obs_s.shape[1],
-            act_dim=train_act_s.shape[1],
-            hidden_units=mdn_config.get("hidden_units", [128, 128, 64]),
-            n_components=mdn_config.get("n_components", 5),
-            covariance_type=mdn_config.get("covariance_type", "diag"),
-            activation=mdn_config.get("activation", "relu"),
-            dropout=mdn_config.get("dropout", 0.1),
-            learning_rate=mdn_config.get("learning_rate", 0.001),
-            weight_decay=mdn_config.get("weight_decay", 0.0001),
-            mixture_reg=mdn_config.get("mixture_reg", 0.01),
-            covariance_floor=mdn_config.get("covariance_floor", 1e-4),
-        )
-        
-        mdn_writer = make_writer(run_tensorboard_dir, "mdn")
-        mdn.fit(
-            train_obs_s,
-            train_act_s,
-            test_obs_s,
-            test_act_s,
-            epochs=mdn_config.get("epochs", 200),
-            batch_size=mdn_config.get("batch_size", 32),
-            patience=mdn_config.get("patience", 30),
-            min_delta=mdn_config.get("min_delta", 1e-4),
-            writer=mdn_writer,
-        )
+        mdn_writer = None
+        if args.skip_existing and mdn_artifact.exists():
+            print(f"[skip] MDN artifact exists → load {mdn_artifact.name}")
+            checkpoint = torch.load(mdn_artifact, map_location="cpu")
+            cfg = checkpoint.get("config", {})
+            mdn = MDNBaseline(
+                obs_dim=cfg.get("obs_dim", train_obs_s.shape[1]),
+                act_dim=cfg.get("act_dim", train_act_s.shape[1]),
+                hidden_units=cfg.get("hidden_units", [128, 128, 64]),
+                n_components=cfg.get("n_components", 5),
+                covariance_type=cfg.get("covariance_type", "diag"),
+                activation=cfg.get("activation", "relu"),
+                dropout=cfg.get("dropout", 0.1),
+                learning_rate=mdn_config.get("learning_rate", 0.001),
+                weight_decay=mdn_config.get("weight_decay", 0.0001),
+                mixture_reg=mdn_config.get("mixture_reg", 0.01),
+                covariance_floor=mdn_config.get("covariance_floor", 1e-4),
+            )
+            mdn.model.load_state_dict(checkpoint["model_state"])  # type: ignore
+        else:
+            print("[info] training MDN baseline ...")
+            mdn = MDNBaseline(
+                obs_dim=train_obs_s.shape[1],
+                act_dim=train_act_s.shape[1],
+                hidden_units=mdn_config.get("hidden_units", [128, 128, 64]),
+                n_components=mdn_config.get("n_components", 5),
+                covariance_type=mdn_config.get("covariance_type", "diag"),
+                activation=mdn_config.get("activation", "relu"),
+                dropout=mdn_config.get("dropout", 0.1),
+                learning_rate=mdn_config.get("learning_rate", 0.001),
+                weight_decay=mdn_config.get("weight_decay", 0.0001),
+                mixture_reg=mdn_config.get("mixture_reg", 0.01),
+                covariance_floor=mdn_config.get("covariance_floor", 1e-4),
+            )
+            mdn_writer = make_writer(run_tensorboard_dir, "mdn")
+            mdn.fit(
+                train_obs_s,
+                train_act_s,
+                test_obs_s,
+                test_act_s,
+                epochs=int(mdn_config.get("epochs", 200)),
+                batch_size=int(mdn_config.get("batch_size", 32)),
+                patience=int(mdn_config.get("patience", 30)),
+                min_delta=float(mdn_config.get("min_delta", 1e-4)),
+                writer=mdn_writer,
+            )
+            torch.save({"model_state": mdn.model.state_dict(), "config": {
+                "obs_dim": train_obs_s.shape[1], "act_dim": train_act_s.shape[1],
+                "hidden_units": mdn_config.get("hidden_units", [128,128,64]),
+                "n_components": mdn_config.get("n_components", 5),
+                "covariance_type": mdn_config.get("covariance_type", "diag"),
+                "activation": mdn_config.get("activation", "relu"),
+                "dropout": mdn_config.get("dropout", 0.1)}}, mdn_artifact)
+            if mdn_writer is not None:
+                mdn_writer.flush(); mdn_writer.close()
         
         # Predict (mean mode)
         pred_mdn_scaled = mdn.predict(test_obs_s, mode="mean")
@@ -2249,22 +2487,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
         )
         
         # Save model
-        mdn_artifact = artifacts_root / "mdn.pt"
-        torch.save(
-            {
-                "model_state": mdn.model.state_dict(),
-                "config": {
-                    "obs_dim": train_obs_s.shape[1],
-                    "act_dim": train_act_s.shape[1],
-                    "hidden_units": mdn_config.get("hidden_units", [128, 128, 64]),
-                    "n_components": mdn_config.get("n_components", 5),
-                    "covariance_type": mdn_config.get("covariance_type", "diag"),
-                    "activation": mdn_config.get("activation", "relu"),
-                    "dropout": mdn_config.get("dropout", 0.1),
-                },
-            },
-            mdn_artifact,
-        )
+        manifest["models"]["mdn"] = {"kind": "mdn", "path": mdn_artifact.name}
         
         if args.save_predictions:
             save_predictions(
@@ -2283,22 +2506,43 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
     if "diffusion_c" in models_requested:
         if torch is None:
             raise RuntimeError("Requested diffusion policy but PyTorch is not installed.")
-        print("[info] training diffusion policy (conditional) ...")
-        diffusion_c = DiffusionPolicyBaseline(
-            obs_dim=train_obs_s.shape[1],
-            act_dim=train_act_s.shape[1],
-            timesteps=args.diffusion_steps,
-            hidden_dim=args.diffusion_hidden,
-            lr=args.diffusion_lr,
-            batch_size=args.diffusion_batch,
-            epochs=args.diffusion_epochs,
-            seed=args.seed,
-            log_name="diffusion_c",
-            temporal=False,
-        )
-        diff_c_writer = make_writer(run_tensorboard_dir, "diffusion_c")
-        diffusion_c.fit(train_obs_s, train_act_s, writer=diff_c_writer)
         diffusion_c_artifact = artifacts_root / "diffusion_c.pt"
+        diff_c_writer = None
+        if args.skip_existing and diffusion_c_artifact.exists():
+            print(f"[skip] diffusion_c artifact exists → load {diffusion_c_artifact.name}")
+            checkpoint = torch.load(diffusion_c_artifact, map_location="cpu")
+            cfg = checkpoint.get("config", {})
+            diffusion_c = DiffusionPolicyBaseline(
+                obs_dim=cfg.get("obs_dim", train_obs_s.shape[1]),
+                act_dim=cfg.get("act_dim", train_act_s.shape[1]),
+                timesteps=cfg.get("timesteps", args.diffusion_steps),
+                hidden_dim=cfg.get("hidden_dim", args.diffusion_hidden),
+                lr=args.diffusion_lr,
+                batch_size=args.diffusion_batch,
+                epochs=0,
+                seed=args.seed,
+                log_name="diffusion_c",
+                temporal=False,
+            )
+            diffusion_c.model.load_state_dict(checkpoint["state_dict"])  # type: ignore
+        else:
+            print("[info] training diffusion policy (conditional) ...")
+            diffusion_c = DiffusionPolicyBaseline(
+                obs_dim=train_obs_s.shape[1],
+                act_dim=train_act_s.shape[1],
+                timesteps=args.diffusion_steps,
+                hidden_dim=args.diffusion_hidden,
+                lr=args.diffusion_lr,
+                batch_size=args.diffusion_batch,
+                epochs=args.diffusion_epochs,
+                seed=args.seed,
+                log_name="diffusion_c",
+                temporal=False,
+            )
+            diff_c_writer = make_writer(run_tensorboard_dir, "diffusion_c")
+            diffusion_c.fit(train_obs_s, train_act_s, writer=diff_c_writer)
+            if diff_c_writer is not None:
+                diff_c_writer.flush(); diff_c_writer.close()
         diffusion_c_config = {
             "obs_dim": train_obs_s.shape[1],
             "act_dim": train_act_s.shape[1],
@@ -2383,22 +2627,43 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             )
         if test_seq_obs.shape[0] == 0:
             raise RuntimeError("Temporal diffusion policy requires sequence data. Increase --sequence-window or trajectory length.")
-        print("[info] training diffusion policy (temporal) ...")
-        diffusion_t = DiffusionPolicyBaseline(
-            obs_dim=train_seq_obs.shape[-1],
-            act_dim=train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
-            timesteps=args.diffusion_steps,
-            hidden_dim=args.diffusion_hidden,
-            lr=args.diffusion_lr,
-            batch_size=args.diffusion_batch,
-            epochs=args.diffusion_epochs,
-            seed=args.seed,
-            log_name="diffusion_t",
-            temporal=True,
-        )
-        diff_t_writer = make_writer(run_tensorboard_dir, "diffusion_t")
-        diffusion_t.fit(train_seq_obs, train_seq_act_s, writer=diff_t_writer)
         diffusion_t_artifact = artifacts_root / "diffusion_t.pt"
+        diff_t_writer = None
+        if args.skip_existing and diffusion_t_artifact.exists():
+            print(f"[skip] diffusion_t artifact exists → load {diffusion_t_artifact.name}")
+            checkpoint = torch.load(diffusion_t_artifact, map_location="cpu")
+            cfg = checkpoint.get("config", {})
+            diffusion_t = DiffusionPolicyBaseline(
+                obs_dim=cfg.get("obs_dim", train_seq_obs.shape[-1]),
+                act_dim=cfg.get("act_dim", train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1]),
+                timesteps=cfg.get("timesteps", args.diffusion_steps),
+                hidden_dim=cfg.get("hidden_dim", args.diffusion_hidden),
+                lr=args.diffusion_lr,
+                batch_size=args.diffusion_batch,
+                epochs=0,
+                seed=args.seed,
+                log_name="diffusion_t",
+                temporal=True,
+            )
+            diffusion_t.model.load_state_dict(checkpoint["state_dict"])  # type: ignore
+        else:
+            print("[info] training diffusion policy (temporal) ...")
+            diffusion_t = DiffusionPolicyBaseline(
+                obs_dim=train_seq_obs.shape[-1],
+                act_dim=train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
+                timesteps=args.diffusion_steps,
+                hidden_dim=args.diffusion_hidden,
+                lr=args.diffusion_lr,
+                batch_size=args.diffusion_batch,
+                epochs=args.diffusion_epochs,
+                seed=args.seed,
+                log_name="diffusion_t",
+                temporal=True,
+            )
+            diff_t_writer = make_writer(run_tensorboard_dir, "diffusion_t")
+            diffusion_t.fit(train_seq_obs, train_seq_act_s, writer=diff_t_writer)
+            if diff_t_writer is not None:
+                diff_t_writer.flush(); diff_t_writer.close()
         diffusion_t_config = {
             "obs_dim": train_seq_obs.shape[-1],
             "act_dim": train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
@@ -2490,23 +2755,45 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             )
         if test_seq_obs.shape[0] == 0:
             raise RuntimeError("LSTM-GMM baseline requires sequence data. Increase --sequence-window or trajectory length.")
-        print("[info] training LSTM-GMM baseline ...")
-        lstm_gmm = LSTMGMMBaseline(
-            obs_dim=train_seq_obs.shape[-1],
-            act_dim=train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
-            seq_len=window,
-            n_components=args.lstm_gmm_components,
-            hidden_dim=args.lstm_gmm_hidden,
-            n_layers=args.lstm_gmm_layers,
-            lr=args.lstm_gmm_lr,
-            batch_size=args.bc_batch,
-            epochs=args.lstm_gmm_epochs,
-            seed=args.seed,
-            log_name="lstm_gmm",
-        )
-        lstm_writer = make_writer(run_tensorboard_dir, "lstm_gmm")
-        lstm_gmm.fit(train_seq_obs, train_seq_act_s, writer=lstm_writer)
         lstm_artifact = artifacts_root / "lstm_gmm.pt"
+        lstm_writer = None
+        if args.skip_existing and lstm_artifact.exists():
+            print(f"[skip] LSTM-GMM artifact exists → load {lstm_artifact.name}")
+            checkpoint = torch.load(lstm_artifact, map_location="cpu")
+            cfg = checkpoint.get("config", {})
+            lstm_gmm = LSTMGMMBaseline(
+                obs_dim=cfg.get("obs_dim", train_seq_obs.shape[-1]),
+                act_dim=cfg.get("act_dim", train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1]),
+                seq_len=cfg.get("seq_len", window),
+                n_components=cfg.get("n_components", args.lstm_gmm_components),
+                hidden_dim=cfg.get("hidden_dim", args.lstm_gmm_hidden),
+                n_layers=cfg.get("n_layers", args.lstm_gmm_layers),
+                lr=args.lstm_gmm_lr,
+                batch_size=args.bc_batch,
+                epochs=0,
+                seed=args.seed,
+                log_name="lstm_gmm",
+            )
+            lstm_gmm.model.load_state_dict(checkpoint["state_dict"])  # type: ignore
+        else:
+            print("[info] training LSTM-GMM baseline ...")
+            lstm_gmm = LSTMGMMBaseline(
+                obs_dim=train_seq_obs.shape[-1],
+                act_dim=train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
+                seq_len=window,
+                n_components=args.lstm_gmm_components,
+                hidden_dim=args.lstm_gmm_hidden,
+                n_layers=args.lstm_gmm_layers,
+                lr=args.lstm_gmm_lr,
+                batch_size=args.bc_batch,
+                epochs=args.lstm_gmm_epochs,
+                seed=args.seed,
+                log_name="lstm_gmm",
+            )
+            lstm_writer = make_writer(run_tensorboard_dir, "lstm_gmm")
+            lstm_gmm.fit(train_seq_obs, train_seq_act_s, writer=lstm_writer)
+            if lstm_writer is not None:
+                lstm_writer.flush(); lstm_writer.close()
         lstm_config = {
             "obs_dim": train_seq_obs.shape[-1],
             "act_dim": train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
@@ -2602,7 +2889,18 @@ def run_per_finger_benchmarks(args, models_requested: set) -> None:
     """Per-finger training: 3 independent models (th: 8D->3D, if: 8D->3D, mf: 8D->3D)."""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     
+    # Resolve artifact/tensorboard directories
+    artifacts_root, run_tensorboard_dir = _resolve_artifact_and_tb_dirs(
+        base_output=args.output_dir,
+        base_tb=args.tensorboard_dir,
+        stiffness_dir=args.stiffness_dir,
+        timestamp=timestamp,
+        mode="per-finger",
+    )
+    ensure_dir(artifacts_root)
+    
     all_results = {}
+    all_manifests = {}
     
     for finger in ["th", "if", "mf"]:
         print(f"\n{'='*80}")
@@ -2644,9 +2942,59 @@ def run_per_finger_benchmarks(args, models_requested: set) -> None:
         train_act_s = act_scaler.fit_transform(train_act)
         test_act_s = act_scaler.transform(test_act)
         
-        finger_results = {}
+        # Save scalers for this finger
+        finger_artifact_dir = ensure_dir(artifacts_root / finger)
+        scalers_path = finger_artifact_dir / "scalers.pkl"
+        with scalers_path.open("wb") as fh:
+            pickle.dump({"obs_scaler": obs_scaler, "act_scaler": act_scaler}, fh)
         
-        # Train BC model (fastest baseline for quick testing)
+        finger_results = {}
+        finger_manifest = {
+            "timestamp": timestamp,
+            "finger": finger,
+            "scalers": scalers_path.name,
+            "models": {},
+            "train_trajectories": [t.name for t in train_traj],
+            "test_trajectories": [t.name for t in test_traj],
+        }
+        
+        # Prepare sequence data for LSTM-GMM and temporal models
+        window = int(LSTM_GMM_CONFIG.get("sequence_window", 10))
+        
+        # Build scaled trajectories for sequence dataset
+        train_traj_scaled = [
+            Trajectory(
+                name=t.name,
+                observations=obs_scaler.transform(t.observations),
+                actions=act_scaler.transform(t.actions),
+            )
+            for t in train_traj
+        ]
+        test_traj_scaled = [
+            Trajectory(
+                name=t.name,
+                observations=obs_scaler.transform(t.observations),
+                actions=act_scaler.transform(t.actions),
+            )
+            for t in test_traj
+        ]
+        
+        train_offsets = compute_offsets(train_traj)
+        test_offsets = compute_offsets(test_traj)
+        train_seq_obs, train_seq_act_s, train_seq_act_raw, _ = build_sequence_dataset(
+            train_traj_scaled,
+            train_traj,
+            window,
+            train_offsets,
+        )
+        test_seq_obs, test_seq_act_s, test_seq_act_raw, test_seq_indices = build_sequence_dataset(
+            test_traj_scaled,
+            test_traj,
+            window,
+            test_offsets,
+        )
+        
+        # Train BC model
         if "bc" in models_requested:
             print(f"[{finger}] training behavior cloning baseline ...")
             try:
@@ -2661,24 +3009,206 @@ def run_per_finger_benchmarks(args, models_requested: set) -> None:
                     weight_decay=args.bc_weight_decay,
                     log_name=f"bc_{finger}",
                 )
-                bc_policy.fit(train_obs_s, train_act_s, verbose=False)
+                bc_writer = make_writer(run_tensorboard_dir, f"bc_{finger}")
+                bc_policy.fit(train_obs_s, train_act_s, writer=bc_writer, verbose=False)
+                
+                # Save BC model
+                bc_artifact = finger_artifact_dir / "bc.pt"
+                bc_config = {
+                    "obs_dim": train_obs_s.shape[1],
+                    "act_dim": train_act_s.shape[1],
+                    "hidden_dim": args.bc_hidden,
+                    "depth": args.bc_depth,
+                    "lr": args.bc_lr,
+                    "batch_size": args.bc_batch,
+                    "epochs": args.bc_epochs,
+                    "weight_decay": args.bc_weight_decay,
+                    "seed": args.seed,
+                }
+                torch.save(
+                    {
+                        "config": bc_config,
+                        "state_dict": {k: v.cpu() for k, v in bc_policy.model.state_dict().items()},
+                    },
+                    bc_artifact,
+                )
+                finger_manifest["models"]["bc"] = {
+                    "kind": "bc",
+                    "path": bc_artifact.name,
+                }
+                
+                # Evaluate
                 pred_act_s = bc_policy.predict(test_obs_s)
                 pred_act = act_scaler.inverse_transform(pred_act_s)
                 
                 metrics = compute_metrics(test_act, pred_act)
                 print(f"[{finger}] bc rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
                 finger_results["bc"] = metrics
+                
+                if bc_writer is not None:
+                    bc_writer.flush()
+                    bc_writer.close()
             except Exception as exc:
                 print(f"[{finger}] bc training failed: {exc}")
         
+        # Train LSTM-GMM model
+        if "lstm_gmm" in models_requested:
+            if train_seq_obs.shape[0] == 0 or test_seq_obs.shape[0] == 0:
+                print(f"[{finger}] lstm_gmm skipped (insufficient sequence data)")
+            else:
+                print(f"[{finger}] training LSTM-GMM baseline ...")
+                try:
+                    lstm_gmm = LSTMGMMBaseline(
+                        obs_dim=train_seq_obs.shape[-1],
+                        act_dim=train_seq_act_s.shape[1],
+                        seq_len=window,
+                        n_components=args.lstm_gmm_components,
+                        hidden_dim=args.lstm_gmm_hidden,
+                        n_layers=args.lstm_gmm_layers,
+                        lr=args.lstm_gmm_lr,
+                        batch_size=args.bc_batch,
+                        epochs=args.lstm_gmm_epochs,
+                        seed=args.seed,
+                        log_name=f"lstm_gmm_{finger}",
+                    )
+                    lstm_writer = make_writer(run_tensorboard_dir, f"lstm_gmm_{finger}")
+                    lstm_gmm.fit(train_seq_obs, train_seq_act_s, writer=lstm_writer, verbose=False)
+                    
+                    # Save model
+                    lstm_artifact = finger_artifact_dir / "lstm_gmm.pt"
+                    lstm_config = {
+                        "obs_dim": train_seq_obs.shape[-1],
+                        "act_dim": train_seq_act_s.shape[1],
+                        "seq_len": window,
+                        "n_components": args.lstm_gmm_components,
+                        "hidden_dim": args.lstm_gmm_hidden,
+                        "n_layers": args.lstm_gmm_layers,
+                        "lr": args.lstm_gmm_lr,
+                        "batch_size": args.bc_batch,
+                        "epochs": args.lstm_gmm_epochs,
+                        "seed": args.seed,
+                    }
+                    torch.save(
+                        {
+                            "config": lstm_config,
+                            "state_dict": {k: v.cpu() for k, v in lstm_gmm.model.state_dict().items()},
+                        },
+                        lstm_artifact,
+                    )
+                    finger_manifest["models"]["lstm_gmm"] = {
+                        "kind": "lstm_gmm",
+                        "path": lstm_artifact.name,
+                        "seq_len": window,
+                    }
+                    
+                    # Evaluate
+                    pred_seq_scaled = lstm_gmm.predict(test_seq_obs, mode="mean", n_samples=args.gmm_samples)
+                    pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
+                    metrics = compute_metrics(test_seq_act_raw, pred_seq)
+                    metrics["nll"] = float("nan")
+                    print(f"[{finger}] lstm_gmm rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
+                    finger_results["lstm_gmm"] = metrics
+                    
+                    if lstm_writer is not None:
+                        lstm_writer.flush()
+                        lstm_writer.close()
+                except Exception as exc:
+                    print(f"[{finger}] lstm_gmm training failed: {exc}")
+        
+        # Train Diffusion model
+        if "diffusion_c" in models_requested:
+            print(f"[{finger}] training diffusion policy (conditional) ...")
+            try:
+                diffusion_c = DiffusionPolicyBaseline(
+                    obs_dim=train_obs_s.shape[1],
+                    act_dim=train_act_s.shape[1],
+                    timesteps=args.diffusion_steps,
+                    hidden_dim=args.diffusion_hidden,
+                    lr=args.diffusion_lr,
+                    batch_size=args.diffusion_batch,
+                    epochs=args.diffusion_epochs,
+                    seed=args.seed,
+                    log_name=f"diffusion_c_{finger}",
+                    temporal=False,
+                )
+                diff_c_writer = make_writer(run_tensorboard_dir, f"diffusion_c_{finger}")
+                diffusion_c.fit(train_obs_s, train_act_s, writer=diff_c_writer, verbose=False)
+                
+                # Save model
+                diffusion_c_artifact = finger_artifact_dir / "diffusion_c.pt"
+                diffusion_c_config = {
+                    "obs_dim": train_obs_s.shape[1],
+                    "act_dim": train_act_s.shape[1],
+                    "timesteps": args.diffusion_steps,
+                    "hidden_dim": args.diffusion_hidden,
+                    "time_dim": diffusion_c.model.time_embed.dim if hasattr(diffusion_c.model.time_embed, "dim") else 64,
+                    "lr": args.diffusion_lr,
+                    "batch_size": args.diffusion_batch,
+                    "epochs": args.diffusion_epochs,
+                    "seed": args.seed,
+                    "temporal": False,
+                }
+                torch.save(
+                    {
+                        "config": diffusion_c_config,
+                        "state_dict": {k: v.cpu() for k, v in diffusion_c.model.state_dict().items()},
+                    },
+                    diffusion_c_artifact,
+                )
+                finger_manifest["models"]["diffusion_c"] = {
+                    "kind": "diffusion",
+                    "path": diffusion_c_artifact.name,
+                    "temporal": False,
+                    "sampler": "ddpm",
+                    "eta": 0.0,
+                }
+                
+                # Evaluate with DDPM sampler
+                pred_scaled_c_ddpm = diffusion_c.predict(test_obs_s, n_samples=4, sampler="ddpm", eta=0.0)
+                pred_c_ddpm = act_scaler.inverse_transform(pred_scaled_c_ddpm)
+                metrics_c_ddpm = compute_metrics(test_act, pred_c_ddpm)
+                metrics_c_ddpm["nll"] = float("nan")
+                finger_results["diffusion_c_ddpm"] = metrics_c_ddpm
+                print(f"[{finger}] diffusion_c|ddpm rmse={metrics_c_ddpm['rmse']:.4f} mae={metrics_c_ddpm['mae']:.4f} r2={metrics_c_ddpm['r2']:.4f}")
+                
+                # Evaluate with DDIM sampler
+                diffusion_eta = 1.0
+                pred_scaled_c_ddim = diffusion_c.predict(test_obs_s, n_samples=4, sampler="ddim", eta=diffusion_eta)
+                pred_c_ddim = act_scaler.inverse_transform(pred_scaled_c_ddim)
+                metrics_c_ddim = compute_metrics(test_act, pred_c_ddim)
+                metrics_c_ddim["nll"] = float("nan")
+                finger_results["diffusion_c_ddim"] = metrics_c_ddim
+                finger_manifest["models"]["diffusion_c_ddim"] = {
+                    "kind": "diffusion",
+                    "path": diffusion_c_artifact.name,
+                    "temporal": False,
+                    "sampler": "ddim",
+                    "eta": diffusion_eta,
+                }
+                print(f"[{finger}] diffusion_c|ddim rmse={metrics_c_ddim['rmse']:.4f} mae={metrics_c_ddim['mae']:.4f} r2={metrics_c_ddim['r2']:.4f}")
+                
+                if diff_c_writer is not None:
+                    diff_c_writer.flush()
+                    diff_c_writer.close()
+            except Exception as exc:
+                print(f"[{finger}] diffusion_c training failed: {exc}")
+        
         # Store results
         all_results[finger] = finger_results
+        all_manifests[finger] = finger_manifest
+        
+        # Save manifest for this finger
+        manifest_path = finger_artifact_dir / "manifest.json"
+        with manifest_path.open("w", encoding="utf-8") as fh:
+            json.dump(finger_manifest, fh, indent=2)
     
     # Save combined summary
     summary = {
         "mode": "per-finger",
         "timestamp": timestamp,
+        "artifacts_root": str(artifacts_root),
         "results_per_finger": all_results,
+        "manifests_per_finger": all_manifests,
         "config": {
             "test_size": args.test_size,
             "seed": args.seed,
@@ -2695,6 +3225,7 @@ def run_per_finger_benchmarks(args, models_requested: set) -> None:
     with out_json.open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"\n[done] per-finger summary saved to {out_json}")
+    print(f"[done] artifacts stored in {artifacts_root}")
     
     # Print aggregate results
     print(f"\n{'='*80}")

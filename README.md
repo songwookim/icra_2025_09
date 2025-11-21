@@ -37,21 +37,60 @@ python3 scripts/augment_demonstration_data.py \
 
 
 ### 3. Train Stiffness Prediction Models
-Train all models (BC, GMM, GMR, LSTM-GMM, Diffusion, IBC, GP, MDN):
+
+**4가지 구성 중 선택하여 실행:**
 
 ```bash
 cd /home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge
+
+# [구성 1] Unified + Original
 python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
-  --stiffness-dir outputs/analysis/stiffness_profiles_global_tk \
-  --mode per-finger \
+  --mode unified \
+  --stiffness-dir outputs/analysis/stiffness_profiles \
   --models all \
   --bc-epochs 200 \
   --diffusion-epochs 200 \
-  --augment \
-  --augment-num 1 \
+  --augment --augment-num 1 \
   --augment-noise-force 0.015 \
   --augment-noise-stiffness 0.04 \
   --augment-temporal-jitter 1
+
+# [구성 2] Unified + Global T_K (추천: 성능 가장 좋음)
+python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
+  --mode unified \
+  --stiffness-dir outputs/analysis/stiffness_profiles_global_tk \
+  --models all \
+  --bc-epochs 200 \
+  --diffusion-epochs 200 \
+  --augment --augment-num 1 \
+  --augment-noise-force 0.015 \
+  --augment-noise-stiffness 0.04 \
+  --augment-temporal-jitter 1
+
+# [구성 3] Per-Finger + Original
+python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
+  --mode per-finger \
+  --stiffness-dir outputs/analysis/stiffness_profiles \
+  --models all \
+  --bc-epochs 200 \
+  --augment --augment-num 1 \
+  --augment-noise-force 0.015 \
+  --augment-noise-stiffness 0.04 \
+  --augment-temporal-jitter 1
+
+# [구성 4] Per-Finger + Global T_K
+python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
+  --mode per-finger \
+  --stiffness-dir outputs/analysis/stiffness_profiles_global_tk \
+  --models all \
+  --bc-epochs 200 \
+  --augment --augment-num 1 \
+  --augment-noise-force 0.015 \
+  --augment-noise-stiffness 0.04 \
+  --augment-temporal-jitter 1
+
+# 4가지 모두 자동 실행 (배치 스크립트)
+bash run_all_with_tb.sh
 ```
 
 **Available Models:**
@@ -112,27 +151,63 @@ python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
 View real-time training metrics:
 ```bash
 # Start TensorBoard
-tensorboard --logdir outputs/models/stiffness_policies/tensorboard --port 6006
+tensorboard --logdir src/hri_falcon_robot_bridge/outputs/models/policy_learning/tensorboard --port 6006
 
 # Access in browser at http://localhost:6006
 ```
 
 ### 5. Evaluate Trained Models
-Evaluate all models on held-out test demonstrations:
+
+**먼저 최신 timestamp 확인:**
+
 ```bash
-# 각 학습 결과에 대해 평가
+# 모든 artifact 디렉토리 확인 (최신 순)
+ls -1dt outputs/models/policy_learning*/artifacts/*
+
+# 또는 특정 구성만
+ls -1t outputs/models/stiffness_policies/policy_learning_unified/artifacts/*
+ls -1t outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/*
+ls -1t outputs/models/stiffness_policies/policy_learning_per_finger/artifacts/*
+ls -1t outputs/models/stiffness_policies/policy_learning_global_tk_per_finger/artifacts/*
+```
+
+**평가 실행 (아래 `YYYYMMDD_HHMMSS`를 위에서 확인한 실제 timestamp로 교체):**
+
+```bash
+# Unified + Original 평가
 python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir outputs/models/policy_learning/artifacts/<timestamp> \
+  --artifact-dir outputs/models/stiffness_policies/policy_learning_unified/artifacts/YYYYMMDD_HHMMSS \
   --models all
 
-# Global T_K 버전 평가
+# Unified + Global T_K 평가
 python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir outputs/models/policy_learning_global_tk/artifacts/<timestamp> \
+  --artifact-dir outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/YYYYMMDD_HHMMSS \
+  --models all
+
+# Per-Finger + Original 평가
+python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
+  --artifact-dir outputs/models/stiffness_policies/policy_learning_per_finger/artifacts/YYYYMMDD_HHMMSS \
+  --models bc
+
+# Per-Finger + Global T_K 평가
+python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
+  --artifact-dir outputs/models/stiffness_policies/policy_learning_global_tk_per_finger/artifacts/YYYYMMDD_HHMMSS \
   --models all
 ```
 
-Options:
+**자동으로 최신 timestamp 사용 (고급):**
+
+```bash
+# Unified + Global T_K 최신 결과 자동 평가
+LATEST=$(ls -1dt outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/* | head -1)
+python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
+  --artifact-dir "$LATEST" \
+  --models all
+```
+
+**평가 옵션:**
 - `--diffusion-sampler ddpm` : DDPM or DDIM sampling
+- `--models all` : 모든 모델 평가 (또는 bc, gmr, diffusion_c 등 개별 지정)
 
 ### 6. Visualize Results
 Generate comprehensive comparison plots:
@@ -153,8 +228,31 @@ outputs/
 ├── analysis/
 │   └── stiffness_profiles_global_tk/      # Generated stiffness profiles (*_paper_profile.csv)
 └── models/stiffness_policies/
-    ├── artifacts/                          # Trained model checkpoints
-    │   └── <timestamp>/
+  ├── policy_learning_unified/            # Unified (original stiffness) models
+  │   ├── artifacts/<timestamp>/
+  │   │   ├── bc.pt
+  │   │   ├── diffusion_c.pt / diffusion_t.pt
+  │   │   ├── gmm.pkl
+  │   │   ├── ibc.pt
+  │   │   ├── lstm_gmm.pt
+  │   │   ├── scalers.pkl
+  │   │   └── manifest.json
+  │   └── tensorboard/<timestamp>/        # TensorBoard events (bc, ibc, diffusion, lstm_gmm, mdn)
+  ├── policy_learning_global_tk_unified/  # Unified (global T_K) models
+  │   ├── artifacts/<timestamp>/ ... (same layout)
+  │   └── tensorboard/<timestamp>/
+  ├── policy_learning_per_finger/         # Per-finger (original stiffness) models
+  │   ├── artifacts/<timestamp>/
+  │   │   ├── th/bc.pt, scalers.pkl, manifest.json
+  │   │   ├── if/bc.pt, scalers.pkl, manifest.json
+  │   │   ├── mf/bc.pt, scalers.pkl, manifest.json
+  │   │   └── manifest.json (aggregate)
+  │   └── tensorboard/<timestamp>/        # (Reserved for future per-finger TB runs)
+  ├── policy_learning_global_tk_per_finger/ # Per-finger (global T_K) models
+  │   ├── artifacts/<timestamp>/ (same per-finger layout)
+  │   └── tensorboard/<timestamp>/
+  ├── artifacts/                          # Legacy (symlink to unified) – backward compatibility
+  │   └── <timestamp>/                    # (Old path retained for existing scripts)
     │       ├── bc.pt                       # Behavior cloning model
     │       ├── gmm.pkl, gmr.pkl           # Gaussian mixture models
     │       ├── lstm_gmm.pt                 # LSTM-GMM model
@@ -168,9 +266,56 @@ outputs/
     └── benchmark_summary_<timestamp>.json  # Performance summary
 ```
 
+### 4가지 구성별 실행 & 평가 (Unified / Per-Finger × Original / Global T_K)
+
+| 구성 | 설명 | 학습 명령 예시 | 평가 경로 예시 |
+|------|------|----------------|----------------|
+| Unified + Original | 단일 모델 (20D→9D) 원본 강성 | `--mode unified --stiffness-dir outputs/analysis/stiffness_profiles` | `outputs/models/stiffness_policies/policy_learning_unified/artifacts/<ts>` |
+| Unified + Global T_K | 단일 모델 (20D→9D) 전역 T_K | `--mode unified --stiffness-dir outputs/analysis/stiffness_profiles_global_tk` | `outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/<ts>` |
+| Per-Finger + Original | 손가락별 3개 모델 (8D→3D) 원본 강성 | `--mode per-finger --stiffness-dir outputs/analysis/stiffness_profiles` | `outputs/models/stiffness_policies/policy_learning_per_finger/artifacts/<ts>` |
+| Per-Finger + Global T_K | 손가락별 3개 모델 (8D→3D) 전역 T_K | `--mode per-finger --stiffness-dir outputs/analysis/stiffness_profiles_global_tk` | `outputs/models/stiffness_policies/policy_learning_global_tk_per_finger/artifacts/<ts>` |
+
+학습 예시 (4-way 모두 실행):
+
+```bash
+bash run_all_with_tb.sh
+```
+
+개별 실행 예시 (Unified + Global T_K):
+
+```bash
+python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
+  --mode unified \
+  --stiffness-dir outputs/analysis/stiffness_profiles_global_tk \
+  --models all \
+  --augment --augment-num 1 \
+  --augment-noise-force 0.015 \
+  --augment-noise-stiffness 0.04 \
+  --augment-temporal-jitter 1
+```
+
+평가 (Unified + Global T_K):
+
+```bash
+python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
+  --artifact-dir outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/<timestamp> \
+  --models all
+```
+
+평가 (Per-Finger + Original):
+
+```bash
+python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
+  --artifact-dir outputs/models/stiffness_policies/policy_learning_per_finger/artifacts/<timestamp> \
+  --models bc
+```
+
+주의: 기존 경로(`policy_learning`, `policy_learning_global_tk`)는 새 구조의 unified 폴더로 심볼릭 링크가 생성되어 기존 스크립트 호환이 유지됩니다.
+
 ### Common Commands
 
 **Check Training Status:**
+
 ```bash
 # View training log
 tail -f outputs/unified_all_models.log
@@ -180,6 +325,7 @@ ps aux | grep "run_stiffness_policy_benchmarks.py"
 ```
 
 **View Benchmark Results:**
+
 ```bash
 # List all benchmarks (sorted by time)
 ls -lt outputs/models/stiffness_policies/benchmark_summary_*.json | head -5
@@ -197,6 +343,7 @@ for name, metrics in data['models'].items():
 ```
 
 **Quick Data Stats:**
+
 ```bash
 # Count demonstrations
 ls outputs/logs/success/*.csv | wc -l

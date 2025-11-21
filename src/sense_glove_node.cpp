@@ -9,6 +9,8 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -89,14 +91,14 @@ constexpr std::array<std::pair<const char *, const char *>, 9> kCommandOrder{{
 
 constexpr std::array<ForceCalibrationSample, 6> kCalibrationTable{{
   // {1.0f, 0.0f},
-  // {2.5f, 0.25f},
-  // {4.0f, 0.4f},
-  // {6.5f, 0.6f},
-  // {8.0f, 0.85f},
-  // {9.5f, 1.0f},
+  // {4.0f, 0.2f},
+  // {8.0f, 0.4f},
+  // {12.0f, 0.6f},
+  // {16.0f, 0.8f},
+  // {20.0f, 1.0f},
 
   {1.0f, 0.0f},
-  {4.0f, 0.2f},
+  {5.0f, 0.2f},
   {8.0f, 0.4f},
   {12.0f, 0.6f},
   {16.0f, 0.8f},
@@ -247,6 +249,8 @@ public:
     declare_parameter("force_feedback_lambda", force_feedback_lambda_);
     declare_parameter("force_feedback_force_norm", force_feedback_force_norm_);
     declare_parameter("force_feedback_torque_norm", force_feedback_torque_norm_);
+    // 디버그: 센서값 무시하고 고정 레벨 적용 (-1.0이면 비활성)
+    declare_parameter("force_feedback_debug_constant_level", -1.0);
   declare_parameter("force_feedback_publish_rate", force_feedback_publish_rate_);
   declare_parameter("force_feedback_print_enabled", true);
   declare_parameter("force_feedback_print_rate", 1.0);
@@ -868,12 +872,12 @@ void SenseGloveNode::on_force_wrench(
 
   const auto now = get_clock()->now();
   std::array<double, kAxesPerSensor> sample{
-    msg->wrench.force.x,
-    msg->wrench.force.y,
-    msg->wrench.force.z,
-    msg->wrench.torque.x,
-    msg->wrench.torque.y,
-    msg->wrench.torque.z
+    std::abs(msg->wrench.force.x),
+    std::abs(msg->wrench.force.y),
+    std::abs(msg->wrench.force.z),
+    std::abs(msg->wrench.torque.x),
+    std::abs(msg->wrench.torque.y),
+    std::abs(msg->wrench.torque.z)
   };
   const std::size_t target_finger = std::min(sensor_index, static_cast<std::size_t>(kFingerCount - 1));
 
@@ -900,12 +904,9 @@ void SenseGloveNode::on_force_wrench(
     const double force_mag = magnitude_force(filtered_sample);
     const double torque_mag = magnitude_torque(filtered_sample);
 
-    const double target_level = static_cast<double>(map_force_to_haptic_level(static_cast<float>(force_mag)));
+    // Previous code mapped per-sensor magnitude_force to haptic level and smoothed into filtered_levels_.
+    // We now defer level mapping to send_force_feedback() using aggregated force_abs_sum per finger.
     const double normalized_torque = clamp(torque_mag, 0.0, 1.0);
-
-    const double previous_level = filtered_levels_[target_finger];
-    filtered_levels_[target_finger] =
-      (1.0 - force_feedback_level_alpha_) * previous_level + force_feedback_level_alpha_ * target_level;
 
     double aggregated_force = 0.0;
     double aggregated_torque = 0.0;
@@ -988,6 +989,7 @@ void SenseGloveNode::send_force_feedback()
 
   std::array<double, kFingerCount> levels{};
   std::array<double, kFingerCount> forces_newton{};
+  std::array<double, kFingerCount> force_abs_sum{}; // sum of |fx|+|fy|+|fz| per finger
   double strap_level = 0.0;
   double vibe_level = 0.0;
 
@@ -1015,6 +1017,8 @@ void SenseGloveNode::send_force_feedback()
       
       const auto & ft = filtered_sensor_ft_[idx];
       forces_newton[finger] = magnitude_force(ft);
+      // accumulate absolute force sum (if multiple sensors map to same finger, they add)
+      force_abs_sum[finger] += std::abs(ft[0]) + std::abs(ft[1]) + std::abs(ft[2]);
     }
 
     if (!any_active)
@@ -1026,6 +1030,14 @@ void SenseGloveNode::send_force_feedback()
       forces_newton.fill(0.0);
     }
 
+    // Map aggregated absolute force sum per finger to haptic level via calibration, then smooth.
+    for (std::size_t f = 0; f < kFingerCount; ++f)
+    {
+      const double raw_abs_sum = force_abs_sum[f];
+      const double mapped_level = static_cast<double>(map_force_to_haptic_level(static_cast<float>(raw_abs_sum)));
+      const double prev = filtered_levels_[f];
+      filtered_levels_[f] = (1.0 - force_feedback_level_alpha_) * prev + force_feedback_level_alpha_ * mapped_level;
+    }
     levels = filtered_levels_;
     strap_level = filtered_strap_;
     vibe_level = filtered_vibe_;
@@ -1071,36 +1083,54 @@ void SenseGloveNode::send_force_feedback()
 #else
   try
   {
-    struct HandLayerHapticsProxy
+    SGCore::Nova::Nova2Glove glove;
+    if (!SGCore::Nova::Nova2Glove::GetNova2Glove(use_right_hand_, glove))
     {
-      explicit HandLayerHapticsProxy(bool use_right) : use_right(use_right) {}
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Nova2 glove (%s hand) not connected; skipping haptics send.",
+        use_right_hand_ ? "right" : "left");
+      return;
+    }
 
-      bool QueueForceFeedbackLevel(int channel, float level) const
-      {
-        return SGCore::HandLayer::QueueCommand_ForceFeedbackLevel(use_right, channel, level, false);
-      }
-
-      bool SendHaptics() const
-      {
-        return SGCore::HandLayer::SendHaptics(use_right);
-      }
-
-      bool use_right;
-    } glove(use_right_hand_);
-
-    const float thumb_lvl  = static_cast<float>(clamp(levels[0], 0.0, 1.0));
+    const float raw_thumb  = static_cast<float>(clamp(levels[0], 0.0f, 1.0f));
+    const float thumb_lvl  = raw_thumb < 0.2f ? 0.0f : raw_thumb; // 0.2 <= deadzone
     const float index_lvl  = static_cast<float>(clamp(kFingerCount > 1 ? levels[1] : 0.0, 0.0, 1.0));
     const float middle_lvl = static_cast<float>(clamp(kFingerCount > 2 ? levels[2] : 0.0, 0.0, 1.0));
 
-    bool queued_thumb  = glove.QueueForceFeedbackLevel(0, thumb_lvl);
-    bool queued_index  = glove.QueueForceFeedbackLevel(1, index_lvl);
-    bool queued_middle = glove.QueueForceFeedbackLevel(2, middle_lvl);
-    const bool all_queued = queued_thumb && queued_index && queued_middle;
+    RCLCPP_INFO(
+      get_logger(), 
+      "Haptic levels -> thumb: %.3f(%.3f) index: %.3f(%.3f) middle: %.3f(%.3f)",
+      static_cast<double>(thumb_lvl), static_cast<double>(force_abs_sum[0]),
+      static_cast<double>(index_lvl), static_cast<double>(force_abs_sum[1]),
+      static_cast<double>(middle_lvl), static_cast<double>(force_abs_sum[2]));
 
-    bool sent = glove.SendHaptics();
+    const bool queued_thumb  = glove.QueueForceFeedbackLevel(0, thumb_lvl);
+    const bool queued_index  = glove.QueueForceFeedbackLevel(1, index_lvl);
+    const bool queued_middle = glove.QueueForceFeedbackLevel(2, middle_lvl);
+
+    // RCLCPP_INFO(
+    //   get_logger(), 
+    //   "Queue status -> thumb: %s index: %s middle: %s",
+    //   queued_thumb ? "ok" : "fail",
+    //   queued_index ? "ok" : "fail",
+    //   queued_middle ? "ok" : "fail");
+    // // Warn if any queue failed; still attempt SendHaptics() so successful channels update.
+    // if (!(queued_thumb && queued_index && queued_middle))
+    // {
+    //   RCLCPP_WARN(get_logger(), "One or more QueueForceFeedbackLevel calls failed; attempting SendHaptics anyway.");
+    // }
+
+    const bool sent = glove.SendHaptics();
+    if (!sent)
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Nova2 SendHaptics() call failed");
+    }
 
     last_haptics_send_ = now;
-  }
+  } // end try block
   catch (const std::exception & exc)
   {
     RCLCPP_WARN_THROTTLE(

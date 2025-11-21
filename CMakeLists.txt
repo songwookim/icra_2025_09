@@ -80,6 +80,9 @@ if(SENSEGLOVE_SDK_FOUND AND EXISTS "${SENSEGLOVE_LIB_DIR}/libsgcore.so" AND EXIS
   target_link_directories(sense_glove_node PRIVATE ${SENSEGLOVE_LIB_DIR})
   target_link_libraries(sense_glove_node sgcore sgconnect)
   ament_target_dependencies(sense_glove_node rclcpp sensor_msgs std_msgs std_srvs)
+  target_compile_features(sense_glove_node PRIVATE cxx_std_17)
+  set_target_properties(sense_glove_node PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+  target_compile_options(sense_glove_node PRIVATE -std=gnu++17)
   if(NOT MSVC)
     target_compile_options(sense_glove_node PRIVATE -g -O0 -fno-omit-frame-pointer)
   endif()
@@ -106,6 +109,7 @@ install(PROGRAMS
   hri_falcon_robot_bridge/robot_controller_node.py
   hri_falcon_robot_bridge/deformity_tracker_node.py
   hri_falcon_robot_bridge/emg_node.py
+  scripts/4_policy_depolyer/stiffness_policy_deployer_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

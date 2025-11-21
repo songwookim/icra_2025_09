@@ -1,0 +1,79 @@
+=== Evaluating Unified + Original ===
+[info] evaluating demonstration '20251117_064008_synced_aug5'
+[gmr] rmse=90.6618 mae=75.2553 r2=-19.2088
+    (TH) rmse=92.6096 mae=77.0505 samples=3876
+    (IF) rmse=75.1437 mae=59.1874 samples=3876
+    (MF) rmse=102.1546 mae=89.5280 samples=3876
+[gmm] rmse=92.3830 mae=76.0792 r2=-21.0800
+    (TH) rmse=93.8673 mae=77.3752 samples=3876
+    (IF) rmse=76.9921 mae=60.8470 samples=3876
+    (MF) rmse=104.2354 mae=90.0154 samples=3876
+[bc] rmse=106.2952 mae=88.8491 r2=-34.6627
+    (TH) rmse=114.8277 mae=93.0132 samples=3876
+    (IF) rmse=80.9513 mae=66.8147 samples=3876
+    (MF) rmse=118.9853 mae=106.7195 samples=3876
+[ibc] rmse=95.1687 mae=74.2986 r2=-19.6944
+    (TH) rmse=90.5981 mae=71.1295 samples=3876
+    (IF) rmse=64.6403 mae=52.4349 samples=3876
+    (MF) rmse=121.5930 mae=99.3312 samples=3876
+[diffusion_c] rmse=86.7163 mae=72.4448 r2=-25.2840
+    (TH) rmse=81.3772 mae=65.7976 samples=3876
+    (IF) rmse=75.8354 mae=64.6499 samples=3876
+    (MF) rmse=100.9253 mae=86.8870 samples=3876
+[diffusion_c_ddim] rmse=86.7163 mae=72.4448 r2=-25.2840
+    (TH) rmse=81.3772 mae=65.7976 samples=3876
+    (IF) rmse=75.8354 mae=64.6499 samples=3876
+    (MF) rmse=100.9253 mae=86.8870 samples=3876
+[diffusion_t] rmse=91.8382 mae=74.9632 r2=-32.2904
+    (TH) rmse=81.2060 mae=60.1421 samples=3876
+    (IF) rmse=83.6049 mae=71.3823 samples=3876
+    (MF) rmse=108.2522 mae=93.3652 samples=3876
+[diffusion_t_ddim] rmse=91.8382 mae=74.9632 r2=-32.2904
+    (TH) rmse=81.2060 mae=60.1421 samples=3876
+    (IF) rmse=83.6049 mae=71.3823 samples=3876
+    (MF) rmse=108.2522 mae=93.3652 samples=3876
+[lstm_gmm] rmse=96.0917 mae=81.6073 r2=-30.7379
+    (TH) rmse=100.7630 mae=84.2622 samples=3876
+    (IF) rmse=86.2116 mae=69.2703 samples=3876
+    (MF) rmse=100.5743 mae=91.2894 samples=3876
+[done] plot saved to outputs/models/policy_learning/artifacts/20251119_100949/plots/20251117_064008_synced_aug5_comparison.png
+=== Evaluating Unified + Global T_K ===
+[info] evaluating demonstration '20251117_064008_synced_aug5'
+[gmr] rmse=118.9122 mae=86.8428 r2=-15.1276
+    (TH) rmse=115.3166 mae=77.4362 samples=3876
+    (IF) rmse=86.3131 mae=64.6916 samples=3876
+    (MF) rmse=147.2158 mae=118.4007 samples=3876
+[gmm] rmse=119.0325 mae=86.9968 r2=-15.2467
+    (TH) rmse=115.5092 mae=77.5973 samples=3876
+    (IF) rmse=86.3746 mae=64.9623 samples=3876
+    (MF) rmse=147.3203 mae=118.4310 samples=3876
+[bc] rmse=119.6578 mae=86.6253 r2=-14.6845
+    (TH) rmse=115.1094 mae=74.6687 samples=3876
+    (IF) rmse=87.0517 mae=66.9005 samples=3876
+    (MF) rmse=148.7474 mae=118.3066 samples=3876
+[ibc] rmse=127.9859 mae=97.6427 r2=-22.5088
+    (TH) rmse=140.6685 mae=104.4329 samples=3876
+    (IF) rmse=76.6592 mae=59.8424 samples=3876
+    (MF) rmse=153.2219 mae=128.6528 samples=3876
+[diffusion_c] rmse=122.9602 mae=88.9132 r2=-15.7808
+    (TH) rmse=119.9004 mae=78.1020 samples=3876
+    (IF) rmse=87.1289 mae=67.2156 samples=3876
+    (MF) rmse=152.9382 mae=121.4220 samples=3876
+[diffusion_c_ddim] rmse=122.9602 mae=88.9132 r2=-15.7808
+    (TH) rmse=119.9004 mae=78.1020 samples=3876
+    (IF) rmse=87.1289 mae=67.2156 samples=3876
+    (MF) rmse=152.9382 mae=121.4220 samples=3876
+[diffusion_t] rmse=121.6688 mae=88.0457 r2=-15.3331
+    (TH) rmse=116.9800 mae=75.8576 samples=3876
+    (IF) rmse=88.0070 mae=68.0260 samples=3876
+    (MF) rmse=151.5926 mae=120.2535 samples=3876
+[diffusion_t_ddim] rmse=121.6688 mae=88.0457 r2=-15.3331
+    (TH) rmse=116.9800 mae=75.8576 samples=3876
+    (IF) rmse=88.0070 mae=68.0260 samples=3876
+    (MF) rmse=151.5926 mae=120.2535 samples=3876
+[lstm_gmm] rmse=121.9105 mae=88.5986 r2=-15.5011
+    (TH) rmse=118.7279 mae=78.5767 samples=3876
+    (IF) rmse=87.5672 mae=66.8677 samples=3876
+    (MF) rmse=151.0701 mae=120.3513 samples=3876
+[done] plot saved to outputs/models/policy_learning_global_tk/artifacts/20251119_112601/plots/20251117_064008_synced_aug5_comparison.png
+✅ Evaluation completed

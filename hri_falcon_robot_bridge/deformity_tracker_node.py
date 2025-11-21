@@ -149,8 +149,7 @@ class DeformityTrackerNode(Node):
 
         self._cv_inited = False
 
-        # Publishers (circularity + eccentricity)
-        self.pub_circularity = self.create_publisher(Float32, '/deformity_tracker/circularity', 10)
+        # Publisher (eccentricity only; circularity removed)
         self.pub_eccentricity = self.create_publisher(Float32, '/deformity_tracker/eccentricity', 10)
         
         # Local state tracking (for overlay display)
@@ -284,10 +283,7 @@ class DeformityTrackerNode(Node):
         area = float(cv2.contourArea(cnt))
         if area <= 1e-3:
             return None
-        peri = float(cv2.arcLength(cnt, True))
-        circularity = 0.0
-        if peri > 1e-6:
-            circularity = float(4.0 * math.pi * area / (peri * peri))
+        # circularity computation removed
         center = None
         ((x, y), r) = cv2.minEnclosingCircle(cnt)
         if r > 0:
@@ -314,7 +310,7 @@ class DeformityTrackerNode(Node):
         return {
             'center': center,
             'radius': float(r),
-            'circularity': circularity,
+            # 'circularity': removed
             'eccentricity': eccentricity,
             'aspect': aspect,
             'a': a,
@@ -417,6 +413,11 @@ class DeformityTrackerNode(Node):
                     continue
                 frame = np.asanyarray(color.get_data())
                 vis = frame.copy()
+                # Fixed reference point overlay at (370,230)
+                try:
+                    cv2.circle(vis, (370, 230), 6, (0, 255, 255), -1)  # yellow dot
+                except Exception:
+                    pass
 
                 mask, masks_by_color, cnts = self._extract_mask_and_contours(frame)
                 best = None
@@ -445,22 +446,16 @@ class DeformityTrackerNode(Node):
                             dot_color = (0, 255, 0) if (0.495 <= ecc_for_color <= 0.505) else (0, 0, 255)
                             # Draw dot
                             cv2.circle(vis, best['center'], 5, dot_color, -1)
-                            # Prepare and draw coordinate label near the dot
+                            # Prepare coordinate text for top overlay (removed near-dot label)
                             try:
                                 cx, cy = int(best['center'][0]), int(best['center'][1])
                                 point_text = f"pt:({cx},{cy})"
-                                tx, ty = cx + 8, max(12, cy - 8)
-                                # Shadow for readability
-                                cv2.putText(vis, point_text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
-                                cv2.putText(vis, point_text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
                             except Exception:
                                 pass
                         # If ellipse data (a,b) present, draw approximate ellipse outline (use minEnclosingCircle already for circle) - optional
                         # Could extend: cv2.ellipse(...)
-                circ_val = best['circularity'] if best else 0.0
                 ecc_val = best['eccentricity'] if best else 0.0
                 try:
-                    self.pub_circularity.publish(Float32(data=float(circ_val)))
                     self.pub_eccentricity.publish(Float32(data=float(ecc_val)))
                 except Exception:
                     pass
@@ -501,10 +496,8 @@ class DeformityTrackerNode(Node):
                 f_txt = 'ON' if self._calibration_mode else 'OFF'
                 f_color = (0, 255, 0) if self._calibration_mode else (0, 0, 255)  # Green if ON, Red if OFF
                     
-                # Line 1: Eccentricity + point coordinates (if available)
+                # Line 1: Eccentricity (compact, no coordinates here)
                 line1 = f"{prefix}ecc:{ecc_val:.3f}"
-                if point_text:
-                    line1 += f" | {point_text}"
                 line2_label = "| publish_robot(h):"
                 line3_label = "| data_logger(s):"
                 line4_label = "| force_calibration(f):"
@@ -513,6 +506,15 @@ class DeformityTrackerNode(Node):
                 cv2.putText(vis, line1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
                 line1_color = (0, 255, 0) if (0.495 <= float(ecc_val) <= 0.505) else (255, 255, 255)
                 cv2.putText(vis, line1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, line1_color, 1, cv2.LINE_AA)
+                
+                # Display point coordinates at top-right if available (small text)
+                if point_text:
+                    # Calculate position: right-aligned with padding
+                    text_size = cv2.getTextSize(point_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                    text_x = self.width - text_size[0] - 10
+                    text_y = 25
+                    cv2.putText(vis, point_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+                    cv2.putText(vis, point_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
                 
                 # Line 2: publish_robot with colored status
                 cv2.putText(vis, line2_label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
