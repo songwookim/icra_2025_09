@@ -164,7 +164,7 @@ CONFIG_DIR = _PKG_ROOT / "scripts" / "3_model_learning" / "configs" / "stiffness
 # Prefer outputs under the package (…/src/hri_falcon_robot_bridge/outputs) if present,
 # otherwise fall back to project root (…/icra2025/outputs).
 _STIFF_CANDIDATES = [
-    _PKG_ROOT / "outputs" / "stiffness_profiles",
+    _PKG_ROOT / "outputs" / "stiffness_profiles_signaligned",
 ]
 _OUT_CANDIDATES = [
     _PKG_ROOT / "outputs" / "models",
