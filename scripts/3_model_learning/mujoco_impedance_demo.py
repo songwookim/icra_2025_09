@@ -31,6 +31,8 @@ import numpy as np
 import pandas as pd  # type: ignore
 HAS_PANDAS = True
 
+# (Plotting removed per user request)
+
 
 import mujoco
 import mujoco.viewer
@@ -40,6 +42,13 @@ HAS_MUJOCO = True
 
 # Default external MJCF (user provided path)
 DEFAULT_MUJOCO_MODEL_PATH = '/home/songwoo/git/ur_dclaw/dclaw_finger_description/urdf/dclaw_finger_mjcf_finall_inertia_edit.xml'
+
+# Resolve package root for consistent output paths
+_THIS_FILE = Path(__file__).resolve()
+_PKG_ROOT = _THIS_FILE.parents[2]  # .../src/hri_falcon_robot_bridge
+_OUTPUT_ROOT = _PKG_ROOT / 'outputs'
+_PLOT_DIR = _OUTPUT_ROOT / 'plots'  # unused
+DEFAULT_POSITION_LOG_DIR = _PKG_ROOT / 'outputs' / 'logs' / 'success'
 
 
 
@@ -64,99 +73,39 @@ class CartesianImpedanceController:
         except:
             self.ee_site_id = -1
             print(f"[warn] Site '{ee_site_name}' not found; using body 0 position as fallback")
-
-    def set_stiffness(self, K: np.ndarray):
-        k = np.asarray(K, dtype=float).flatten()
-        if k.size >= 3:
-            self.K_cart[:3] = k[:3]
-        else:
-            self.K_cart[:k.size] = k
-
-    def set_target_cartesian(self, x_target: np.ndarray):
-        self.x_desired = np.asarray(x_target, dtype=float).flatten()[:3]
-        self.xd_desired[:] = 0.0
-
-    def get_ee_pos(self) -> np.ndarray:
-        if self.ee_site_id >= 0:
-            return self.data.site_xpos[self.ee_site_id].copy()
-        else:
-            return self.data.xpos[0].copy()
-
-    def get_ee_jacp(self) -> np.ndarray:
-        jacp = np.zeros((3, self.nv), dtype=float)
-        if self.ee_site_id >= 0:
-            mujoco.mj_jacSite(self.model, self.data, jacp, None, self.ee_site_id)  # type: ignore
-        return jacp
-
-    def compute_torque(self) -> np.ndarray:
-        x = self.get_ee_pos()
-        jacp = self.get_ee_jacp()
-        xd = jacp @ self.data.qvel
-        x_err = self.x_desired - x
-        xd_err = self.xd_desired - xd
-        D_cart = 2.0 * np.sqrt(np.clip(self.K_cart, 1e-3, None))
-        F_cart = self.K_cart * x_err + D_cart * xd_err
-        tau = jacp.T @ F_cart
-        tau = np.ones_like(tau)
-        # a = 1.57
-        # idx = 2
-        # tau[idx] = a
-        if tau.size < self.nu:
-            tau_full = np.zeros(self.nu, dtype=float)
-            tau_full[:tau.size] = tau
-            return tau_full
-        return tau[:self.nu]
-
-
 def load_stiffness_csv(csv_path: Path, finger_prefix: str) -> np.ndarray:
+    """Load stiffness sequence (k1,k2,k3) for given finger prefix from CSV."""
     if not csv_path.exists():
         raise RuntimeError(f"Stiffness CSV not found: {csv_path}")
     print(f"[info] Loading stiffness from: {csv_path}")
     df = pd.read_csv(csv_path)  # type: ignore
-    candidates = [f"{finger_prefix}_k1", f"{finger_prefix}_k2", f"{finger_prefix}_k3"]
-    if all(c in df.columns for c in candidates):
-        arr = df[candidates].to_numpy(dtype=float)  # type: ignore
-        return arr
+    cols = [f"{finger_prefix}_k1", f"{finger_prefix}_k2", f"{finger_prefix}_k3"]
+    if all(c in df.columns for c in cols):
+        return df[cols].to_numpy(dtype=float)  # type: ignore
     numeric_cols = list(df.select_dtypes(include=[np.number]).columns)  # type: ignore
     if len(numeric_cols) < 3:
         raise RuntimeError("Not enough numeric columns to derive stiffness")
-    arr = df[numeric_cols[:3]].to_numpy(dtype=float)  # type: ignore
-    return arr
+    return df[numeric_cols[:3]].to_numpy(dtype=float)  # type: ignore
 
-def load_demo_positions(csv_path: Path, finger_prefix: str, center: bool, normalize: bool, scale: float) -> Optional[np.ndarray]:
+
+def load_demo_positions(csv_path: Path, finger_prefix: str) -> Optional[np.ndarray]:
+    """Load end-effector Cartesian positions for a finger prefix (ee_<prefix>_px/py/pz)."""
     if not csv_path.exists():
         return None
-    print(f"[info] Loading positions from: {csv_path}")
     df = pd.read_csv(csv_path)  # type: ignore
     cols = [f"ee_{finger_prefix}_px", f"ee_{finger_prefix}_py", f"ee_{finger_prefix}_pz"]
     if not all(c in df.columns for c in cols):
-        print(f"[warn] Position columns {cols} not found in CSV; available: {list(df.columns)[:10]}")
         return None
-    pos = df[cols].to_numpy(dtype=float)  # type: ignore
-    print(f"[info] Loaded {pos.shape[0]} position samples from CSV")
-    if center:
-        mean_pos = np.mean(pos, axis=0, keepdims=True)
-        pos = pos - mean_pos
-        print(f"[info] Centered positions (mean subtracted: {mean_pos.flatten()})")
-    if normalize:
-        std = np.std(pos, axis=0, keepdims=True)
-        std[std < 1e-9] = 1.0
-        pos = pos / std
-        print(f"[info] Normalized positions (std: {std.flatten()})")
-    pos = pos * scale
-    if scale != 1.0:
-        print(f"[info] Scaled positions by {scale}")
-    return pos
+    return df[cols].to_numpy(dtype=float)  # type: ignore
 
 
 def generate_synthetic_stiffness(num_steps: int) -> np.ndarray:
+    """Generate a simple synthetic stiffness pattern if no CSV provided."""
     t = np.linspace(0, 2 * np.pi, num_steps)
     k1 = 40 + 20 * (np.sin(t) * 0.5 + 0.5)
     k2 = 50 + 25 * (np.sin(t + np.pi/3) * 0.5 + 0.5)
     k3 = 60 + 30 * (np.sin(t + 2*np.pi/3) * 0.5 + 0.5)
     return np.stack([k1, k2, k3], axis=1)
-
-
 def _load_mujoco_model(args) -> tuple:
     """Load external MJCF; raise if missing (fallback removed by user request)."""
     mjcf_path = getattr(args, 'mjcf_path', None) or DEFAULT_MUJOCO_MODEL_PATH
@@ -172,7 +121,24 @@ def run_simulation(args: argparse.Namespace) -> None:
     print(f"[info] Configuration:")
     print(f"  - Finger prefix: {args.finger_prefix}")
     print(f"  - Stiffness CSV: {args.stiffness_csv if args.stiffness_csv else 'None (using default K=50)'}")
-    print(f"  - Position CSV: {args.position_csv if args.position_csv else 'None'}")
+    # Auto-detect latest position CSV if none provided
+    position_csv = args.position_csv
+    if position_csv is None:
+        search_dir = DEFAULT_POSITION_LOG_DIR
+        latest = None
+        if search_dir.exists():
+            candidates = [p for p in search_dir.rglob('*.csv') if p.is_file()]
+            if candidates:
+                latest = max(candidates, key=lambda p: p.stat().st_mtime)
+        if latest is not None:
+            position_csv = latest
+            print(f"[info] Auto-selected latest position CSV: {position_csv}")
+        else:
+            print(f"[warn] No position CSV provided and none found under {search_dir}")
+    else:
+        print(f"[info] Using provided position CSV: {position_csv}")
+
+    # (Analysis/plotting removed)
     
     mj_model, mj_data = _load_mujoco_model(args)
     controller = CartesianImpedanceController(mj_model, mj_data, finger_prefix=args.finger_prefix)
@@ -190,17 +156,23 @@ def run_simulation(args: argparse.Namespace) -> None:
 
     # Load position sequences for all three fingers
     demo_pos_dict = {}  # Dict mapping prefix to position array
-    if args.position_csv:
-        if not args.position_csv.exists():
-            raise RuntimeError(f"Position CSV not found: {args.position_csv}")
+    if position_csv:
+        if not position_csv.exists():
+            raise RuntimeError(f"Position CSV not found: {position_csv}")
         # Load positions for each finger
         for prefix in ["if", "mf", "th"]:
-            pos = load_demo_positions(args.position_csv, prefix, args.demo_center, args.demo_normalize, args.demo_scale)
+            pos = load_demo_positions(position_csv, prefix)
             if pos is not None:
                 demo_pos_dict[prefix] = pos
                 print(f"[info] Loaded demo positions for ee_{prefix}: {pos.shape}")
             else:
-                print(f"[warn] Could not extract position data for ee_{prefix} from {args.position_csv}")
+                print(f"[warn] Could not extract position data for ee_{prefix} from {position_csv}")
+    
+    # Plot EE trajectories if position data loaded
+    if demo_pos_dict:
+        print("[info] Position data loaded:")
+        for prefix, arr in demo_pos_dict.items():
+            print(f"  ee_{prefix}: {arr.shape[0]} samples")
 
     # Apply scaling
     stiffness_seq = stiffness_seq * args.stiffness_scale
@@ -260,7 +232,16 @@ def run_simulation(args: argparse.Namespace) -> None:
 
         while viewer.is_running():
             start = time.time()
-            idx = step if step < num_steps else (step % num_steps if args.repeat else num_steps - 1)
+            
+            # Check if we've reached the end of the sequence
+            if step >= num_steps:
+                if args.repeat:
+                    step = 0  # Reset to beginning
+                else:
+                    print(f"[info] Reached end of sequence ({num_steps} steps). Exiting...")
+                    break
+            
+            idx = step
             
             # Get stiffness from sequence
             K = stiffness_seq[idx]
@@ -300,8 +281,8 @@ def run_simulation(args: argparse.Namespace) -> None:
                 
                 # Simple Cartesian PD control with increased gains
                 # F = Kp * position_error - Kd * velocity
-                Kp = np.diag(K * 1.5)  # Increase proportional gain significantly
-                Kd = np.diag(2.0 * np.sqrt(K * 1.5))  # Critical damping
+                Kp = np.diag(K )  # Increase proportional gain significantly
+                Kd = np.diag(2.0 * np.sqrt(K))  # Critical damping
                 
                 F_cartesian = Kp @ x_error - Kd @ xvel
                 
@@ -359,13 +340,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stiffness-csv", type=Path, default=None, help="CSV with stiffness profiles (<prefix>_k1, <prefix>_k2, <prefix>_k3 columns).")
     p.add_argument("--position-csv", type=Path, default=None, help="CSV with EE position trajectory (ee_<prefix>_px/py/pz columns).")
     p.add_argument("--finger-prefix", type=str, default="th", help="Finger prefix to select (th, if, mf).")
-    p.add_argument("--repeat", action="store_true", help="Loop stiffness sequence when finished.")
+    p.add_argument("--repeat", default=True, action="store_true", help="Loop stiffness sequence when finished.")
     p.add_argument("--synthetic-steps", type=int, default=2000, help="Length of synthetic stiffness if CSV not provided.")
     p.add_argument("--stiffness-scale", type=float, default=1.0, help="Scale factor applied to stiffness values.")
     p.add_argument("--mjcf-path", type=str, default=None, help="Override path for external MJCF model (defaults to user-provided constant).")
-    p.add_argument("--demo-scale", type=float, default=1.0, help="Scale factor for demo positions.")
-    p.add_argument("--demo-center", action="store_true", help="Center demo positions by subtracting mean.")
-    p.add_argument("--demo-normalize", action="store_true", help="Normalize demo positions by std.")
+    # (All plotting-related CLI options removed)
     return p.parse_args()
 
 

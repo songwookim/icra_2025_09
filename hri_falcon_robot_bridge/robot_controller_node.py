@@ -30,7 +30,8 @@ from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32MultiArray, Bool
+from std_msgs.msg import Int32MultiArray, Bool, Float32MultiArray
+import numpy as np
 
 try:
     from .dynamixel_control import DynamixelControl  # type: ignore
@@ -56,9 +57,9 @@ class RobotControllerNode(Node):
         # 설정 로드
         self.config = self._load_config()
         if self.config is None:
-            self.get_logger().error("설정 로드 실패 -> 종료")
-            rclpy.shutdown()
-            sys.exit(1)
+            # 기존에는 즉시 종료했지만, 기본값(Dry-run)으로 계속 진행하도록 변경
+            self.get_logger().error("설정 로드 실패: config.yaml 없음 또는 파싱 실패 -> 기본값으로 계속 진행 (Dry-run 모드)")
+            # cfg_dyn 은 None 으로 남아 Dry-run 경로를 타게 됨
         cfg_dyn = getattr(self.config, 'dynamixel', None) if self.config is not None else None
         default_ids = list(getattr(cfg_dyn, 'ids', [10, 11, 12, 20, 21, 22, 30, 31, 32]))
         default_mode = int(getattr(getattr(cfg_dyn, 'control_modes', {}), 'default_mode', 3))
@@ -83,6 +84,14 @@ class RobotControllerNode(Node):
         self.declare_parameter('units_enabled_topic', '/hand_tracker/units_enabled')
         self.declare_parameter('max_step_units', 20.0)
         self.declare_parameter('safe_mode', True)
+        # Force / current control extension params
+        self.declare_parameter('use_force_control', False)  # true -> torque/current path 활성화
+        self.declare_parameter('torque_topic', '/impedance_control/computed_torques')
+        self.declare_parameter('current_topic', '/dynamixel/goal_current')  # 직접 current 명령 받아 Passthrough 가능
+        self.declare_parameter('force_control_mode', 0)  # Dynamixel current control mode (XM430: 0)
+        self.declare_parameter('current_to_torque', 1.78e-3)  # Nm per mA (Kt)
+        self.declare_parameter('current_unit_mA', 2.69)  # mA per raw current unit
+        self.declare_parameter('max_current_units_fc', 500)  # force control 시 클램프
         # hand enable/disable parameters removed (always enabled)
         self.declare_parameter('initial_val', initial_val_default)
         
@@ -137,6 +146,14 @@ class RobotControllerNode(Node):
         self.units_enabled_topic = str(self.get_parameter('units_enabled_topic').value or '/hand_tracker/units_enabled')
         self.max_step_units = float(self.get_parameter('max_step_units').value or 20.0)
         self.safe_mode = bool(self.get_parameter('safe_mode').value)
+        self.use_force_control = bool(self.get_parameter('use_force_control').value)
+        self.torque_topic = str(self.get_parameter('torque_topic').value)
+        self.current_topic = str(self.get_parameter('current_topic').value)
+        # None 방지 기본값 할당 (ROS param 획득 실패 대비)
+        self.force_control_mode = int(self.get_parameter('force_control_mode').value or 0)
+        self.current_to_torque = float(self.get_parameter('current_to_torque').value or 1.78e-3)
+        self.current_unit_mA = float(self.get_parameter('current_unit_mA').value or 2.69)
+        self.max_current_units_fc = int(self.get_parameter('max_current_units_fc').value or 500)
         self.hand_enabled = True
 
         # Backend 연결 (Dynamixel or Dry-run)
@@ -146,6 +163,13 @@ class RobotControllerNode(Node):
                 self.controller = DynamixelControl(cfg_dyn)
                 self.controller.connect()
                 self.get_logger().info(f"Dynamixel connected (ids={self.ids}, mode={self.mode})")
+                if self.use_force_control and self.mode != self.force_control_mode:
+                    try:
+                        self.get_logger().info(f"Switch operating mode -> current (mode={self.force_control_mode}) for force control")
+                        self.controller.set_operating_mode_all(self.force_control_mode)
+                        self.mode = self.force_control_mode
+                    except Exception as e:
+                        self.get_logger().warn(f"Operating mode switch 실패: {e}")
             except Exception as e:
                 self.get_logger().error(f"Dynamixel init/connect 실패: {e} -> Dry-run")
         elif DynamixelControl is None:
@@ -164,8 +188,15 @@ class RobotControllerNode(Node):
         # 구독 설정
         self.sub_units = self.create_subscription(Int32MultiArray, self.hand_units_topic, self.on_unit_targets, 10)
         self.units_enabled_sub = self.create_subscription(Bool, self.units_enabled_topic, self.on_units_enabled, 10)
+        # Force control: subscribe to torque topic -> convert to current
+        if self.use_force_control:
+            self.sub_torque = self.create_subscription(Float32MultiArray, self.torque_topic, self.on_target_torques, 10)
+            # Optional direct current passthrough (Int16/Int32 both 가능) if external node already converts
+            self.sub_current_passthrough = self.create_subscription(Int32MultiArray, self.current_topic, self.on_direct_currents, 10)
         self.get_logger().info(f"Input source: {self.hand_units_topic} (units)")
         self.get_logger().info(f"Enable source: {self.units_enabled_topic}")
+        if self.use_force_control:
+            self.get_logger().info(f"Force control 활성화 torque_topic={self.torque_topic} current_topic={self.current_topic}")
 
         # 시작 시 초기 포즈로 세팅(한 번)
         try:
@@ -173,6 +204,8 @@ class RobotControllerNode(Node):
             self._send_targets(self.initial_val)
         except Exception as e:
             self.get_logger().warn(f"초기 포즈 적용 실패: {e}")
+        # Torque log throttling counter
+        self._torque_log_counter = 0
 
     # ============================== Utils
     def _load_config(self) -> Optional['DictConfig']:  # type: ignore[name-defined]
@@ -265,6 +298,56 @@ class RobotControllerNode(Node):
         except Exception as e:
             self.get_logger().error(f"set_joint_positions 실패: {e}")
 
+    # ============================== Force Control (Torque -> Current) ==============================
+    def on_target_torques(self, msg: Float32MultiArray):
+        if not self.use_force_control:
+            return
+        torques = np.array(list(msg.data), dtype=float)
+        if len(torques) < len(self.ids):
+            self.get_logger().warn(f"torque length {len(torques)} < ids {len(self.ids)}")
+            return
+        # τ(Nm) -> current units: units = τ / (Kt * mA_per_unit)
+        denom = self.current_to_torque * self.current_unit_mA if self.current_to_torque > 0 else 1e-6
+        current_units = torques / denom
+        current_units = np.clip(current_units, -self.max_current_units_fc, self.max_current_units_fc)
+        int_currents = [int(round(c)) for c in current_units[:len(self.ids)]]
+        log_needed = any(c != 0 for c in int_currents) or (self._torque_log_counter % 50 == 0)
+        if self.controller is None:
+            if log_needed:
+                self.get_logger().info(f"[Dry-run torque->current] {int_currents}")
+            self._torque_log_counter += 1
+            return
+        if self.safe_mode:
+            if log_needed:
+                self.get_logger().info(f"[Safe Mode torque] {int_currents}")
+            self._torque_log_counter += 1
+            return
+        try:
+            # test_torqueinputs(ids, input_torque)
+            self.controller.test_torqueinputs(self.ids, int_currents, log=False)
+        except Exception as e:
+            self.get_logger().error(f"torque inputs 실패: {e}")
+        self._torque_log_counter += 1
+
+    def on_direct_currents(self, msg: Int32MultiArray):
+        if not self.use_force_control:
+            return
+        currents = [int(x) for x in msg.data]
+        if len(currents) < len(self.ids):
+            return
+        currents = currents[:len(self.ids)]
+        currents = [int(max(-self.max_current_units_fc, min(self.max_current_units_fc, c))) for c in currents]
+        if self.controller is None:
+            self.get_logger().info(f"[Dry-run passthrough currents] {currents}")
+            return
+        if self.safe_mode:
+            self.get_logger().info(f"[Safe Mode currents] {currents}")
+            return
+        try:
+            self.controller.test_torqueinputs(self.ids, currents, log=False)
+        except Exception as e:
+            self.get_logger().error(f"current passthrough 실패: {e}")
+
     # enable/disable control removed (always enabled)
 
     # _keyboard_loop removed
@@ -274,9 +357,16 @@ class RobotControllerNode(Node):
 def _run(node: RobotControllerNode):
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            # Ignore double-shutdown race (RCLError: rcl_shutdown already called)
+            pass
 
 def main():  # ROS only / hydra 우회
     rclpy.init()

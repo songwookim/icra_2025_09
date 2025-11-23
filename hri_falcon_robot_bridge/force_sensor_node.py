@@ -28,20 +28,24 @@ class ForceSensorNode(Node):
     def __init__(self) -> None:
         super().__init__('force_sensor_node')
 
-        # Load config
-        self.config = self._load_config()
-        if self.config is None:
-            self.get_logger().error("설정 로드 실패 -> 종료")
-            rclpy.shutdown()
-            sys.exit(1)
-
-        # Parameters
+        # Parameters (declare first so we can override use_mock if config missing)
         self.declare_parameter('publish_rate_hz', 1000.0)
         self.declare_parameter('use_mock', False)
         self.declare_parameter('config_path', 'config.yaml')  # currently unused
 
+        # Load config (graceful fallback)
+        self.config = self._load_config()
+        if self.config is None:
+            self.get_logger().warn("config.yaml 없음 또는 로드 실패 -> mock 데이터로 계속 진행")
+            try:
+                # Force use_mock parameter true
+                from rclpy.parameter import Parameter
+                self.set_parameters([Parameter('use_mock', Parameter.Type.BOOL, True)])
+            except Exception:
+                pass
+
         self.rate = self.get_parameter('publish_rate_hz').get_parameter_value().double_value
-        self.use_mock = self.get_parameter('use_mock').get_parameter_value().bool_value
+        self.use_mock = self.get_parameter('use_mock').get_parameter_value().bool_value or (self.config is None)
         self.num_sensors = 3  # fixed
 
         # Controller init
@@ -160,8 +164,7 @@ class ForceSensorNode(Node):
     def on_timer(self) -> None:
         self.i += 1
         values = self.read_force()
-        if self.controller.calibration_mode :
-            pass
+        # Publish calibration mode safely (controller may be None)
         self._calib_state_pub.publish(Bool(data=getattr(self.controller, 'calibration_mode', False)))
 
         # 각 센서 별 토픽 퍼블리시
@@ -191,18 +194,19 @@ class ForceSensorNode(Node):
                     self.get_logger().debug(f"Loaded config.yaml ({cfg_path})")
                     return cfg
                 else:
-                    # Fallback to plain YAML if OmegaConf is unavailable
                     try:
                         import yaml  # type: ignore
                         with open(cfg_path, 'r') as f:
                             data = yaml.safe_load(f)
                         self.get_logger().debug(f"Loaded config.yaml without OmegaConf ({cfg_path})")
                         return data
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.get_logger().warn(f"YAML 파싱 실패: {e}")
+                        return None
+            return None
         except Exception as e:
-            self.get_logger().warn(f"Config load 실패: {e}")
-            quit(1)
+            self.get_logger().warn(f"Config load 예외: {e}")
+            return None
 
 
 

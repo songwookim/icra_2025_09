@@ -1,0 +1,86 @@
+{
+  "th": {
+    "abs_vs_raw": {
+      "fro_norm": 0.24917037288046692,
+      "fro_rel": 0.14530707584263627,
+      "eig_L2": 0.0010424124217393441,
+      "trace_diff": 0.0005565635585318418,
+      "principal_angle_max_deg": 0.0,
+      "canonical_corr_mean": 1.0
+    },
+    "neg_vs_raw": {
+      "fro_norm": 0.24917037288046692,
+      "fro_rel": 0.14530707584263627,
+      "eig_L2": 0.0010424124217393441,
+      "trace_diff": 0.0005565635585318418,
+      "principal_angle_max_deg": 0.0,
+      "canonical_corr_mean": 1.0
+    },
+    "dims": {
+      "P": [
+        8,
+        60756
+      ],
+      "F_raw": [
+        3,
+        60756
+      ] 
+    }
+  },
+  "if": {
+    "abs_vs_raw": {
+      "fro_norm": 1.333706716808486,
+      "fro_rel": 0.7871243347017891,
+      "eig_L2": 0.028424679671683523,
+      "trace_diff": 0.03250045804957802,
+      "principal_angle_max_deg": 0.0,
+      "canonical_corr_mean": 0.9999999999999996
+    },
+    "neg_vs_raw": {
+      "fro_norm": 1.333706716808486,
+      "fro_rel": 0.7871243347017891,
+      "eig_L2": 0.028424679671683523,
+      "trace_diff": 0.03250045804957802,
+      "principal_angle_max_deg": 0.0,
+      "canonical_corr_mean": 0.9999999999999996
+    },
+    "dims": {
+      "P": [
+        8,
+        60756
+      ],
+      "F_raw": [
+        3,
+        60756
+      ]
+    }
+  },
+  "mf": {
+    "abs_vs_raw": {
+      "fro_norm": 0.31906239379684415,
+      "fro_rel": 0.18677863054421598,
+      "eig_L2": 0.0004949619566017398,
+      "trace_diff": 0.0005940595716142916,
+      "principal_angle_max_deg": 0.0,
+      "canonical_corr_mean": 0.9999999999999999
+    },
+    "neg_vs_raw": {
+      "fro_norm": 0.31906239379684415,
+      "fro_rel": 0.18677863054421598,
+      "eig_L2": 0.0004949619566017398,
+      "trace_diff": 0.0005940595716142916,
+      "principal_angle_max_deg": 0.0,
+      "canonical_corr_mean": 0.9999999999999999
+    },
+    "dims": {
+      "P": [
+        8,
+        60756
+      ],
+      "F_raw": [
+        3,
+        60756
+      ]
+    }
+  }
+}

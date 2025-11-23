@@ -1,0 +1,206 @@
+{
+  "fingers": {
+    "th": {
+      "ranking": [
+        {
+          "channel": "emg_ch2",
+          "spearman": 0.41197146134420776
+        },
+        {
+          "channel": "emg_ch3",
+          "spearman": 0.40052584127613666
+        },
+        {
+          "channel": "emg_ch7",
+          "spearman": 0.3412685282424835
+        },
+        {
+          "channel": "emg_ch4",
+          "spearman": 0.33285994949904263
+        },
+        {
+          "channel": "emg_ch8",
+          "spearman": 0.20221579525169742
+        },
+        {
+          "channel": "emg_ch6",
+          "spearman": 0.17978904350903185
+        },
+        {
+          "channel": "emg_ch1",
+          "spearman": 0.14096323732827395
+        },
+        {
+          "channel": "emg_ch5",
+          "spearman": 0.02364458720785799
+        }
+      ],
+      "subset_channels": [
+        "emg_ch2",
+        "emg_ch3",
+        "emg_ch7",
+        "emg_ch4"
+      ],
+      "weights_full": {
+        "emg_ch1": 4.41051680910005,
+        "emg_ch2": 0.0,
+        "emg_ch3": 0.0,
+        "emg_ch4": 0.0,
+        "emg_ch5": 0.5212037805464771,
+        "emg_ch6": 2.50927202907385,
+        "emg_ch7": 0.20467645139605006,
+        "emg_ch8": 4.200018843855024
+      },
+      "weights_subset": {
+        "emg_ch2": 0.0,
+        "emg_ch3": 0.2762394634800255,
+        "emg_ch7": 0.324181581693427,
+        "emg_ch4": 2.6731253523616116
+      },
+      "metrics": {
+        "full_raw": 0.4310797012301191,
+        "full_mono": 1.0,
+        "subset_raw": 0.41197146134420776,
+        "subset_mono": 0.9812040182317779,
+        "raw_delta": -0.019108239885911316,
+        "mono_delta": -0.01879598176822206
+      }
+    },
+    "if": {
+      "ranking": [
+        {
+          "channel": "emg_ch2",
+          "spearman": 0.3968086949399398
+        },
+        {
+          "channel": "emg_ch7",
+          "spearman": 0.38313223555489234
+        },
+        {
+          "channel": "emg_ch4",
+          "spearman": 0.3687748008935839
+        },
+        {
+          "channel": "emg_ch3",
+          "spearman": 0.258486369156558
+        },
+        {
+          "channel": "emg_ch1",
+          "spearman": 0.2413877726575484
+        },
+        {
+          "channel": "emg_ch6",
+          "spearman": 0.16270413485982987
+        },
+        {
+          "channel": "emg_ch8",
+          "spearman": 0.08739356786362175
+        },
+        {
+          "channel": "emg_ch5",
+          "spearman": 0.004962685218762829
+        }
+      ],
+      "subset_channels": [
+        "emg_ch2",
+        "emg_ch7",
+        "emg_ch4",
+        "emg_ch3"
+      ],
+      "weights_full": {
+        "emg_ch1": 0.23071721041381243,
+        "emg_ch2": 0.0,
+        "emg_ch3": 0.0,
+        "emg_ch4": 0.0,
+        "emg_ch5": 9.131665966835843,
+        "emg_ch6": 5.050930604916579,
+        "emg_ch7": 0.6731645579994039,
+        "emg_ch8": 0.0
+      },
+      "weights_subset": {
+        "emg_ch2": 0.0,
+        "emg_ch7": 0.7905883343045345,
+        "emg_ch4": 3.544991312343098,
+        "emg_ch3": 0.259812051042726
+      },
+      "metrics": {
+        "full_raw": 0.421913352828044,
+        "full_mono": 0.9624950943847196,
+        "subset_raw": 0.3968086949399398,
+        "subset_mono": 0.9624950943847196,
+        "raw_delta": -0.025104657888104176,
+        "mono_delta": 0.0
+      }
+    },
+    "mf": {
+      "ranking": [
+        {
+          "channel": "emg_ch7",
+          "spearman": 0.4066158111713959
+        },
+        {
+          "channel": "emg_ch8",
+          "spearman": 0.2660510419203275
+        },
+        {
+          "channel": "emg_ch3",
+          "spearman": 0.174311634257223
+        },
+        {
+          "channel": "emg_ch4",
+          "spearman": 0.16791568806645496
+        },
+        {
+          "channel": "emg_ch2",
+          "spearman": 0.14616894042970718
+        },
+        {
+          "channel": "emg_ch5",
+          "spearman": 0.12877334589460115
+        },
+        {
+          "channel": "emg_ch1",
+          "spearman": -0.11376897107349275
+        },
+        {
+          "channel": "emg_ch6",
+          "spearman": -0.05796549279117911
+        }
+      ],
+      "subset_channels": [
+        "emg_ch7",
+        "emg_ch8",
+        "emg_ch3",
+        "emg_ch4"
+      ],
+      "weights_full": {
+        "emg_ch1": 0.0,
+        "emg_ch2": 0.0,
+        "emg_ch3": 0.0,
+        "emg_ch4": 0.0,
+        "emg_ch5": 13.56208035625029,
+        "emg_ch6": 0.0,
+        "emg_ch7": 1.2421811997226657,
+        "emg_ch8": 1.039787904685316
+      },
+      "weights_subset": {
+        "emg_ch7": 1.143240058467512,
+        "emg_ch8": 13.736482909869283,
+        "emg_ch3": 0.0,
+        "emg_ch4": 0.4231220660885599
+      },
+      "metrics": {
+        "full_raw": 0.4066158111713959,
+        "full_mono": 0.9769401008502595,
+        "subset_raw": 0.37587083377641806,
+        "subset_mono": 0.9769401008502595,
+        "raw_delta": -0.030744977394977835,
+        "mono_delta": 0.0
+      }
+    }
+  },
+  "meta": {
+    "limit": 5,
+    "top_k": 4
+  }
+}

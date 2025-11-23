@@ -109,6 +109,9 @@ install(PROGRAMS
   hri_falcon_robot_bridge/robot_controller_node.py
   hri_falcon_robot_bridge/deformity_tracker_node.py
   hri_falcon_robot_bridge/emg_node.py
+  hri_falcon_robot_bridge/run_policy_node.py
+  hri_falcon_robot_bridge/impedance_controller_node.py
+  hri_falcon_robot_bridge/torque_impedance_controller_node.py
   scripts/4_policy_depolyer/stiffness_policy_deployer_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -146,6 +149,27 @@ install(PROGRAMS
   hri_falcon_robot_bridge/emg_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME emg_node
+)
+
+# Optional: alias for run_policy_node without .py
+install(PROGRAMS
+  hri_falcon_robot_bridge/run_policy_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME run_policy_node
+)
+
+# Optional: alias for impedance_controller_node without .py
+install(PROGRAMS
+  hri_falcon_robot_bridge/impedance_controller_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME impedance_controller_node
+)
+
+# Optional: alias for torque_impedance_controller_node without .py
+install(PROGRAMS
+  hri_falcon_robot_bridge/torque_impedance_controller_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME torque_impedance_controller_node
 )
 
 # --- Launch (optional) ---

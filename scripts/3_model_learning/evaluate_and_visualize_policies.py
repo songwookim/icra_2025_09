@@ -46,6 +46,15 @@ from run_stiffness_policy_benchmarks import (
     GPBaseline,
 )
 
+# Setup default paths
+_THIS_FILE = Path(__file__).resolve()
+_PKG_ROOT = _THIS_FILE.parents[2]  # .../src/hri_falcon_robot_bridge
+
+DEFAULT_LOG_DIR = _PKG_ROOT / "outputs" / "logs" / "success"
+DEFAULT_STIFFNESS_DIR = _PKG_ROOT / "outputs" / "analysis" / "stiffness_profiles_global_tk"
+DEFAULT_OUT_DIR = _PKG_ROOT / "outputs" / "analysis" / "policy_eval" / "global_tk"
+DEFAULT_UNIFIED_ARTIFACTS = _PKG_ROOT / "outputs" / "models" / "stiffness_policies" / "artifacts"
+
 
 OBS_COLUMNS_DEFAULT = [
     "s1_fx","s1_fy","s1_fz","s2_fx","s2_fy","s2_fz","s3_fx","s3_fy","s3_fz",
@@ -534,12 +543,32 @@ def evaluate_per_finger(artifact_dir: Path, log_dir: Path, stiff_dir: Path, out_
 
 def main():
     ap = argparse.ArgumentParser(description="Evaluate and visualize stiffness policies")
-    ap.add_argument("--unified-artifact-dir", type=Path, required=True)
-    ap.add_argument("--per-finger-artifact-dir", type=Path, default=None)
-    ap.add_argument("--log-dir", type=Path, required=True)
-    ap.add_argument("--stiffness-dir", type=Path, required=True)
-    ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--unified-artifact-dir", type=Path, default=None, 
+                    help=f"Unified mode artifact directory (default: latest in {DEFAULT_UNIFIED_ARTIFACTS})")
+    ap.add_argument("--per-finger-artifact-dir", type=Path, default=None,
+                    help="Per-finger mode artifact directory (optional)")
+    ap.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR,
+                    help=f"Raw demonstration logs directory (default: {DEFAULT_LOG_DIR})")
+    ap.add_argument("--stiffness-dir", type=Path, default=DEFAULT_STIFFNESS_DIR,
+                    help=f"Stiffness profiles directory (default: {DEFAULT_STIFFNESS_DIR})")
+    ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR,
+                    help=f"Output directory for metrics and plots (default: {DEFAULT_OUT_DIR})")
     args = ap.parse_args()
+
+    # Auto-detect latest unified artifact if not specified
+    if args.unified_artifact_dir is None:
+        if DEFAULT_UNIFIED_ARTIFACTS.exists():
+            subdirs = sorted([d for d in DEFAULT_UNIFIED_ARTIFACTS.iterdir() if d.is_dir()])
+            if subdirs:
+                args.unified_artifact_dir = subdirs[-1]  # Use latest
+                print(f"[auto] Using latest unified artifacts: {args.unified_artifact_dir}")
+            else:
+                print(f"[error] No artifact directories found in {DEFAULT_UNIFIED_ARTIFACTS}")
+                return
+        else:
+            print(f"[error] Artifacts directory not found: {DEFAULT_UNIFIED_ARTIFACTS}")
+            print("[hint] Run run_stiffness_policy_benchmarks.py first to generate artifacts")
+            return
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[eval] unified artifacts: {args.unified_artifact_dir}")

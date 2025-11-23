@@ -591,6 +591,10 @@ class SenseGloveMJNode(Node):
         elif not self._mj_poll_warned:
             self._mj_poll_warned = True
             self.get_logger().warn("[MuJoCo] qpos polling yielded no valid joint values.")
+        
+        # Always publish EE pose from MuJoCo regardless of qpos validity
+        if self.ee_pose_publish_enabled and self.ee_pose_source == "mujoco":
+            self._publish_ee_pose()
 
     def _load_orientation_param(self, param_name: str, fallback: Sequence[float]) -> List[float]:
         try:

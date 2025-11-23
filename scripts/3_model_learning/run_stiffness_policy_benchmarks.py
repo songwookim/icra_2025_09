@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 """Benchmark conditional stiffness policies on demonstration data.
+-----------------------------
+#!/bin/bash
+set -euo pipefail
 
+cd /home/songwoo/ros2_ws/icra2025
+
+echo "[1/2] Unified 시작"
+python3 src/hri_falcon_robot_bridge/scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
+  --models all --mode unified
+
+echo "[2/2] Per-finger 시작"
+python3 src/hri_falcon_robot_bridge/scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
+  --models all --mode per-finger
+
+echo "✅ 완료"
+--------------------------
 This script pairs the raw demonstrations under ``outputs/logs/success`` with the
-low-pass stiffness reconstructions stored in ``outputs/analysis/stiffness_profiles``.
+low-pass stiffness reconstructions stored in ``outputs/stiffness_profiles``.
 Observations ``O`` are built from force magnitudes, deformity descriptors, and end
 -effector positions, while actions ``a`` are the reconstructed stiffness profiles.
 
@@ -148,17 +163,12 @@ CONFIG_DIR = _PKG_ROOT / "scripts" / "3_model_learning" / "configs" / "stiffness
 
 # Prefer outputs under the package (…/src/hri_falcon_robot_bridge/outputs) if present,
 # otherwise fall back to project root (…/icra2025/outputs).
-_LOG_CANDIDATES = [
-    _PKG_ROOT / "outputs" / "logs" / "success",
-    _PROJECT_ROOT / "outputs" / "logs" / "success",
-]
 _STIFF_CANDIDATES = [
-    _PKG_ROOT / "outputs" / "analysis" / "stiffness_profiles_global_tk",
-    _PROJECT_ROOT / "outputs" / "analysis" / "stiffness_profiles_global_tk",
+    _PKG_ROOT / "outputs" / "stiffness_profiles",
 ]
 _OUT_CANDIDATES = [
-    _PKG_ROOT / "outputs" / "models" / "stiffness_policies",
-    _PROJECT_ROOT / "outputs" / "models" / "stiffness_policies",
+    _PKG_ROOT / "outputs" / "models",
+    _PROJECT_ROOT / "outputs" / "models",
 ]
 
 
@@ -222,7 +232,6 @@ def _pick_first_existing(paths):
             return p
     return paths[0]
 
-DEFAULT_LOG_DIR = _pick_first_existing(_LOG_CANDIDATES)
 DEFAULT_STIFFNESS_DIR = _pick_first_existing(_STIFF_CANDIDATES)
 DEFAULT_OUTPUT_DIR = _pick_first_existing(_OUT_CANDIDATES)
 DEFAULT_TENSORBOARD_DIR = DEFAULT_OUTPUT_DIR / "tensorboard"
@@ -335,10 +344,37 @@ def build_sequence_dataset(
 
 
 def _resolve_stiffness_csv(stiffness_dir: Path, demo_stem: str) -> Path:
-    cand = stiffness_dir / f"{demo_stem}_paper_profile.csv"
-    if not cand.exists():
-        raise FileNotFoundError(f"Missing stiffness profile for {demo_stem}: {cand}")
-    return cand
+    """Resolve stiffness profile path for a given demonstration stem.
+
+    Supports current naming ("<stem>.csv"), legacy paper suffix
+    ("<stem>_paper_profile.csv"), and augmented variants
+    ("<stem>_augN.csv").
+
+    Resolution priority:
+    1. Base file "<stem>.csv"
+    2. Legacy "<stem>_paper_profile.csv" (backward compatibility)
+    3. First augmented variant "<stem>_aug*.csv" (lowest priority fallback)
+
+    Note: Returning a single augmented file keeps existing loader
+    interface unchanged. If multiple augmented variants should be
+    treated as separate trajectories, loader logic must be extended.
+    """
+    base = stiffness_dir / f"{demo_stem}.csv"
+    if base.exists():
+        return base
+
+    legacy = stiffness_dir / f"{demo_stem}_paper_profile.csv"
+    if legacy.exists():
+        return legacy
+
+    aug_matches = sorted(stiffness_dir.glob(f"{demo_stem}_aug*.csv"))
+    if aug_matches:
+        # Fallback to the first augmented variant if no base/legacy present
+        return aug_matches[0]
+
+    raise FileNotFoundError(
+        f"Missing stiffness profile for {demo_stem}: tried base, legacy, and aug variants in {stiffness_dir}"
+    )
 
 
 def _load_single_demo(log_path: Path, stiffness_dir: Path, stride: int) -> Optional[Trajectory]:
@@ -405,16 +441,81 @@ def _load_single_demo(log_path: Path, stiffness_dir: Path, stride: int) -> Optio
     return Trajectory(name=log_path.stem, observations=obs, actions=act)
 
 
-def load_dataset(log_dir: Path, stiffness_dir: Path, stride: int) -> List[Trajectory]:
+def load_dataset(stiffness_dir: Path, stride: int, include_aug: bool = False) -> List[Trajectory]:
+    """Load demonstrations from stiffness_profiles directory.
+    
+    Each CSV contains both observations and actions. Optionally include *_augN.csv variants.
+    Base files: <stem>_synced.csv or <stem>.csv
+    Augmented: <stem>_synced_augN.csv
+    """
     trajectories: List[Trajectory] = []
-    for csv_path in sorted(log_dir.glob("*.csv")):
-        if csv_path.name.endswith("_paper_profile.csv"):
-            continue
-        traj = _load_single_demo(csv_path, stiffness_dir, stride)
-        if traj is not None:
-            trajectories.append(traj)
+    # Collect all CSV files
+    all_csvs = sorted(stiffness_dir.glob("*.csv"))
+    
+    # Group by base stem (remove _augN suffix)
+    from collections import defaultdict
+    stem_groups = defaultdict(list)
+    for csv_path in all_csvs:
+        stem = csv_path.stem
+        # Extract base stem (remove _augN if present)
+        if "_aug" in stem:
+            base_stem = stem.split("_aug")[0]
+        else:
+            base_stem = stem
+        stem_groups[base_stem].append(csv_path)
+    
+    for base_stem, csv_list in stem_groups.items():
+        # Filter: base only or base + augmented variants
+        if include_aug:
+            paths_to_load = csv_list
+        else:
+            # Only load base (non-aug) file
+            paths_to_load = [p for p in csv_list if "_aug" not in p.stem]
+        
+        for csv_path in paths_to_load:
+            try:
+                df = pd.read_csv(csv_path)
+            except Exception:
+                continue
+            
+            if len(df) < 5:
+                continue
+            
+            # Backward compatibility for ee finger pose columns
+            for finger in ["if", "mf", "th"]:
+                prefix = f"ee_{finger}_"
+                for axis in ["px", "py", "pz"]:
+                    col = prefix + axis
+                    legacy_col = "ee_" + axis
+                    if col not in df.columns and legacy_col in df.columns:
+                        df[col] = df[legacy_col]
+            
+            # Check required columns
+            missing_obs = [c for c in OBS_COLUMNS if c not in df.columns]
+            missing_act = [c for c in ACTION_COLUMNS if c not in df.columns]
+            if missing_obs or missing_act:
+                continue
+            
+            # Extract observations and actions
+            obs = df[OBS_COLUMNS].to_numpy(dtype=float)
+            act = df[ACTION_COLUMNS].to_numpy(dtype=float)
+            
+            # Filter NaN/Inf
+            mask = np.isfinite(obs).all(axis=1) & np.isfinite(act).all(axis=1)
+            obs = obs[mask]
+            act = act[mask]
+            
+            if stride > 1:
+                obs = obs[::stride]
+                act = act[::stride]
+            
+            if obs.shape[0] < 5:
+                continue
+            
+            trajectories.append(Trajectory(name=csv_path.stem, observations=obs, actions=act))
+    
     if not trajectories:
-        raise RuntimeError("No valid demonstrations found. Ensure stiffness profiles exist.")
+        raise RuntimeError(f"No valid demonstrations found in {stiffness_dir}")
     return trajectories
 
 
@@ -496,17 +597,73 @@ def _load_single_demo_per_finger(
     return Trajectory(name=f"{log_path.stem}_{finger}", observations=obs, actions=act)
 
 
-def load_dataset_per_finger(log_dir: Path, stiffness_dir: Path, stride: int, finger: str) -> List[Trajectory]:
-    """Load all demos for a specific finger."""
+def load_dataset_per_finger(stiffness_dir: Path, stride: int, finger: str, include_aug: bool = False) -> List[Trajectory]:
+    """Load finger-specific demonstrations from stiffness_profiles directory."""
+    if finger not in FINGER_CONFIG:
+        raise ValueError(f"Invalid finger: {finger}. Must be one of {list(FINGER_CONFIG.keys())}")
+    
+    obs_cols = FINGER_CONFIG[finger]["obs"]
+    act_cols = FINGER_CONFIG[finger]["act"]
     trajectories: List[Trajectory] = []
-    for csv_path in sorted(log_dir.glob("*.csv")):
-        if csv_path.name.endswith("_paper_profile.csv"):
-            continue
-        traj = _load_single_demo_per_finger(csv_path, stiffness_dir, stride, finger)
-        if traj is not None:
-            trajectories.append(traj)
+    
+    all_csvs = sorted(stiffness_dir.glob("*.csv"))
+    from collections import defaultdict
+    stem_groups = defaultdict(list)
+    for csv_path in all_csvs:
+        stem = csv_path.stem
+        if "_aug" in stem:
+            base_stem = stem.split("_aug")[0]
+        else:
+            base_stem = stem
+        stem_groups[base_stem].append(csv_path)
+    
+    for base_stem, csv_list in stem_groups.items():
+        if include_aug:
+            paths_to_load = csv_list
+        else:
+            paths_to_load = [p for p in csv_list if "_aug" not in p.stem]
+        
+        for csv_path in paths_to_load:
+            try:
+                df = pd.read_csv(csv_path)
+            except Exception:
+                continue
+            
+            if len(df) < 5:
+                continue
+            
+            # Backward compatibility for ee finger pose columns
+            ee_prefix = f"ee_{finger}_"
+            for axis in ["px", "py", "pz"]:
+                new_col = f"{ee_prefix}{axis}"
+                legacy_col = "ee_" + axis
+                if new_col not in df.columns and legacy_col in df.columns:
+                    df[new_col] = df[legacy_col]
+            
+            missing_obs = [c for c in obs_cols if c not in df.columns]
+            missing_act = [c for c in act_cols if c not in df.columns]
+            if missing_obs or missing_act:
+                continue
+            
+            obs = df[obs_cols].to_numpy(dtype=float)
+            act = df[act_cols].to_numpy(dtype=float)
+            
+            mask = np.isfinite(obs).all(axis=1) & np.isfinite(act).all(axis=1)
+            obs = obs[mask]
+            act = act[mask]
+            
+            if stride > 1:
+                obs = obs[::stride]
+                act = act[::stride]
+            
+            if obs.shape[0] < 5:
+                continue
+            
+            traj_name = f"{csv_path.stem}_{finger}"
+            trajectories.append(Trajectory(name=traj_name, observations=obs, actions=act))
+    
     if not trajectories:
-        raise RuntimeError(f"No valid demonstrations found for finger '{finger}'. Ensure stiffness profiles exist.")
+        raise RuntimeError(f"No valid demonstrations found for finger '{finger}' in {stiffness_dir}")
     return trajectories
 
 
@@ -1647,12 +1804,11 @@ def parse_args() -> argparse.Namespace:
     lstm_epochs_default = int(LSTM_GMM_CONFIG.get("epochs", 200))
     lstm_lr_default = float(LSTM_GMM_CONFIG.get("learning_rate", 1e-3))
 
-    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="Directory with raw demonstrations")
     parser.add_argument(
         "--stiffness-dir",
         type=Path,
         default=DEFAULT_STIFFNESS_DIR,
-        help="Directory with *_paper_profile.csv outputs",
+        help="Directory with stiffness profile CSVs (contains both obs and actions)",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for benchmark artifacts")
     parser.add_argument(
@@ -1756,49 +1912,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable CSV export of predictions",
     )
     
-    # Data augmentation arguments
+    # Data augmentation flag (disk-based only)
     parser.add_argument(
         "--augment",
         action="store_true",
-        help="Enable data augmentation to increase training samples",
-    )
-    parser.add_argument(
-        "--augment-num",
-        type=int,
-        default=3,
-        help="Number of augmented copies per demonstration (default: 3)",
-    )
-    parser.add_argument(
-        "--augment-noise-force",
-        type=float,
-        default=0.02,
-        help="Noise std for force sensors (relative, default: 0.02 = 2%%)",
-    )
-    parser.add_argument(
-        "--augment-noise-stiffness",
-        type=float,
-        default=0.05,
-        help="Noise std for stiffness (relative, default: 0.05 = 5%%)",
-    )
-    parser.add_argument(
-        "--augment-scale-force",
-        type=float,
-        nargs=2,
-        default=[0.95, 1.05],
-        help="Force scaling range (min max, default: 0.95 1.05)",
-    )
-    parser.add_argument(
-        "--augment-scale-stiffness",
-        type=float,
-        nargs=2,
-        default=[0.90, 1.10],
-        help="Stiffness scaling range (min max, default: 0.90 1.10)",
-    )
-    parser.add_argument(
-        "--augment-temporal-jitter",
-        type=int,
-        default=3,
-        help="Max temporal jitter in timesteps (default: 3)",
+        help="Include on-disk augmented stiffness profiles (*_augN.csv) as separate trajectories",
+        default=True,
     )
     parser.add_argument(
         "--skip-existing",
@@ -1851,7 +1970,8 @@ def main() -> None:
         models_requested.remove("diffusion")
         models_requested.add("diffusion_c")
     if "all" in models_requested or not models_requested:
-        models_requested = {"gmm", "gmr", "bc", "ibc", "diffusion_c", "diffusion_t", "lstm_gmm", "gp", "mdn"}
+        # 'all' 기본 집합에서 gp, mdn 제외 (요청사항)
+        models_requested = {"gmm", "gmr", "bc", "ibc", "diffusion_c", "diffusion_t", "lstm_gmm"}
     # Exclude any requested heavy models
     if exclude_requested:
         before = sorted(models_requested)
@@ -1890,36 +2010,19 @@ def _resolve_artifact_and_tb_dirs(
     mode: str,
 ) -> Tuple[Path, Optional[Path]]:
     """Return artifact root and tensorboard run dir.
-
-    New 4-way directory separation (unified/per-finger × original/global_TK):
+    
+    Simple 2-way directory separation (unified vs per-finger):
         policy_learning_unified/
-        policy_learning_global_tk_unified/
         policy_learning_per_finger/
-        policy_learning_global_tk_per_finger/
-
-    Backwards compatibility:
-        Create symlinks 'policy_learning' -> 'policy_learning_unified' and
-        'policy_learning_global_tk' -> 'policy_learning_global_tk_unified' when possible.
     """
-    is_global = _is_global_stiffness_dir(stiffness_dir)
-    base_name = "policy_learning_global_tk" if is_global else "policy_learning"
-    # Append mode suffix for new structure
     mode_suffix = "per_finger" if mode == "per-finger" else "unified"
-    full_dir_name = f"{base_name}_{mode_suffix}"
+    full_dir_name = f"policy_learning_{mode_suffix}"
 
-    policy_learning_dir = base_output.parent / full_dir_name
+    # Store mode-specific results directly under `outputs/models/<policy_learning_mode>`
+    policy_learning_dir = base_output / full_dir_name
     ensure_dir(policy_learning_dir)
     artifacts_root = ensure_dir(policy_learning_dir / "artifacts" / timestamp)
     tb_parent = policy_learning_dir / "tensorboard"
-
-    # Backwards compatibility symlinks (best-effort, ignore failures)
-    try:
-        if mode == "unified":
-            legacy = base_output.parent / base_name  # e.g. policy_learning or policy_learning_global_tk
-            if not legacy.exists():
-                legacy.symlink_to(policy_learning_dir, target_is_directory=True)
-    except Exception:
-        pass
 
     tb_run = ensure_dir(tb_parent / timestamp) if SummaryWriter is not None else None
     return artifacts_root, tb_run
@@ -1935,52 +2038,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-    trajectories = load_dataset(args.log_dir, args.stiffness_dir, stride=max(1, args.stride))
-    
-    # Apply data augmentation if requested
-    if args.augment:
-        print(f"\n{'='*80}")
-        print(f"DATA AUGMENTATION ENABLED")
-        print(f"{'='*80}")
-        from augmentation_utils import DataAugmentor, Trajectory as AugTrajectory
-        
-        original_count = len(trajectories)
-        original_samples = sum(len(t.observations) for t in trajectories)
-        
-        augmentor = DataAugmentor(seed=args.seed)
-        augmented_trajectories = []
-        
-        for traj in trajectories:
-            # Convert to augmentation utils Trajectory to avoid type mismatch
-            aug_input = AugTrajectory(
-                name=traj.name,
-                observations=traj.observations,
-                actions=traj.actions,
-            )
-            aug_trajs = augmentor.augment_trajectory(
-                aug_input,
-                obs_columns=OBS_COLUMNS,
-                num_augmentations=args.augment_num,
-                noise_std_force=args.augment_noise_force,
-                noise_std_stiffness=args.augment_noise_stiffness,
-                scale_range_force=tuple(args.augment_scale_force),
-                scale_range_stiffness=tuple(args.augment_scale_stiffness),
-                jitter_timesteps=args.augment_temporal_jitter,
-            )
-            # Convert back to local Trajectory class used by the rest of the pipeline
-            for t in aug_trajs:
-                augmented_trajectories.append(
-                    Trajectory(name=t.name, observations=t.observations, actions=t.actions)
-                )
-        
-        trajectories = augmented_trajectories
-        augmented_count = len(trajectories)
-        augmented_samples = sum(len(t.observations) for t in trajectories)
-        
-        print(f"Original:   {original_count} demos, {original_samples:,} samples")
-        print(f"Augmented:  {augmented_count} demos, {augmented_samples:,} samples")
-        print(f"Factor:     {augmented_count / original_count:.1f}x demos, {augmented_samples / original_samples:.1f}x samples")
-        print(f"{'='*80}\n")
+    trajectories = load_dataset(args.stiffness_dir, stride=max(1, args.stride), include_aug=args.augment)
 
     evaluation_meta: Dict[str, Any]
     if args.eval_demo:
@@ -2848,7 +2906,6 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
 
     summary = {
         "timestamp": timestamp,
-        "log_dir": str(args.log_dir),
         "stiffness_dir": str(args.stiffness_dir),
         "train_samples": int(train_obs.shape[0]),
         "test_samples": int(test_obs.shape[0]),
@@ -2908,7 +2965,12 @@ def run_per_finger_benchmarks(args, models_requested: set) -> None:
         print(f"{'='*80}")
         
         # Load finger-specific data
-        trajectories = load_dataset_per_finger(args.log_dir, args.stiffness_dir, stride=max(1, args.stride), finger=finger)
+        trajectories = load_dataset_per_finger(
+            args.stiffness_dir,
+            stride=max(1, args.stride),
+            finger=finger,
+            include_aug=args.augment,
+        )
         
         # Train/test split
         if args.eval_demo:
@@ -2993,6 +3055,65 @@ def run_per_finger_benchmarks(args, models_requested: set) -> None:
             window,
             test_offsets,
         )
+        
+        # Train GMM/GMR models
+        if {"gmm", "gmr"} & models_requested:
+            print(f"[{finger}] training Gaussian Mixture Models ...")
+            try:
+                gmm_policy = GMMConditional(
+                    obs_dim=train_obs_s.shape[1],
+                    act_dim=train_act_s.shape[1],
+                    n_components=args.gmm_components,
+                    covariance_type=args.gmm_covariance,
+                    reg_covar=args.gmm_reg_covar,
+                )
+                gmm_policy.fit(train_obs_s, train_act_s)
+                
+                # Save GMM artifact
+                gmm_artifact = finger_artifact_dir / "gmm.pkl"
+                gmm_config = {
+                    "obs_dim": train_obs_s.shape[1],
+                    "act_dim": train_act_s.shape[1],
+                    "n_components": args.gmm_components,
+                    "covariance_type": args.gmm_covariance,
+                    "reg_covar": args.gmm_reg_covar,
+                }
+                with gmm_artifact.open("wb") as fh:
+                    pickle.dump({"config": gmm_config, "model": gmm_policy}, fh)
+                finger_manifest["models"]["gmm"] = {
+                    "kind": "gmm",
+                    "path": gmm_artifact.name,
+                }
+                
+                # Evaluate GMM (stochastic sampling)
+                if "gmm" in models_requested:
+                    gmm_metrics = evaluate_gmm(
+                        gmm_policy,
+                        test_obs_s,
+                        test_act_s,
+                        mode="sample",
+                        n_samples=args.gmm_samples,
+                        act_scaler=act_scaler,
+                        act_test_raw=test_act,
+                    )
+                    print(f"[{finger}] gmm rmse={gmm_metrics['rmse']:.4f} mae={gmm_metrics['mae']:.4f} r2={gmm_metrics['r2']:.4f}")
+                    finger_results["gmm"] = gmm_metrics
+                
+                # Evaluate GMR (deterministic regression)
+                if "gmr" in models_requested:
+                    gmr_metrics = evaluate_gmm(
+                        gmm_policy,
+                        test_obs_s,
+                        test_act_s,
+                        mode="regression",
+                        n_samples=1,
+                        act_scaler=act_scaler,
+                        act_test_raw=test_act,
+                    )
+                    print(f"[{finger}] gmr rmse={gmr_metrics['rmse']:.4f} mae={gmr_metrics['mae']:.4f} r2={gmr_metrics['r2']:.4f}")
+                    finger_results["gmr"] = gmr_metrics
+            except Exception as exc:
+                print(f"[{finger}] gmm/gmr training failed: {exc}")
         
         # Train BC model
         if "bc" in models_requested:
@@ -3192,6 +3313,154 @@ def run_per_finger_benchmarks(args, models_requested: set) -> None:
                     diff_c_writer.close()
             except Exception as exc:
                 print(f"[{finger}] diffusion_c training failed: {exc}")
+        
+        # Train Diffusion Temporal model
+        if "diffusion_t" in models_requested:
+            if train_seq_obs.shape[0] == 0 or test_seq_obs.shape[0] == 0:
+                print(f"[{finger}] diffusion_t skipped (insufficient sequence data)")
+            else:
+                print(f"[{finger}] training diffusion policy (temporal) ...")
+                try:
+                    diffusion_t = DiffusionPolicyBaseline(
+                        obs_dim=train_seq_obs.shape[-1],
+                        act_dim=train_seq_act_s.shape[1],
+                        timesteps=args.diffusion_steps,
+                        hidden_dim=args.diffusion_hidden,
+                        lr=args.diffusion_lr,
+                        batch_size=args.diffusion_batch,
+                        epochs=args.diffusion_epochs,
+                        seed=args.seed,
+                        log_name=f"diffusion_t_{finger}",
+                        temporal=True,
+                    )
+                    diff_t_writer = make_writer(run_tensorboard_dir, f"diffusion_t_{finger}")
+                    diffusion_t.fit(train_seq_obs, train_seq_act_s, writer=diff_t_writer, verbose=False)
+                    
+                    # Save model
+                    diffusion_t_artifact = finger_artifact_dir / "diffusion_t.pt"
+                    diffusion_t_config = {
+                        "obs_dim": train_seq_obs.shape[-1],
+                        "act_dim": train_seq_act_s.shape[1],
+                        "timesteps": args.diffusion_steps,
+                        "hidden_dim": args.diffusion_hidden,
+                        "time_dim": diffusion_t.model.time_embed.dim if hasattr(diffusion_t.model.time_embed, "dim") else 64,
+                        "lr": args.diffusion_lr,
+                        "batch_size": args.diffusion_batch,
+                        "epochs": args.diffusion_epochs,
+                        "seed": args.seed,
+                        "temporal": True,
+                        "seq_len": window,
+                    }
+                    torch.save(
+                        {
+                            "config": diffusion_t_config,
+                            "state_dict": {k: v.cpu() for k, v in diffusion_t.model.state_dict().items()},
+                        },
+                        diffusion_t_artifact,
+                    )
+                    finger_manifest["models"]["diffusion_t"] = {
+                        "kind": "diffusion",
+                        "path": diffusion_t_artifact.name,
+                        "temporal": True,
+                        "sampler": "ddpm",
+                        "eta": 0.0,
+                        "seq_len": window,
+                    }
+                    
+                    # Evaluate with DDPM sampler
+                    pred_scaled_t_ddpm = diffusion_t.predict(test_seq_obs, n_samples=4, sampler="ddpm", eta=0.0)
+                    pred_t_ddpm = act_scaler.inverse_transform(pred_scaled_t_ddpm)
+                    metrics_t_ddpm = compute_metrics(test_seq_act_raw, pred_t_ddpm)
+                    metrics_t_ddpm["nll"] = float("nan")
+                    finger_results["diffusion_t_ddpm"] = metrics_t_ddpm
+                    print(f"[{finger}] diffusion_t|ddpm rmse={metrics_t_ddpm['rmse']:.4f} mae={metrics_t_ddpm['mae']:.4f} r2={metrics_t_ddpm['r2']:.4f}")
+                    
+                    # Evaluate with DDIM sampler
+                    diffusion_eta = 1.0
+                    pred_scaled_t_ddim = diffusion_t.predict(test_seq_obs, n_samples=4, sampler="ddim", eta=diffusion_eta)
+                    pred_t_ddim = act_scaler.inverse_transform(pred_scaled_t_ddim)
+                    metrics_t_ddim = compute_metrics(test_seq_act_raw, pred_t_ddim)
+                    metrics_t_ddim["nll"] = float("nan")
+                    finger_results["diffusion_t_ddim"] = metrics_t_ddim
+                    finger_manifest["models"]["diffusion_t_ddim"] = {
+                        "kind": "diffusion",
+                        "path": diffusion_t_artifact.name,
+                        "temporal": True,
+                        "sampler": "ddim",
+                        "eta": diffusion_eta,
+                        "seq_len": window,
+                    }
+                    print(f"[{finger}] diffusion_t|ddim rmse={metrics_t_ddim['rmse']:.4f} mae={metrics_t_ddim['mae']:.4f} r2={metrics_t_ddim['r2']:.4f}")
+                    
+                    if diff_t_writer is not None:
+                        diff_t_writer.flush()
+                        diff_t_writer.close()
+                except Exception as exc:
+                    print(f"[{finger}] diffusion_t training failed: {exc}")
+        
+        # Train IBC model
+        if "ibc" in models_requested:
+            print(f"[{finger}] training IBC baseline ...")
+            try:
+                ibc_batch = args.ibc_batch if args.ibc_batch is not None else args.bc_batch
+                ibc_policy = IBCBaseline(
+                    obs_dim=train_obs_s.shape[1],
+                    act_dim=train_act_s.shape[1],
+                    hidden_dim=args.ibc_hidden,
+                    depth=args.ibc_depth,
+                    lr=args.ibc_lr,
+                    batch_size=ibc_batch,
+                    epochs=args.ibc_epochs,
+                    noise_std=args.ibc_noise_std,
+                    langevin_steps=args.ibc_langevin_steps,
+                    step_size=args.ibc_step_size,
+                    seed=args.seed,
+                    log_name=f"ibc_{finger}",
+                )
+                ibc_writer = make_writer(run_tensorboard_dir, f"ibc_{finger}")
+                ibc_policy.fit(train_obs_s, train_act_s, writer=ibc_writer, verbose=False)
+                
+                # Save IBC model
+                ibc_artifact = finger_artifact_dir / "ibc.pt"
+                ibc_config = {
+                    "obs_dim": train_obs_s.shape[1],
+                    "act_dim": train_act_s.shape[1],
+                    "hidden_dim": args.ibc_hidden,
+                    "depth": args.ibc_depth,
+                    "lr": args.ibc_lr,
+                    "batch_size": ibc_batch,
+                    "epochs": args.ibc_epochs,
+                    "noise_std": args.ibc_noise_std,
+                    "langevin_steps": args.ibc_langevin_steps,
+                    "step_size": args.ibc_step_size,
+                    "seed": args.seed,
+                }
+                torch.save(
+                    {
+                        "config": ibc_config,
+                        "state_dict": {k: v.cpu() for k, v in ibc_policy.model.state_dict().items()},
+                    },
+                    ibc_artifact,
+                )
+                finger_manifest["models"]["ibc"] = {
+                    "kind": "ibc",
+                    "path": ibc_artifact.name,
+                }
+                
+                # Evaluate
+                pred_act_s = ibc_policy.predict(test_obs_s)
+                pred_act = act_scaler.inverse_transform(pred_act_s)
+                
+                metrics = compute_metrics(test_act, pred_act)
+                metrics["nll"] = float("nan")
+                print(f"[{finger}] ibc rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
+                finger_results["ibc"] = metrics
+                
+                if ibc_writer is not None:
+                    ibc_writer.flush()
+                    ibc_writer.close()
+            except Exception as exc:
+                print(f"[{finger}] ibc training failed: {exc}")
         
         # Store results
         all_results[finger] = finger_results

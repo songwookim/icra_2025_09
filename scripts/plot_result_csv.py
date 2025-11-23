@@ -256,7 +256,7 @@ def _find_latest_csv(search_roots):
 
 def main():
     p = argparse.ArgumentParser(description='Plot synced CSV outputs from data_logger_node')
-    p.add_argument('csv', nargs='?', default='/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/analysis/stiffness_profiles_global_tk/20251122_023936_synced_aug4_paper_profile.csv', type=str,
+    p.add_argument('csv', nargs='?', type=str, default='/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/stiffness_profiles_signaligned/20251122_023936_synced_signaligned_aug2.csv',
                    help='Path to CSV (omit to auto-pick latest from outputs/logs)')
     p.add_argument('--save', type=str, default='', help='If set, save figure to this file instead of showing')
     p.add_argument('--force-smooth', type=int, default=0, help='Rolling mean window for |F|,|T| (0=off)')
