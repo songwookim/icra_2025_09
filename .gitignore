@@ -1,2 +1,17 @@
-*.dboutputs/models/
-outputs/models/
+############################################################
+# Global ignore rules for generated / large artifacts
+############################################################
+
+# Database or cache fragments
+*.db
+
+# Ignore ALL generated outputs (logs, analysis, profiles, models, plots, etc.)
+# User wants local-only storage; keep completely out of Git history.
+outputs/
+
+# (Optional) If later you want to track lightweight summaries, you can whitelist:
+# !outputs/reports/
+# !outputs/reports/*.json
+# For now everything under outputs/ is ignored.
+
+# End of file
