@@ -33,24 +33,21 @@ class ForceSensorNode(Node):
         self.declare_parameter('use_mock', False)
         self.declare_parameter('config_path', 'config.yaml')  # currently unused
 
-        # Load config (graceful fallback)
+        # Load config; if unavailable we will NOT publish mock data (strict gating)
         self.config = self._load_config()
         if self.config is None:
-            self.get_logger().warn("config.yaml 없음 또는 로드 실패 -> mock 데이터로 계속 진행")
-            try:
-                # Force use_mock parameter true
-                from rclpy.parameter import Parameter
-                self.set_parameters([Parameter('use_mock', Parameter.Type.BOOL, True)])
-            except Exception:
-                pass
+            self.get_logger().warn("config.yaml 없음 -> 측정 불가 상태. mock 퍼블리시 비활성화 (토픽 미발행).")
 
         self.rate = self.get_parameter('publish_rate_hz').get_parameter_value().double_value
-        self.use_mock = self.get_parameter('use_mock').get_parameter_value().bool_value or (self.config is None)
+        # use_mock 파라미터는 이제 무시: 실제 측정 불가 시 퍼블리시 중단
+        requested_mock = self.get_parameter('use_mock').get_parameter_value().bool_value
+        self.use_mock = False  # 기존 sinusoid 기능 제거
+        self.measurement_available = (self.config is not None)
         self.num_sensors = 3  # fixed
 
         # Controller init
         self.controller = None
-        if not self.use_mock:
+        if self.measurement_available:
             try:
                 if MMS101Controller is not None:
                     self.controller = MMS101Controller(self.config)
@@ -58,10 +55,11 @@ class ForceSensorNode(Node):
                 else:
                     raise RuntimeError('No MMS101Controller implementation available')
             except Exception as e:
-                self.get_logger().error(f'Failed to init controller: {e}')
-                self.use_mock = True
-        if self.use_mock:
-            self.get_logger().warn('Using mock force data.')
+                self.get_logger().error(f'컨트롤러 초기화 실패: {e} -> 측정 불가. 퍼블리시 중단.')
+                self.measurement_available = False
+                self.controller = None
+        if not self.measurement_available:
+            self.get_logger().warn('ForceSensorNode 측정 불가 상태: force 토픽을 발행하지 않습니다.')
 
         # Per-sensor publishers
         self.pub_sensors = [
@@ -96,25 +94,10 @@ class ForceSensorNode(Node):
             if self.controller is not None:
                 setattr(self.controller, 'calibration_mode', True)
 
-    def read_force(self) -> List[Tuple[float, float, float, float, float, float]]:
-        # Returns list of (fx, fy, fz, tx, ty, tz) length == num_sensors
-        if self.use_mock:
-            import math
-            # Mock data for testing
-            # t 값의 증가량을 줄여서 mock 데이터의 변화 주기를 늦춤 (0.0005 -> 0.0001)
-            t = self.i * 0.0001
-            values: List[Tuple[float, float, float, float, float, float]] = []
-            for s in range(self.num_sensors):
-                phase = s * 0.1
-                values.append((
-                    2 * math.sin(t + phase),
-                    0 * math.cos(0.5 * t + phase),
-                    0.,
-                    0.,
-                    0.,
-                    0.
-                ))
-            return values
+    def read_force(self) -> Optional[List[Tuple[float, float, float, float, float, float]]]:
+        """실측 값을 읽어 반환. 측정 불가 시 None 반환 (퍼블리시 스킵)."""
+        if not self.measurement_available:
+            return None
 
         # Real controller path
         try:
@@ -139,7 +122,10 @@ class ForceSensorNode(Node):
             elif len(rows) > self.num_sensors:
                 rows = rows[:self.num_sensors]
 
-            values = [tuple(r[:6]) for r in rows]  # type: ignore
+            values: List[Tuple[float, float, float, float, float, float]] = []
+            for r in rows:
+                fx, fy, fz, tx, ty, tz = r[:6]
+                values.append((float(fx), float(fy), float(fz), float(tx), float(ty), float(tz)))
             self.last_values_list = values
 
             if (self.i % 50) == 0 and len(values) > 0:
@@ -150,20 +136,16 @@ class ForceSensorNode(Node):
                 print()
             return values
         except Exception as e:
-            if (self.i % 200) == 0:
-                self.get_logger().warn(f'Using last values due to error: {e}')
-            # ensure length == num_sensors
-            lv = list(self.last_values_list)
-            if len(lv) < self.num_sensors:
-                while len(lv) < self.num_sensors:
-                    lv.append(lv[-1] if lv else (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
-            elif len(lv) > self.num_sensors:
-                lv = lv[:self.num_sensors]
-            return lv
+            if (self.i % 50) == 0:
+                self.get_logger().warn(f'측정 오류 발생: {e} -> 이번 주기 스킵')
+            return None
 
     def on_timer(self) -> None:
         self.i += 1
         values = self.read_force()
+        if values is None:
+            # 측정 불가이거나 오류 -> 퍼블리시 건너뜀
+            return
         # Publish calibration mode safely (controller may be None)
         self._calib_state_pub.publish(Bool(data=getattr(self.controller, 'calibration_mode', False)))
 
@@ -213,9 +195,13 @@ class ForceSensorNode(Node):
 def main() -> None:
     rclpy.init()
     node = ForceSensorNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

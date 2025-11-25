@@ -113,14 +113,11 @@ class DeformityTrackerNode(Node):
         # RealSense 파이프라인
         self.pipe = None
         self.active_serial = None
-        self._dummy_mode = False
         try:
             self.pipe = self._open_realsense(self.serial_number, self.device_index)
         except Exception as e:
-            # Graceful fallback: dummy publisher instead of crashing
-            self.get_logger().error(f"RealSense 초기화 실패: {e} -> dummy eccentricity publish 모드로 전환")
-            self.pipe = None
-            self._dummy_mode = True
+            self.get_logger().error(f"RealSense 초기화 실패: {e}")
+            raise
 
         # 이미지 캡처 상태
         self.record_video_auto = bool(self.get_parameter('record_video_auto').get_parameter_value().bool_value)
@@ -404,24 +401,6 @@ class DeformityTrackerNode(Node):
 
     # ---------------- Main loop ----------------
     def spin(self):
-        # Dummy mode: just publish zeros at requested FPS
-        if self._dummy_mode:
-            period = 1.0 / max(1, int(self.fps))
-            def _dummy_cb():
-                try:
-                    self.pub_eccentricity.publish(Float32(data=0.0))
-                except Exception:
-                    pass
-            timer = self.create_timer(period, _dummy_cb)
-            try:
-                while rclpy.ok():
-                    rclpy.spin_once(self, timeout_sec=0.05)
-            finally:
-                try:
-                    self.destroy_timer(timer)
-                except Exception:
-                    pass
-            return
         assert self.pipe is not None
         try:
             while rclpy.ok():

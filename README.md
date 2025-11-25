@@ -4,6 +4,34 @@ cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
 sudo vi /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
    # change to 16 -> 1
    
+
+   # 특정 토픽의 메시지 실시간 출력 (force sensor 예시)
+ros2 topic echo /force_sensor/s1/wrench
+
+# EE pose 토픽 확인
+ros2 topic echo /ee_pose_if
+ros2 topic echo /ee_pose_mf
+ros2 topic echo /ee_pose_th
+
+# JointState 확인
+ros2 topic echo /joint_states
+
+# 실행 중인 ROS2 노드 확인
+ros2 node list
+
+# force_sensor 관련 프로세스 확인
+ps aux | grep force_sensor
+
+# 프로세스 강제 종료
+pkill -9 -f force_sensor_node
+
+# 모든 활성 토픽 나열
+ros2 topic list -t
+
+ros2 topic info /force_sensor/s1/wrench -v
+
+pkill -9 -f "ros2|python3.*hri_falcon"
+
 ```
 
 

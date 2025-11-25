@@ -13,10 +13,9 @@ Topics subscribed:
 
 Topics published:
 - `/impedance_control/target_stiffness` (std_msgs/Float32MultiArray) - 9D stiffness [th_k1..k3, if_k1..k3, mf_k1..k3]
-- `/impedance_control/target_attractor` (std_msgs/Float32MultiArray) - 9D attractor EE positions [if_xyz, mf_xyz, th_xyz] (emg_bc 전용)
 
 Parameters:
-- `model_type` (str): bc, diffusion_c, diffusion_t, gmm, gmr, emg_bc
+- `model_type` (str): bc, diffusion_c, diffusion_t, gmm, gmr
 - `mode` (str): unified or per-finger
 - `artifact_dir` (str): path to model artifacts (auto-detect if empty)
 - `rate_hz` (float): control loop rate (default: 50.0)
@@ -107,7 +106,7 @@ class RunPolicyNode(Node):
         self.declare_parameter("model_type", "bc")
         self.declare_parameter("mode", "unified")
         self.declare_parameter("artifact_dir", "")
-        self.declare_parameter("rate_hz", 50.0)
+        self.declare_parameter("rate_hz", 100.0)
         self.declare_parameter("stiffness_scale", 1.0)
         self.declare_parameter("stiffness_min", 0.0)
         self.declare_parameter("stiffness_max", 1000.0)
@@ -124,9 +123,6 @@ class RunPolicyNode(Node):
         self.declare_parameter("ee_pose_th_topic", "/ee_pose_th")
         self.declare_parameter("debug_inputs", True)
         self.declare_parameter("debug_topic_scan", True)
-        # (NEW) Manual start via keyboard
-        self.declare_parameter("manual_start", True)
-        self.declare_parameter("start_key", "p")
 
         # Get parameters (add explicit typing + None fallbacks for static analysis clarity)
         def _p(name: str):
@@ -153,8 +149,9 @@ class RunPolicyNode(Node):
         self.ee_pose_mf_topic: str = str(_p("ee_pose_mf_topic") or "/ee_pose_mf")
         self.ee_pose_th_topic: str = str(_p("ee_pose_th_topic") or "/ee_pose_th")
         self.debug_inputs: bool = bool(_p("debug_inputs") if _p("debug_inputs") is not None else True)
-        self.manual_start: bool = bool(_p("manual_start") if _p("manual_start") is not None else True)
-        self.start_key: str = str(_p("start_key") or "p")
+        # Mock mode removed: always wait for real sensor data
+        self.allow_mock_missing: bool = False
+        self.mock_start_timeout_sec: float = 0.0
 
         # Log resolved sensor topics & core numeric params once
         self.get_logger().info(
@@ -191,10 +188,7 @@ class RunPolicyNode(Node):
             Float32MultiArray, "/impedance_control/target_stiffness", 10
         )
 
-        # (NEW) Publisher for attractor EE positions (emg_bc)
-        self.attractor_pub = self.create_publisher(
-            Float32MultiArray, "/impedance_control/target_attractor", 10
-        )
+        # Attractor publisher (removed emg_bc support)
 
         # Control timer
         period = 1.0 / self.rate_hz
@@ -216,47 +210,15 @@ class RunPolicyNode(Node):
         self._force_logged = [False, False, False]
         self._deform_logged = False
         self._ee_logged = {"if": False, "mf": False, "th": False}
-
-        # (NEW) policy start gate
-        self._started = not self.manual_start
-        self._start_prompted = False
-        if self.manual_start:
-            self._start_thread = threading.Thread(target=self._keyboard_waiter, daemon=True)
-            self._start_thread.start()
+        self._sensor_waiting_logged = False  # One-time sensor waiting warning
 
         self.get_logger().info(
             f"RunPolicy node started: model={self.model_type}, mode={self.mode}, "
             f"rate={self.rate_hz}Hz, artifact={self.artifact_dir}"
         )
-
-    def _keyboard_waiter(self):
-        """Wait for a single key press (start_key) to start policy."""
-        try:
-            if not sys.stdin.isatty():
-                self.get_logger().warn("stdin is not a TTY; auto-starting policy (manual_start ignored)")
-                self._started = True
-                return
-
-            fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-            try:
-                tty.setcbreak(fd)
-                self.get_logger().info(f"Press '{self.start_key}' to START policy predictions …")
-                while rclpy.ok() and not self._started:
-                    # Use select for non-blocking check
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
-                    if rlist:
-                        ch = sys.stdin.read(1)
-                        if ch.lower() == self.start_key.lower():
-                            self._started = True
-                            self.get_logger().info("Policy STARTED by keyboard input")
-                            break
-                    time.sleep(0.05)
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        except Exception as e:
-            self.get_logger().warn(f"Keyboard waiter error: {e}; auto-starting policy")
-            self._started = True
+        # Mock fallback state
+        self._mock_activated = False
+        self._node_start_time = time.time()
 
     def _setup_subscribers(self):
         """Setup ROS topic subscribers for sensor data."""
@@ -408,7 +370,7 @@ class RunPolicyNode(Node):
             self.get_logger().warn("No scalers found - using raw values (may degrade performance)")
 
         # Load model based on type
-        if self.model_type in ["bc", "diffusion_c", "diffusion_t", "emg_bc"]:
+        if self.model_type in ["bc", "diffusion_c", "diffusion_t"]:
             if not TORCH_AVAILABLE:
                 raise RuntimeError(f"PyTorch required for {self.model_type} model but not available")
             self._load_torch_model(artifact_path)
@@ -425,30 +387,26 @@ class RunPolicyNode(Node):
             "bc": "bc.pt",
             "diffusion_c": "diffusion_c.pt",
             "diffusion_t": "diffusion_t.pt",
-            "emg_bc": "emg_bc.pt",
         }
 
         model_path = artifact_path / model_map[self.model_type]
         checkpoint = torch.load(model_path, map_location="cpu")
 
-        if self.model_type in ("bc", "emg_bc"):
+        if self.model_type == "bc":
             # Reconstruct BC model from config
             config = checkpoint.get("config", {})
             obs_dim = config.get("obs_dim", 19)
-            # act_dim: 9 for bc, 18 for emg_bc (x_attr 9 + K_emg 9)
-            default_act_dim = 18 if self.model_type == "emg_bc" else 9
-            act_dim = config.get("act_dim", default_act_dim)
+            act_dim = config.get("act_dim", 9)
             hidden_dim = config.get("hidden_dim", 256)
             depth = config.get("depth", 3)
 
             self.model = BehaviorCloningModel(obs_dim, act_dim, hidden_dim, depth)
-            # Load state_dict (key name might be 'state_dict' or 'model_state_dict')
             state_dict_key = "state_dict" if "state_dict" in checkpoint else "model_state_dict"
             self.model.load_state_dict(checkpoint[state_dict_key])
             self.model.eval()
 
             self.get_logger().info(
-                f"{self.model_type.upper()} model: obs_dim={obs_dim}, act_dim={act_dim}, hidden={hidden_dim}, depth={depth}"
+                f"BC model: obs_dim={obs_dim}, act_dim={act_dim}, hidden={hidden_dim}, depth={depth}"
             )
 
         elif "diffusion" in self.model_type:
@@ -460,19 +418,24 @@ class RunPolicyNode(Node):
 
                 # Reconstruct diffusion model
                 config = checkpoint.get("config", {})
+                # Determine if temporal based on model_type suffix ('c' = False, 't' = True)
+                is_temporal = self.model_type.split("_")[1] == "t" if "_" in self.model_type else False
+                
                 self.model = DiffusionPolicyBaseline(
                     obs_dim=config.get("obs_dim", 19),
                     act_dim=config.get("act_dim", 9),
                     hidden_dim=config.get("hidden_dim", 256),
                     time_dim=config.get("time_dim", 16),
                     timesteps=config.get("timesteps", 100),
-                    model_type=self.model_type.split("_")[1],  # 'c' or 't'
+                    temporal=is_temporal,
                 )
-                self.model.model.load_state_dict(checkpoint["model_state_dict"])
+                # Try different possible keys for state dict
+                state_dict_key = "model_state_dict" if "model_state_dict" in checkpoint else "state_dict"
+                self.model.model.load_state_dict(checkpoint[state_dict_key])
                 self.model.model.eval()
 
                 self.get_logger().info(
-                    f"Diffusion model loaded: {self.model_type}, timesteps={config.get('timesteps')}"
+                    f"Diffusion model loaded: {self.model_type}, timesteps={config.get('timesteps')}, temporal={is_temporal}"
                 )
 
             except ImportError as e:
@@ -497,30 +460,34 @@ class RunPolicyNode(Node):
 
     def _get_observation(self) -> Optional[np.ndarray]:
         """Construct 19D observation vector from current sensor data."""
-        # Check if we have minimum required data
-        if not all(self.forces):
-            return None
-        if self.deform_ecc is None:
-            return None
-        if not all(self.ee_positions.values()):
+        # ALL sensors are REQUIRED: forces, ee_positions, deform_ecc
+        forces_ready = all(f is not None for f in self.forces)
+        ee_ready = all((p is not None and isinstance(p, np.ndarray) and p.size == 3 and np.all(np.isfinite(p)))
+                       for p in self.ee_positions.values())
+        deform_ready = self.deform_ecc is not None and isinstance(self.deform_ecc, (int, float))
+        
+        if not (forces_ready and ee_ready and deform_ready):
             return None
 
         obs = []
 
         # Force features (9D: s1/s2/s3 fx/fy/fz)
         for i in range(3):
-            if self.forces[i]:
-                obs.extend([self.forces[i]["fx"], self.forces[i]["fy"], self.forces[i]["fz"]])
+            f = self.forces[i]
+            if f is not None:
+                obs.extend([f["fx"], f["fy"], f["fz"]])
             else:
+                # Should not happen since we gate on forces_ready
                 obs.extend([0.0, 0.0, 0.0])
 
         # Eccentricity (1D)
-        obs.append(self.deform_ecc)
+        obs.append(self.deform_ecc if self.deform_ecc is not None else 0.0)
 
         # End-effector positions (9D: if/mf/th px/py/pz)
         for finger in ["if", "mf", "th"]:
-            if self.ee_positions[finger] is not None:
-                obs.extend(self.ee_positions[finger].tolist())
+            pos = self.ee_positions[finger]
+            if pos is not None:
+                obs.extend(pos.tolist())
             else:
                 obs.extend([0.0, 0.0, 0.0])
 
@@ -572,28 +539,7 @@ class RunPolicyNode(Node):
 
         return stiffness.flatten()
 
-    def _predict_action(self, obs: np.ndarray) -> np.ndarray:
-        """General action prediction for variable act_dim (used for emg_bc)."""
-        if self.obs_scaler:
-            obs_scaled = self.obs_scaler.transform(obs.reshape(1, -1))
-        else:
-            obs_scaled = obs.reshape(1, -1)
-
-        if self.model_type in ("bc", "emg_bc"):
-            with torch.no_grad():
-                obs_t = torch.from_numpy(obs_scaled.astype(np.float32))
-                act_scaled = self.model(obs_t).numpy()
-        elif "diffusion" in self.model_type:
-            act_scaled = self.model.predict(obs_scaled, n_samples=1, sampler="ddpm", eta=0.0)
-        else:
-            # Fallback
-            act_scaled = np.zeros((1, 9), dtype=np.float32)
-
-        if self.act_scaler:
-            act = self.act_scaler.inverse_transform(act_scaled)
-        else:
-            act = act_scaled
-        return act.flatten()
+    # _predict_action removed (emg_bc no longer supported)
 
     def _smooth_stiffness(self, stiffness: np.ndarray) -> np.ndarray:
         """Apply moving average smoothing to stiffness predictions."""
@@ -605,29 +551,23 @@ class RunPolicyNode(Node):
         # Compute mean
         smoothed = np.mean(self.stiffness_buffer, axis=0)
 
-        # Apply scale and clamp
-        smoothed = smoothed * self.stiffness_scale
+        # Clamp stiffness (NOTE: stiffness_scale removed - use launch param or model scaling instead)
         smoothed = np.clip(smoothed, self.stiffness_min, self.stiffness_max)
 
         return smoothed
 
     def _scan_topics(self):
         try:
-            if all(self.forces) and self.deform_ecc is not None and all(self.ee_positions.values()):
+            # Ready check without ambiguous NumPy truth-values
+            forces_ready = all(f is not None for f in self.forces)
+            ee_ready = all(v is not None for v in self.ee_positions.values())
+            if forces_ready and self.deform_ecc is not None and ee_ready:
                 # All ready; stop scanning
                 if self._scan_timer is not None:
                     self._scan_timer.cancel()
                 return
+            # Check which topics are absent from the ROS graph
             names_types = dict(self.get_topic_names_and_types())
-            self._scan_counter += 1
-            missing_force_indices = [i for i in range(3) if self.forces[i] is None]
-            missing_ee = [k for k,v in self.ee_positions.items() if v is None]
-            force_topics_present = [t for t in self.force_topics if t in names_types]
-            ee_topics_present = [t for t in [self.ee_pose_if_topic, self.ee_pose_mf_topic, self.ee_pose_th_topic] if t in names_types]
-            self.get_logger().info(
-                f"[scan#{self._scan_counter}] present(force)={force_topics_present} present(ee)={ee_topics_present} missing_force_idx={missing_force_indices} missing_ee={missing_ee}"
-            )
-            # Extra hint if topics absent entirely
             absent_force = [t for t in self.force_topics if t not in names_types]
             absent_ee = [t for t in [self.ee_pose_if_topic, self.ee_pose_mf_topic, self.ee_pose_th_topic] if t not in names_types]
             if absent_force:
@@ -642,20 +582,27 @@ class RunPolicyNode(Node):
         # Get current observation
         obs = self._get_observation()
 
+        # [DEBUG] Log callback entry
+        # if self._log_counter % int(self.rate_hz * 2) == 0:
+        #     self.get_logger().info(f"[DEBUG] _control_callback entered, obs={'OK' if obs is not None else 'NONE'}")
+
         if obs is None:
             # Not enough data yet - skip this iteration
-            if self._log_counter % int(self.rate_hz * 2) == 0:  # Log every 2 seconds
+            self._log_counter += 1  # Increment first so the condition below works
+            if not self._sensor_waiting_logged:
                 missing = []
-                if not all(self.forces):
-                    missing.append("forces")
+                if not all(f is not None for f in self.forces):
+                    missing_idx = [i for i in range(3) if self.forces[i] is None]
+                    missing.append(f"forces({[self.force_topics[i] for i in missing_idx]})")
                 if self.deform_ecc is None:
-                    missing.append("deform_ecc")
-                if not all(self.ee_positions.values()):
-                    missing.append("ee_poses")
+                    missing.append(f"deform_ecc({self.deform_topic})")
+                if not all(v is not None for v in self.ee_positions.values()):
+                    missing_fingers = [k for k,v in self.ee_positions.items() if v is None]
+                    missing.append(f"ee_poses({missing_fingers})")
                 self.get_logger().warn(
-                    f"Waiting for sensor data: {', '.join(missing)}", throttle_duration_sec=2.0
+                    f"[INIT] Waiting for sensor data: {', '.join(missing)}"
                 )
-            self._log_counter += 1
+                self._sensor_waiting_logged = True
             return
 
         try:
@@ -663,72 +610,39 @@ class RunPolicyNode(Node):
                 self.get_logger().info("All required sensor inputs received -> starting policy predictions")
                 self._ready_announced = True
 
-            # Manual start gate
-            if not self._started:
-                if not self._start_prompted:
-                    self.get_logger().info(f"Waiting for key '{self.start_key}' to start policy …")
-                    self._start_prompted = True
-                # Throttle reminder
-                self._log_counter += 1
-                if self._log_counter % int(self.rate_hz * 2) == 0:
-                    self.get_logger().info(f"Still waiting for '{self.start_key}' …")
-                return
+            # [DEBUG] Before prediction
+            # if self._log_counter % int(self.rate_hz * 2) == 0:
+            #     self.get_logger().info(f"[DEBUG] About to predict stiffness")
 
-            if self.model_type == "emg_bc":
-                act = self._predict_action(obs)
-                # Split: x_attr(9) + K_emg(9)
-                if act.shape[0] < 18:
-                    raise RuntimeError(f"emg_bc expected 18-dim action, got {act.shape[0]}")
-                x_attr = act[:9]
-                stiffness = act[9:18]
+            # Predict stiffness (9D)
+            stiffness = self._predict_stiffness(obs)
 
-                # Smooth/clamp stiffness as before
-                stiffness = self._smooth_stiffness(stiffness)
+            # Smooth and scale
+            stiffness = self._smooth_stiffness(stiffness)
 
-                # Publish attractor
-                attr_msg = Float32MultiArray()
-                attr_msg.data = x_attr.tolist()
-                self.attractor_pub.publish(attr_msg)
+            # [DEBUG] Before publish
+            # if self._log_counter % int(self.rate_hz * 2) == 0:
+            #     self.get_logger().info(f"[DEBUG] About to publish stiffness: {stiffness[:3]}")
 
-                # Publish stiffness
-                st_msg = Float32MultiArray()
-                st_msg.data = stiffness.tolist()
-                self.stiffness_pub.publish(st_msg)
+            # Publish stiffness command
+            msg = Float32MultiArray()
+            msg.data = stiffness.tolist()
+            self.stiffness_pub.publish(msg)
 
-                # Log occasionally
-                self._log_counter += 1
-                if self._log_counter % int(self.rate_hz) == 0:
-                    self.get_logger().info(
-                        f"Attr(IF|MF|TH)=[{x_attr[0]:.3f},{x_attr[1]:.3f},{x_attr[2]:.3f}]|"
-                        f"[{x_attr[3]:.3f},{x_attr[4]:.3f},{x_attr[5]:.3f}]|"
-                        f"[{x_attr[6]:.3f},{x_attr[7]:.3f},{x_attr[8]:.3f}] | "
-                        f"K: TH=[{stiffness[0]:.1f},{stiffness[1]:.1f},{stiffness[2]:.1f}], "
-                        f"IF=[{stiffness[3]:.1f},{stiffness[4]:.1f},{stiffness[5]:.1f}], "
-                        f"MF=[{stiffness[6]:.1f},{stiffness[7]:.1f},{stiffness[8]:.1f}]"
-                    )
-            else:
-                # Predict stiffness (9D)
-                stiffness = self._predict_stiffness(obs)
+            # # Log every publish (매 퍼블리시마다 즉시 출력)
+            # self.get_logger().info(
+            #     f"K_cmd: ["
+            #     f"TH: {stiffness[0]:5.1f} {stiffness[1]:5.1f} {stiffness[2]:5.1f} | "
+            #     f"IF: {stiffness[3]:5.1f} {stiffness[4]:5.1f} {stiffness[5]:5.1f} | "
+            #     f"MF: {stiffness[6]:5.1f} {stiffness[7]:5.1f} {stiffness[8]:5.1f}]"
+            # )
 
-                # Smooth and scale
-                stiffness = self._smooth_stiffness(stiffness)
-
-                # Publish stiffness command
-                msg = Float32MultiArray()
-                msg.data = stiffness.tolist()
-                self.stiffness_pub.publish(msg)
-
-                # Log occasionally
-                self._log_counter += 1
-                if self._log_counter % int(self.rate_hz) == 0:  # Log every second
-                    self.get_logger().info(
-                        f"Stiffness: TH=[{stiffness[0]:.1f},{stiffness[1]:.1f},{stiffness[2]:.1f}], "
-                        f"IF=[{stiffness[3]:.1f},{stiffness[4]:.1f},{stiffness[5]:.1f}], "
-                        f"MF=[{stiffness[6]:.1f},{stiffness[7]:.1f},{stiffness[8]:.1f}]"
-                    )
+            # Increment counter after successful prediction
+            self._log_counter += 1
 
         except Exception as e:
-            self.get_logger().error(f"Control callback error: {e}", throttle_duration_sec=1.0)
+            # self.get_logger().error(f"Control callback error: {e}", throttle_duration_sec=1.0)
+            pass
 
 
 def main(args=None):

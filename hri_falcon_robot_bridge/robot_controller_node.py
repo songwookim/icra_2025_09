@@ -30,15 +30,19 @@ from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32MultiArray, Bool, Float32MultiArray
+from std_msgs.msg import Int32MultiArray, Bool, Float32MultiArray, UInt8
+from sensor_msgs.msg import JointState
 import numpy as np
 
 try:
     from .dynamixel_control import DynamixelControl  # type: ignore
-except Exception:
+except ImportError:
+    # Relative import fails when run as script (expected), try absolute
     try:
         from dynamixel_control import DynamixelControl  # type: ignore
-    except Exception:  # pragma: no cover
+    except ImportError as e:
+        print(f"[ERROR] DynamixelControl module not found: {e}")
+        print("[ERROR] Robot control will not be available - running in dry-run mode")
         DynamixelControl = None  # type: ignore
 
 try:  # optional
@@ -83,17 +87,27 @@ class RobotControllerNode(Node):
         self.declare_parameter('hand_units_topic', DEFAULT_UNITS_TOPIC)
         self.declare_parameter('units_enabled_topic', '/hand_tracker/units_enabled')
         self.declare_parameter('max_step_units', 20.0)
-        self.declare_parameter('safe_mode', True)
+        self.declare_parameter('demo_playback_stage_topic', '/demo_playback_stage')
+
         # Force / current control extension params
         self.declare_parameter('use_force_control', False)  # true -> torque/current path 활성화
+        self.declare_parameter('safe_mode', True)
         self.declare_parameter('torque_topic', '/impedance_control/computed_torques')
         self.declare_parameter('current_topic', '/dynamixel/goal_current')  # 직접 current 명령 받아 Passthrough 가능
         self.declare_parameter('force_control_mode', 0)  # Dynamixel current control mode (XM430: 0)
         self.declare_parameter('current_to_torque', 1.78e-3)  # Nm per mA (Kt)
         self.declare_parameter('current_unit_mA', 2.69)  # mA per raw current unit
-        self.declare_parameter('max_current_units_fc', 500)  # force control 시 클램프
+        self.declare_parameter('max_current_units_pos', 500)  # test_torqueinputs 양수 리미트
+        self.declare_parameter('max_current_units_neg', 500)  # test_torqueinputs 음수 리미트
+        # 정책 준비 전까지 force control 입력을 지연할지 여부
+        self.declare_parameter('defer_force_control_until_policy', True)
         # hand enable/disable parameters removed (always enabled)
         self.declare_parameter('initial_val', initial_val_default)
+        # Joint state publish params
+        self.declare_parameter('publish_joint_state', True)
+        self.declare_parameter('joint_state_topic', '/robot_controller/joint_state')
+        self.declare_parameter('units_per_rad', 4096.0 / (2.0 * math.pi))  # conversion scale
+        self.declare_parameter('joint_state_rate_hz', 0.0)  # if >0 use timer, else publish on updates
         
 
         # 유틸
@@ -114,6 +128,7 @@ class RobotControllerNode(Node):
         ids_param = _ensure_list(self.get_parameter('ids').value) or default_ids
         self.ids = [int(x) for x in ids_param]
         self.mode = int(self.get_parameter('mode').value or default_mode)
+        self.position_mode = self.mode
 
         joint_param = _ensure_list(self.get_parameter('hand_joint_order').value)
         self.hand_joint_order = [str(x).lower() for x in (joint_param or DEFAULT_JOINT_ORDER)]
@@ -153,25 +168,47 @@ class RobotControllerNode(Node):
         self.force_control_mode = int(self.get_parameter('force_control_mode').value or 0)
         self.current_to_torque = float(self.get_parameter('current_to_torque').value or 1.78e-3)
         self.current_unit_mA = float(self.get_parameter('current_unit_mA').value or 2.69)
-        self.max_current_units_fc = int(self.get_parameter('max_current_units_fc').value or 500)
+        self.max_current_units_pos = int(self.get_parameter('max_current_units_pos').value or 500)
+        self.max_current_units_neg = int(self.get_parameter('max_current_units_neg').value or 500)
         self.hand_enabled = True
+        self.defer_force_control_until_policy = bool(self.get_parameter('defer_force_control_until_policy').value)
+        self.publish_joint_state = bool(self.get_parameter('publish_joint_state').value)
+        self.joint_state_topic = str(self.get_parameter('joint_state_topic').value or '/robot_controller/joint_state')
+        self.units_per_rad = float(self.get_parameter('units_per_rad').value or (4096.0 / (2.0 * math.pi)))
+        self.joint_state_rate_hz = float(self.get_parameter('joint_state_rate_hz').value or 0.0)
+        self.demo_stage_topic = str(self.get_parameter('demo_playback_stage_topic').value or '/demo_playback_stage')
+        self._joint_state_pub_counter = 0
+        # 정책 예측값 수신 여부
+        self._policy_ready: bool = False
+        self._policy_wait_log_counter: int = 0
+        self._demo_stage = 0
+        self._force_mode_active = False
+        self._torque_playback_enabled = not self.use_force_control
 
         # Backend 연결 (Dynamixel or Dry-run)
         self.controller = None
         if DynamixelControl is not None and cfg_dyn is not None:
             try:  # pragma: no cover
-                self.controller = DynamixelControl(cfg_dyn)
+                self.controller = DynamixelControl(cfg_dyn, max_current_pos=self.max_current_units_pos, max_current_neg=self.max_current_units_neg)
                 self.controller.connect()
-                self.get_logger().info(f"Dynamixel connected (ids={self.ids}, mode={self.mode})")
-                if self.use_force_control and self.mode != self.force_control_mode:
-                    try:
-                        self.get_logger().info(f"Switch operating mode -> current (mode={self.force_control_mode}) for force control")
-                        self.controller.set_operating_mode_all(self.force_control_mode)
-                        self.mode = self.force_control_mode
-                    except Exception as e:
-                        self.get_logger().warn(f"Operating mode switch 실패: {e}")
+                self.get_logger().info(f"Dynamixel connected (ids={self.ids}, initial_mode={self.mode})")
+                
+                # 초기화: Position control mode로 명시적 설정 및 torque enable
+                self.get_logger().info("[INIT] Setting up position control mode for initialization...")
+                position_mode = 3  # Extended Position Control Mode
+                try:
+                    self.controller.disable_torque()
+                    self.controller.set_operating_mode_all(position_mode)
+                    self.mode = position_mode
+                    self.position_mode = position_mode
+                    self.controller.enable_torque()
+                    self.get_logger().info(f"[INIT] Position control mode set (mode={position_mode}), torque enabled")
+                except Exception as e:
+                    self.get_logger().error(f"Failed to set position mode: {e}")
+                    
             except Exception as e:
                 self.get_logger().error(f"Dynamixel init/connect 실패: {e} -> Dry-run")
+                self.controller = None
         elif DynamixelControl is None:
             self.get_logger().warn('dynamixel_control 모듈 없음 -> Dry-run')
         else:
@@ -185,46 +222,116 @@ class RobotControllerNode(Node):
         # keyboard toggle removed
         self._units_enabled_log_state: Optional[bool] = None
 
-        # 구독 설정
-        self.sub_units = self.create_subscription(Int32MultiArray, self.hand_units_topic, self.on_unit_targets, 10)
-        self.units_enabled_sub = self.create_subscription(Bool, self.units_enabled_topic, self.on_units_enabled, 10)
-        # Force control: subscribe to torque topic -> convert to current
+        # 구독 설정: use_force_control에 따라 다른 입력 구독
         if self.use_force_control:
-            self.sub_torque = self.create_subscription(Float32MultiArray, self.torque_topic, self.on_target_torques, 10)
-            # Optional direct current passthrough (Int16/Int32 both 가능) if external node already converts
-            self.sub_current_passthrough = self.create_subscription(Int32MultiArray, self.current_topic, self.on_direct_currents, 10)
-        self.get_logger().info(f"Input source: {self.hand_units_topic} (units)")
-        self.get_logger().info(f"Enable source: {self.units_enabled_topic}")
-        if self.use_force_control:
-            self.get_logger().info(f"Force control 활성화 torque_topic={self.torque_topic} current_topic={self.current_topic}")
+            # Force control mode: torque/current 입력 구독
+            self.sub_torque = self.create_subscription(Float32MultiArray, self.torque_topic, self.subscribe_target_torques, 10)
+            self.sub_current_passthrough = self.create_subscription(Int32MultiArray, self.current_topic, self.subscribe_direct_currents, 10)
+            # 정책 출력 구독하여 첫 값 수신 후 force control 활성화
+            if self.defer_force_control_until_policy:
+                self.sub_policy_pred = self.create_subscription(Float32MultiArray, '/stiffness_policy/predicted', self.subscribe_policy_predicted, 10)
+            self.get_logger().info(f"[MODE] Force control: torque_topic={self.torque_topic}, current_topic={self.current_topic}")
+        else:
+            # Position control mode: units 입력 구독
+            self.sub_units = self.create_subscription(Int32MultiArray, self.hand_units_topic, self.subscribe_unit_targets, 10)
+            self.units_enabled_sub = self.create_subscription(Bool, self.units_enabled_topic, self.subscribe_units_enabled, 10)
+            self.get_logger().info(f"[MODE] Position control: units_topic={self.hand_units_topic}, enable_topic={self.units_enabled_topic}")
 
-        # 시작 시 초기 포즈로 세팅(한 번)
+        self.demo_stage_sub = None
+        if self.use_force_control and self.demo_stage_topic:
+            self.demo_stage_sub = self.create_subscription(UInt8, self.demo_stage_topic, self.subscribe_demo_stage, 10)
+            self.get_logger().info(f"[MODE] Demo playback stage subscribed: topic={self.demo_stage_topic}")
+        elif self.use_force_control:
+            self._torque_playback_enabled = True
+            self.get_logger().warn("[MODE] demo_playback_stage_topic unset -> force control enabled immediately")
+
+        # Joint state publisher & state buffers (must initialize before _send_targets)
+        self.joint_state_pub = None
+        self._last_qpos: Optional[List[float]] = None
+        self._last_qpos_time: Optional[float] = None
+        if self.publish_joint_state:
+            self.joint_state_pub = self.create_publisher(JointState, self.joint_state_topic, 10)
+            self.get_logger().info(f"[INIT] JointState publisher CREATED: topic={self.joint_state_topic}")
+        else:
+            self.get_logger().warn("[INIT] JointState publishing is DISABLED")
+
+        # 시작 시 초기 포즈로 세팅 (항상 position mode에서 수행)
+        # Controller 없어도 _send_targets 호출 (dry-run 로깅 위해)
         try:
-            self.get_logger().info(f"Apply initial posture: {self.initial_val}")
+            self.get_logger().info(f"[INIT] Applying initial posture: {self.initial_val[:3]}...")
             self._send_targets(self.initial_val)
+            if self.controller is not None:
+                self.get_logger().info("[INIT] Initial posture applied successfully")
+                # 로봇이 초기 포즈로 이동할 시간을 주기 위해 2초 대기
+                import time
+                self.get_logger().info("[INIT] Waiting 2 seconds for robot to reach initial pose...")
+                time.sleep(2.0)
+                self.get_logger().info("[INIT] Initial pose settling time completed")
+            else:
+                self.get_logger().warn("[INIT] Dry-run mode - initial pose logged but not sent to hardware")
         except Exception as e:
-            self.get_logger().warn(f"초기 포즈 적용 실패: {e}")
+            self.get_logger().error(f"초기 포즈 적용 실패: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+        
+        # Force control mode will be enabled when demo stage>=1 (or immediately if no stage topic)
+        if self.use_force_control and not self.demo_stage_topic:
+            self._switch_to_force_mode()
+        
         # Torque log throttling counter
         self._torque_log_counter = 0
+        
+        # Timer to republish JointState at regular intervals (for continuous monitoring)
+        if self.publish_joint_state:
+            self._joint_state_republish_rate = 30.0  # Hz
+            self.create_timer(1.0 / self._joint_state_republish_rate, self._republish_joint_state)
+            self.get_logger().info(f"[INIT] JointState republish timer created: rate={self._joint_state_republish_rate}Hz")
+
+        # 초기에는 정책이 올 때까지 force control 입력 무시
+        if self.use_force_control and self.defer_force_control_until_policy:
+            self.get_logger().info("Force control deferred until first policy prediction is received.")
 
     # ============================== Utils
     def _load_config(self) -> Optional['DictConfig']:  # type: ignore[name-defined]
+        if OmegaConf is None:
+            self.get_logger().error("OmegaConf 미설치 -> config 사용 불가")
+            return None
+            
+        # Try ament_index first (for installed package)
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            pkg_share = get_package_share_directory('hri_falcon_robot_bridge')
+            cfg_path = os.path.join(pkg_share, 'robot_parameter', 'config.yaml')
+            self.get_logger().info(f"[Config] Trying ament_index path: {cfg_path}")
+            
+            if os.path.exists(cfg_path):
+                cfg = OmegaConf.load(cfg_path)
+                self.get_logger().info(f"[Config] Loaded from ament_index: {cfg_path}")
+                return cfg
+            else:
+                self.get_logger().error(f"[Config] File not found: {cfg_path}")
+        except Exception as e:
+            self.get_logger().warn(f"[Config] ament_index failed: {e}")
+        
+        # Fallback to source directory (for development)
         try:
             pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             cfg_path = os.path.join(pkg_dir, 'resource', 'robot_parameter', 'config.yaml')
-            if os.path.exists(cfg_path) and OmegaConf is not None:
+            self.get_logger().info(f"[Config] Trying source path: {cfg_path}")
+            
+            if os.path.exists(cfg_path):
                 cfg = OmegaConf.load(cfg_path)
-                self.get_logger().debug(f"Loaded config.yaml ({cfg_path})")
+                self.get_logger().info(f"[Config] Loaded from source: {cfg_path}")
                 return cfg
-            if not os.path.exists(cfg_path):
-                self.get_logger().error(f"Config 파일 없음: {cfg_path}")
-            elif OmegaConf is None:
-                self.get_logger().error("OmegaConf 미설치 -> config 사용 불가")
+            else:
+                self.get_logger().error(f"[Config] Source file not found: {cfg_path}")
         except Exception as e:
-            self.get_logger().warn(f"Config load 실패: {e}")
+            self.get_logger().error(f"[Config] Source path load failed: {e}")
+        
+        return None
 
     # ============================== Hand Units (Int32MultiArray, 9 elems)
-    def on_unit_targets(self, msg: Int32MultiArray):
+    def subscribe_unit_targets(self, msg: Int32MultiArray):
         units_in = [int(x) for x in (msg.data or [])]
         if not units_in and self._last_targets is None:
             self.get_logger().info("No units yet -> apply initial posture once")
@@ -236,6 +343,7 @@ class RobotControllerNode(Node):
 
         if not self.hand_enabled:
             if self._last_targets is None:
+                self.get_logger().warn(f"[Hand DISABLED] Received units {units_in[:3]}... but hand_enabled=False. Press 'h' in sense_glove_mj_node to enable.")
                 idle_targets = [self._clip_target(i, base[i]) for i in range(n)]
                 self._send_targets(idle_targets)
             return
@@ -250,7 +358,7 @@ class RobotControllerNode(Node):
 
         self._send_targets(final_targets)
 
-    def on_units_enabled(self, msg: Bool):
+    def subscribe_units_enabled(self, msg: Bool):
         new_state = bool(msg.data)
         if self._units_enabled_log_state is None or new_state != self._units_enabled_log_state:
             status = 'ENABLED' if new_state else 'DISABLED'
@@ -281,74 +389,236 @@ class RobotControllerNode(Node):
         return out
 
     def _send_targets(self, targets: List[int]):
+        """Position control: 목표 위치(units)를 Dynamixel에 전송"""
+        self.get_logger().info(f"[_send_targets] Called with targets={targets[:3]}... (total {len(targets)} values)")
         targets = self._safe_step_limit(targets)
         self._last_targets = list(targets)
         self.get_logger().debug('final ' + ', '.join(f"ID{self.ids[i]}={targets[i]}" for i in range(len(targets))))
+        
         if self.controller is None:
-            self.get_logger().info(f"robot is not connected -> dry-run {targets}")
+            self.get_logger().warn(f"[Dry-run Position] No controller - targets={targets[:3]}...")
+            if self.publish_joint_state:
+                self.publish_joint_state_message(targets)
             return
-        try:  # pragma: no cover
-            if self.safe_mode:
-                self.get_logger().info(f"[Safe Mode] {targets} ")
-                return
-            else :
-                self.get_logger().info(f"[Safe Mode] {targets} ")
-                self.controller.set_joint_positions(targets)
-                
+        
+        try:
+            self.get_logger().info(f"[Position Control] Calling set_joint_positions with targets: {targets[:3]}...")
+            self.controller.set_joint_positions(targets)
+            self.get_logger().info(f"[Position Control] set_joint_positions completed successfully")
+            if self.publish_joint_state:
+                self.publish_joint_state_message(targets)
         except Exception as e:
             self.get_logger().error(f"set_joint_positions 실패: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            if self.publish_joint_state:
+                self.publish_joint_state_message(targets)
 
-    # ============================== Force Control (Torque -> Current) ==============================
-    def on_target_torques(self, msg: Float32MultiArray):
+    # ============================== Demo Playback Stage (Position ↔ Force) ==============================
+    def _switch_to_force_mode(self) -> None:
         if not self.use_force_control:
             return
+        if self._force_mode_active and self.mode == self.force_control_mode:
+            return
+        if self.controller is None:
+            self._force_mode_active = True
+            self.mode = self.force_control_mode
+            self.get_logger().info("[MODE] (Dry-run) Force control mode marked active")
+            return
+        try:
+            import time
+            self.get_logger().info(f"[MODE] Switching to force control (mode={self.force_control_mode})")
+            self.controller.disable_torque()
+            time.sleep(0.05)  # Allow Dynamixel to process disable command
+            self.controller.set_operating_mode_all(self.force_control_mode)
+            time.sleep(0.05)  # Allow mode change to settle
+            # Retry enable_torque up to 3 times
+            for attempt in range(3):
+                try:
+                    self.controller.enable_torque()
+                    break
+                except Exception as retry_e:
+                    if attempt < 2:
+                        self.get_logger().warn(f"[MODE] Torque enable retry {attempt+1}/3: {retry_e}")
+                        time.sleep(0.1)
+                    else:
+                        raise
+            self.mode = self.force_control_mode
+            self._force_mode_active = True
+            self.get_logger().info("[MODE] Force control mode active, torque re-enabled")
+        except Exception as e:
+            self.get_logger().error(f"Force control mode switch 실패: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+
+    def _switch_to_position_mode(self) -> None:
+        if not self._force_mode_active:
+            return
+        if self.controller is None:
+            self._force_mode_active = False
+            self.mode = self.position_mode
+            self.get_logger().info("[MODE] (Dry-run) Position control mode restored")
+            return
+        try:
+            import time
+            self.get_logger().info(f"[MODE] Restoring position control (mode={self.position_mode})")
+            self.controller.disable_torque()
+            time.sleep(0.05)  # Allow Dynamixel to process disable command
+            self.controller.set_operating_mode_all(self.position_mode)
+            time.sleep(0.05)  # Allow mode change to settle
+            # Retry enable_torque up to 3 times
+            for attempt in range(3):
+                try:
+                    self.controller.enable_torque()
+                    break
+                except Exception as retry_e:
+                    if attempt < 2:
+                        self.get_logger().warn(f"[MODE] Torque enable retry {attempt+1}/3: {retry_e}")
+                        time.sleep(0.1)
+                    else:
+                        raise
+            self.mode = self.position_mode
+            self._force_mode_active = False
+            self.get_logger().info("[MODE] Position control mode active, torque re-enabled")
+        except Exception as e:
+            self.get_logger().error(f"Position control mode restore 실패: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+
+    def subscribe_demo_stage(self, msg: UInt8):
+        if not self.use_force_control:
+            return
+        new_stage = int(msg.data)
+        if new_stage == self._demo_stage:
+            return
+        prev = self._demo_stage
+        self._demo_stage = new_stage
+        self.get_logger().info(f"[DEMO_STAGE] {prev} -> {new_stage}")
+
+        if new_stage <= 0:
+            self._torque_playback_enabled = False
+            self._switch_to_position_mode()
+        else:
+            # Stage 1 (initial pose) and beyond should both run in force control mode so the impedance
+            # controller can actively drive to the published pose before playback begins.
+            self._switch_to_force_mode()
+            self._torque_playback_enabled = True
+
+    def _send_currents(self, currents: List[int]):
+        """Force control: 목표 current(units)를 Dynamixel에 전송"""
+        # Current는 step limit 없이 바로 적용 (임피던스 제어 특성상 급격한 변화 필요)
+        currents = [int(max(-self.max_current_units_neg, min(self.max_current_units_pos, c))) for c in currents]
+        
+        if self.controller is None:
+            # self.get_logger().info(f"[Dry-run Current] currents={currents[:3]}...")
+            return
+        
+        if self.safe_mode:
+        #     # 주기적 로깅 (너무 noisy 방지)
+        #     if self._torque_log_counter % 5000 == 0:
+        #         self.get_logger().info(f"[SAFE MODE] Current blocked: {currents[:3]}...")
+            return
+        
+        try:
+            self.controller.test_torqueinputs(self.ids, currents, log=False)
+        except Exception as e:
+            self.get_logger().error(f"test_torqueinputs 실패: {e}")
+
+    # ============================== Force Control (Torque -> Current) ==============================
+    def subscribe_target_torques(self, msg: Float32MultiArray):
+        """Torque 입력을 current로 변환하여 전송 (use_force_control=True일 때만 호출됨)"""
+        if self.use_force_control and not self._torque_playback_enabled:
+            return
+        if self.defer_force_control_until_policy and not self._policy_ready:
+            return
+        
         torques = np.array(list(msg.data), dtype=float)
         if len(torques) < len(self.ids):
             self.get_logger().warn(f"torque length {len(torques)} < ids {len(self.ids)}")
             return
+        
         # τ(Nm) -> current units: units = τ / (Kt * mA_per_unit)
         denom = self.current_to_torque * self.current_unit_mA if self.current_to_torque > 0 else 1e-6
         current_units = torques / denom
-        current_units = np.clip(current_units, -self.max_current_units_fc, self.max_current_units_fc)
         int_currents = [int(round(c)) for c in current_units[:len(self.ids)]]
-        log_needed = any(c != 0 for c in int_currents) or (self._torque_log_counter % 50 == 0)
-        if self.controller is None:
-            if log_needed:
-                self.get_logger().info(f"[Dry-run torque->current] {int_currents}")
-            self._torque_log_counter += 1
-            return
-        if self.safe_mode:
-            if log_needed:
-                self.get_logger().info(f"[Safe Mode torque] {int_currents}")
-            self._torque_log_counter += 1
-            return
-        try:
-            # test_torqueinputs(ids, input_torque)
-            self.controller.test_torqueinputs(self.ids, int_currents, log=False)
-        except Exception as e:
-            self.get_logger().error(f"torque inputs 실패: {e}")
+        
+        self._send_currents(int_currents)
         self._torque_log_counter += 1
 
-    def on_direct_currents(self, msg: Int32MultiArray):
-        if not self.use_force_control:
+    def subscribe_direct_currents(self, msg: Int32MultiArray):
+        """Current를 직접 입력 (use_force_control=True일 때만 호출됨)"""
+        if self.use_force_control and not self._torque_playback_enabled:
             return
+        # Safe mode만 체크, policy 대기 로직 제거
         currents = [int(x) for x in msg.data]
         if len(currents) < len(self.ids):
             return
         currents = currents[:len(self.ids)]
-        currents = [int(max(-self.max_current_units_fc, min(self.max_current_units_fc, c))) for c in currents]
-        if self.controller is None:
-            self.get_logger().info(f"[Dry-run passthrough currents] {currents}")
+        
+        self._send_currents(currents)
+
+    # ============================== Joint State Publishing ==============================
+    def publish_joint_state_message(self, targets_units: List[int]) -> None:
+        if not self.publish_joint_state or self.joint_state_pub is None:
             return
-        if self.safe_mode:
-            self.get_logger().info(f"[Safe Mode currents] {currents}")
-            return
-        try:
-            self.controller.test_torqueinputs(self.ids, currents, log=False)
-        except Exception as e:
-            self.get_logger().error(f"current passthrough 실패: {e}")
+        now = self.get_clock().now().nanoseconds / 1e9
+        # Publish units directly as position
+        qpos = [float(u) for u in targets_units]
+        # Velocity estimation
+        if self._last_qpos is not None and self._last_qpos_time is not None:
+            dt = max(1e-6, now - self._last_qpos_time)
+            qvel = [(qpos[i] - self._last_qpos[i]) / dt for i in range(len(qpos))]
+        else:
+            qvel = [0.0] * len(qpos)
+        self._last_qpos = list(qpos)
+        self._last_qpos_time = now
+        self._joint_state_pub_counter += 1
+        # 로그는 100번마다 한 번씩만 (30Hz면 약 3초마다)
+        # if self._joint_state_pub_counter % 100 == 0:
+        #     print(f"[JointState publish #{self._joint_state_pub_counter}] t={now:.6f} pos={qpos[:3]}... vel={qvel[:3]}")
+        #     self.get_logger().info(f"[JointState publish #{self._joint_state_pub_counter}] pos={qpos[:3]}... vel={qvel[:3]}")
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = self.hand_joint_order[:len(qpos)]
+        msg.position = qpos
+        msg.velocity = qvel
+        self.joint_state_pub.publish(msg)
+
+    def _republish_joint_state(self) -> None:
+        """Timer callback to republish last joint state at regular intervals."""
+        # Force control mode에서는 실제 Dynamixel 위치를 읽어서 publish
+        if self.controller is not None and self.use_force_control and self.mode == self.force_control_mode:
+            try:
+                # 실제 Dynamixel 현재 위치 읽기
+                current_positions = self.controller.get_joint_positions()
+                if current_positions:
+                    self.publish_joint_state_message(current_positions)
+            except Exception as e:
+                # 읽기 실패 시 마지막 타겟값 사용
+                if self._last_targets is not None:
+                    self.publish_joint_state_message(self._last_targets)
+        elif self._last_targets is not None:
+            # Position control mode에서는 마지막 타겟값 사용
+            self.publish_joint_state_message(self._last_targets)
+
+    # joint_state_rate_hz 타이머 기반 퍼블리시 완전 제거
 
     # enable/disable control removed (always enabled)
+
+    def subscribe_policy_predicted(self, msg: Float32MultiArray):
+        """첫 정책 예측 수신 시 force control 활성화."""
+        if self._policy_ready:
+            return
+        self._policy_ready = True
+        self.get_logger().info("Policy prediction received -> enabling force control inputs now.")
+        # 필요 시 여기서 추가 안전 초기화 혹은 모드 스위치 재시도 가능
+        if self.controller is not None and self.use_force_control and self.mode != self.force_control_mode:
+            try:
+                self.get_logger().info(f"(Deferred) Switch operating mode -> current (mode={self.force_control_mode})")
+                self.controller.set_operating_mode_all(self.force_control_mode)
+                self.mode = self.force_control_mode
+            except Exception as e:
+                self.get_logger().warn(f"Deferred operating mode switch 실패: {e}")
 
     # _keyboard_loop removed
 

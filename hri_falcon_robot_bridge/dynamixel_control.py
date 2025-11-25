@@ -5,13 +5,25 @@ from dynamixel_sdk import *  # Uses Dynamixel SDK library
 import numpy as np  
 
 class DynamixelControl:
-    def __init__(self, config):
+    def __init__(self, config, max_current_pos=500, max_current_neg=500):
         self.cfg = config
+        self.max_current_pos = max_current_pos
+        self.max_current_neg = max_current_neg
         self.portHandler = PortHandler(self.cfg.device_name)
         self.packetHandler = PacketHandler(self.cfg.protocol_version)
-        self.old_settings = termios.tcgetattr(sys.stdin.fileno())
+        # Only save terminal settings if stdin is a TTY
+        try:
+            if sys.stdin.isatty():
+                self.old_settings = termios.tcgetattr(sys.stdin.fileno())
+            else:
+                self.old_settings = None
+        except:
+            self.old_settings = None
 
     def getch(self):
+        if self.old_settings is None:
+            # Not a TTY, can't use getch
+            return None
         fd = sys.stdin.fileno()
         try:
             tty.setraw(fd)
@@ -237,9 +249,10 @@ class DynamixelControl:
     def test_torqueinputs(self, ids, input_torque, log=False):
         ADDR_GOAL_CURRENT = self.cfg.control_table.ADDR_GOAL_CURRENT
         for idx,id in enumerate(ids):
-            print(idx)
-            if abs(input_torque.any()) >= 10 :
-                print(f"Torque input is too high")
+            # print(idx)
+            # Check against asymmetric limits
+            if input_torque[idx] > self.max_current_pos or input_torque[idx] < -self.max_current_neg:
+                print(f"Torque input out of range: {input_torque[idx]} (limits: -{self.max_current_neg} to +{self.max_current_pos})")
                 return
             dxl_comm_result, dxl_error = self.packetHandler.write2ByteTxRx(
                 self.portHandler, id, ADDR_GOAL_CURRENT, input_torque[idx])

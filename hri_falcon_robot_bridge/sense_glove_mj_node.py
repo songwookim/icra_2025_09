@@ -290,14 +290,15 @@ class SenseGloveMJNode(Node):
         self.qpos_topic = "/hand_tracker/qpos"
         self.qpos_pub = self.create_publisher(JointState, self.qpos_topic, 10)
 
+        # EE pose publishers always created (ignore enable flag for unconditional publish)
         self.ee_pose_pub_if = None
         self.ee_pose_pub_mf = None
         self.ee_pose_pub_th = None
-        if self.ee_pose_publish_enabled and self.ee_pose_topic_if:
+        if self.ee_pose_topic_if:
             self.ee_pose_pub_if = self.create_publisher(PoseStamped, self.ee_pose_topic_if, 10)
-        if self.ee_pose_publish_enabled and self.ee_pose_topic_mf:
+        if self.ee_pose_topic_mf:
             self.ee_pose_pub_mf = self.create_publisher(PoseStamped, self.ee_pose_topic_mf, 10)
-        if self.ee_pose_publish_enabled and self.ee_pose_topic_th:
+        if self.ee_pose_topic_th:
             self.ee_pose_pub_th = self.create_publisher(PoseStamped, self.ee_pose_topic_th, 10)
 
         self.zero_srv = self.create_service(Trigger, "set_zero", self._handle_zero_request)
@@ -358,6 +359,11 @@ class SenseGloveMJNode(Node):
         self._log_key_shortcuts()
         self._publish_units_state(initial=True)
         self._publish_baseline_units(initial=True)
+        # Unconditional periodic EE pose publish (20Hz)
+        try:
+            self._ee_pose_timer = self.create_timer(0.05, self._publish_ee_pose)
+        except Exception:
+            self._ee_pose_timer = None
 
         # Enable runtime parameter updates for joint_weights
         try:
@@ -592,9 +598,8 @@ class SenseGloveMJNode(Node):
             self._mj_poll_warned = True
             self.get_logger().warn("[MuJoCo] qpos polling yielded no valid joint values.")
         
-        # Always publish EE pose from MuJoCo regardless of qpos validity
-        if self.ee_pose_publish_enabled and self.ee_pose_source == "mujoco":
-            self._publish_ee_pose()
+        # Unconditional EE pose publish attempt
+        self._publish_ee_pose()
 
     def _load_orientation_param(self, param_name: str, fallback: Sequence[float]) -> List[float]:
         try:
@@ -1100,33 +1105,30 @@ class SenseGloveMJNode(Node):
             except Exception as exc:
                 self._mj_viewer = None
                 self.get_logger().warn(f"[MuJoCo] viewer start failed, continuing headless: {exc}")
-        # Identify EE pose handles if requested
-        if self.ee_pose_publish_enabled:
-            try:
-                if self.ee_pose_mj_site_if:
-                    sid = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_if)  # type: ignore[attr-defined]
-                    if sid >= 0:
-                        self._ee_site_id = int(sid)
-                        self.get_logger().info(f"[EE] MuJoCo site(IF): {self.ee_pose_mj_site_if} (id={self._ee_site_id})")
-                if self._ee_site_id is None and self.ee_pose_mj_body:
-                    bid = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_BODY, self.ee_pose_mj_body)  # type: ignore[attr-defined]
-                    if bid >= 0:
-                        self._ee_body_id = int(bid)
-                        self.get_logger().info(f"[EE] MuJoCo body: {self.ee_pose_mj_body} (id={self._ee_body_id})")
-                # MF site ID lookup
-                if self.ee_pose_mj_site_mf:
-                    sid_mf = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_mf)  # type: ignore[attr-defined]
-                    if sid_mf >= 0:
-                        self._ee_site_id_mf = int(sid_mf)
-                        self.get_logger().info(f"[EE] MuJoCo site(MF): {self.ee_pose_mj_site_mf} (id={self._ee_site_id_mf})")
-                # Thumb site ID lookup
-                if self.ee_pose_mj_site_th:
-                    sid_th = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_th)  # type: ignore[attr-defined]
-                    if sid_th >= 0:
-                        self._ee_site_id_th = int(sid_th)
-                        self.get_logger().info(f"[EE] MuJoCo site(TH): {self.ee_pose_mj_site_th} (id={self._ee_site_id_th})")
-            except Exception as exc:
-                self.get_logger().warn(f"[EE] MuJoCo identifiers lookup failed: {exc}")
+        # Identify EE pose handles (always attempt; unconditional publish desired)
+        try:
+            if self.ee_pose_mj_site_if:
+                sid = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_if)  # type: ignore[attr-defined]
+                if sid >= 0:
+                    self._ee_site_id = int(sid)
+                    self.get_logger().info(f"[EE] MuJoCo site(IF): {self.ee_pose_mj_site_if} (id={self._ee_site_id})")
+            if self._ee_site_id is None and self.ee_pose_mj_body:
+                bid = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_BODY, self.ee_pose_mj_body)  # type: ignore[attr-defined]
+                if bid >= 0:
+                    self._ee_body_id = int(bid)
+                    self.get_logger().info(f"[EE] MuJoCo body: {self.ee_pose_mj_body} (id={self._ee_body_id})")
+            if self.ee_pose_mj_site_mf:
+                sid_mf = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_mf)  # type: ignore[attr-defined]
+                if sid_mf >= 0:
+                    self._ee_site_id_mf = int(sid_mf)
+                    self.get_logger().info(f"[EE] MuJoCo site(MF): {self.ee_pose_mj_site_mf} (id={self._ee_site_id_mf})")
+            if self.ee_pose_mj_site_th:
+                sid_th = mj.mj_name2id(self._mj_model, mj.mjtObj.mjOBJ_SITE, self.ee_pose_mj_site_th)  # type: ignore[attr-defined]
+                if sid_th >= 0:
+                    self._ee_site_id_th = int(sid_th)
+                    self.get_logger().info(f"[EE] MuJoCo site(TH): {self.ee_pose_mj_site_th} (id={self._ee_site_id_th})")
+        except Exception as exc:
+            self.get_logger().warn(f"[EE] MuJoCo identifiers lookup failed: {exc}")
 
     def _apply_to_mujoco(self, smoothed_qpos: List[List[float]]) -> None:
         if not self._mj_enabled or self._mj_model is None or self._mj_data is None:
@@ -1170,8 +1172,8 @@ class SenseGloveMJNode(Node):
             except Exception:
                 pass
 
-        if self.ee_pose_publish_enabled and self.ee_pose_source == "mujoco":
-            self._publish_ee_pose()
+        # Unconditional EE pose publish attempt
+        self._publish_ee_pose()
 
     def _capture_zero_reference(self) -> bool:
         updated_any = False
@@ -1220,13 +1222,15 @@ class SenseGloveMJNode(Node):
         if lines:
             self.get_logger().info("[QPOS]\n" + "\n".join(lines))
     def _publish_ee_pose(self) -> None:
-        if self._mj_data is None:
-            return
+        """Publish EE poses unconditionally.
 
+        If MuJoCo data unavailable -> publish zero poses.
+        Missing individual site -> that finger publishes zeros.
+        """
         timestamp = self.get_clock().now().to_msg()
 
-        def _send_pose(pub: Optional[Any], position: Optional[Sequence[float]]) -> None:
-            if pub is None or position is None:
+        def _send_pose(pub: Optional[Any], position: Sequence[float]) -> None:
+            if pub is None:
                 return
             try:
                 msg = PoseStamped()
@@ -1243,52 +1247,54 @@ class SenseGloveMJNode(Node):
             except Exception:
                 pass
 
-        main_pose: Optional[Sequence[float]] = None
+        zero = (0.0, 0.0, 0.0)
+        if self._mj_data is None:
+            self._last_ee_pose = zero
+            _send_pose(self.ee_pose_pub_if, zero)
+            _send_pose(self.ee_pose_pub_mf, zero)
+            _send_pose(self.ee_pose_pub_th, zero)
+            return
+
+        # IF pose (site preferred, body fallback)
+        if_pose = zero
         if self._ee_site_id is not None:
             try:
-                main_pose = self._mj_data.site_xpos[self._ee_site_id]
+                raw = self._mj_data.site_xpos[self._ee_site_id]
+                if_pose = (float(raw[0]), float(raw[1]), float(raw[2]))
             except Exception:
-                main_pose = None
+                if_pose = zero
         elif self._ee_body_id is not None:
             try:
-                main_pose = self._mj_data.xpos[self._ee_body_id]
+                raw = self._mj_data.xpos[self._ee_body_id]
+                if_pose = (float(raw[0]), float(raw[1]), float(raw[2]))
             except Exception:
-                main_pose = None
-        elif not self._ee_mj_warned:
-            self.get_logger().warn("[EE] MuJoCo site/body not configured; skipping EE pose publish.")
-            self._ee_mj_warned = True
-
-        if main_pose is not None:
-            try:
-                self._last_ee_pose = (
-                    float(main_pose[0]),
-                    float(main_pose[1]),
-                    float(main_pose[2])
-                )
-            except Exception:
-                self._last_ee_pose = None
+                if_pose = zero
         else:
-            self._last_ee_pose = None
+            if not self._ee_mj_warned:
+                self.get_logger().warn("[EE] No MuJoCo site/body resolved; publishing zeros.")
+                self._ee_mj_warned = True
+        self._last_ee_pose = if_pose
+        _send_pose(self.ee_pose_pub_if, if_pose)
 
-        _send_pose(self.ee_pose_pub_if, main_pose)
-
-        # MF finger pose (separate from IF)
-        mf_pose: Optional[Sequence[float]] = None
+        # MF pose
+        mf_pose = zero
         if self._ee_site_id_mf is not None:
             try:
-                mf_pose = self._mj_data.site_xpos[self._ee_site_id_mf]
+                raw = self._mj_data.site_xpos[self._ee_site_id_mf]
+                mf_pose = (float(raw[0]), float(raw[1]), float(raw[2]))
             except Exception:
-                mf_pose = None
+                mf_pose = zero
         _send_pose(self.ee_pose_pub_mf, mf_pose)
 
-        # Thumb pose
-        thumb_pose: Optional[Sequence[float]] = None
+        # TH pose
+        th_pose = zero
         if self._ee_site_id_th is not None:
             try:
-                thumb_pose = self._mj_data.site_xpos[self._ee_site_id_th]
+                raw = self._mj_data.site_xpos[self._ee_site_id_th]
+                th_pose = (float(raw[0]), float(raw[1]), float(raw[2]))
             except Exception:
-                thumb_pose = None
-        _send_pose(self.ee_pose_pub_th, thumb_pose)
+                th_pose = zero
+        _send_pose(self.ee_pose_pub_th, th_pose)
 
     def _on_logger_state(self, msg: Bool) -> None:
         try:

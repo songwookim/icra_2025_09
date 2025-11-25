@@ -977,7 +977,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifact-dir",
         type=Path,
-        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_unified/artifacts/20251124_033503",
+        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_unified/artifacts/20251124_183103",
         help="Optional explicit artifact directory (timestamped run). If omitted, latest run is auto-selected per mode.",
     )
     parser.add_argument(

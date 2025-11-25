@@ -1240,10 +1240,14 @@ if torch is not None:
         def predict(self, obs: np.ndarray, n_samples: int = 1) -> np.ndarray:
             obs_tensor = torch.from_numpy(obs.astype(np.float32)).to(self.device)
             batch = obs_tensor.size(0)
+            # Initialize from Gaussian prior; could be replaced by a deterministic regressor (e.g., BC) for faster convergence.
             act = torch.randn(batch, self.act_dim, device=self.device) * self.noise_std
+            sigma_sq = self.noise_std ** 2
             for _ in range(max(1, self.langevin_steps)):
-                act = act + self.step_size * self.model(obs_tensor, act)
-                act = act + math.sqrt(2 * self.step_size) * self.noise_std * torch.randn_like(act)
+                # Model trained to predict added noise ε ~ N(0, σ^2); score ≈ ∇_a log p(a|obs) = -ε / σ^2
+                pred_noise = self.model(obs_tensor, act)
+                score = -pred_noise / sigma_sq
+                act = act + self.step_size * score + math.sqrt(2 * self.step_size) * self.noise_std * torch.randn_like(act)
             return act.cpu().numpy()
 
 
@@ -1826,7 +1830,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         type=str,
-        default="all",
+        default="diffusion_c,diffusion_t",
         help="Comma-separated models: gmm,gmr,bc,diffusion_c,diffusion_t,lstm_gmm,ibc,gp,mdn,all (default: all)",
     )
     parser.add_argument("--test-size", type=float, default=test_size_default, help="Fraction of trajectories reserved for testing")

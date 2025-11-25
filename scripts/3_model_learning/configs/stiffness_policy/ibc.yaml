@@ -1,6 +1,6 @@
 # Implicit BC(score-based) 구성. CLI에서는 --ibc-* 인자로 조정합니다.
 # hidden_dim: 점수 네트워크 폭. 크게 하면 표현력↑, 메모리 사용↑.
-hidden_dim: 256
+hidden_dim: 512
 # hidden_layers: 은닉층 수. 깊을수록 복잡한 구조 표현 가능하지만 학습이 어려울 수 있습니다.
 hidden_layers: 3
 # batch_size: 학습 배치. 값이 크면 안정적이지만 GPU 메모리 요구가 커집니다.
@@ -8,10 +8,14 @@ batch_size: 256
 # learning_rate: 학습률. 발산 시 낮추고, 수렴이 느리면 조금 높입니다.
 learning_rate: 1.0e-3
 # epochs: 전체 학습 반복 수. 점수 기반 모델은 일반 BC보다 더 많은 에폭이 필요할 때가 많습니다.
-epochs: 300
+epochs: 500
 # noise_std: 입력/행동에 추가할 노이즈 표준편차. 크면 분포가 넓어지고 세부 재현이 약해질 수 있습니다.
-noise_std: 0.5
+noise_std: 0.005
 # langevin_steps: 샘플링용 Langevin 반복 횟수. 많을수록 정확하지만 느립니다.
-langevin_steps: 30
+langevin_steps: 100
 # langevin_step_size: Langevin에서 한 번 이동하는 크기. 너무 크면 발산, 너무 작으면 수렴이 느립니다.
 langevin_step_size: 1.0e-2
+# sequence_window: (시퀀스 길이) 최근 관측/행동 히스토리를 몇 step 묶어 점수 네트워크 입력으로 사용할지.
+#                  시간적 패턴(가속도, 점진 변화)을 포착하려면 1보다 크게 설정.
+#                  너무 크면 메모리/연산 증가 및 과적합 위험. 일반적으로 8~64 범위 탐색.
+sequence_window: 16

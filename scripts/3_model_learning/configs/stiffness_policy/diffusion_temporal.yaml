@@ -10,8 +10,10 @@ learning_rate: 1.0e-3
 # epochs: 학습 에폭. 시퀀스 데이터가 많지 않다면 150 이하로도 충분할 수 있습니다.
 epochs: 200
 # sequence_window: LSTM/Temporal 모델이 참고할 과거 길이. 길수록 장기 의존성 포착, 비용 증가.
-sequence_window: 5
+sequence_window: 16 # 약 0.3초
 # sampler: ddpm 기본. DDIM 사용 시 eta와 함께 조절.
 sampler: ddpm
 # eta: DDIM 노이즈 계수. 0은 결정적, 양수는 랜덤성 추가. DDPM과는 무관합니다.
 eta: 0.0
+
+lstm_layers: 2
