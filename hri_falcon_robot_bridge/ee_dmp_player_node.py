@@ -154,7 +154,7 @@ class EEDMPPlayerNode(Node):
         if self.idx >= self.n_steps:
             if self.loop:
                 self.idx = 0
-                self.get_logger().info("Trajectory loop restart", throttle_duration_sec=2.0)
+                self.get_logger().info("Trajectory loop restart")
             else:
                 self.playing = False
                 self.get_logger().info("Trajectory playback finished (loop disabled)")

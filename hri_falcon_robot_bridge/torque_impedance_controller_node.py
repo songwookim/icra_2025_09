@@ -20,7 +20,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, TwistStamped, WrenchStamped
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray, Int32MultiArray, Bool, UInt8
+from std_msgs.msg import Float32MultiArray, Int32MultiArray, Bool, UInt8, Float32
 
 try:
     import mujoco as mj  # type: ignore
@@ -68,12 +68,12 @@ class TorqueImpedanceControllerNode(Node):
         self.declare_parameter("max_current_units_pos", 500)
         self.declare_parameter("max_current_units_neg", 500)
         self.declare_parameter("torque_filter_alpha", 0.3)
-        self.declare_parameter("velocity_window", 5)
+        self.declare_parameter("velocity_window", 15)
         self.declare_parameter("enable_force_feedback", False)
         self.declare_parameter("force_sensor_map", ["if", "mf", "th"])
         self.declare_parameter("kp_force", 0.3)
         self.declare_parameter("ki_force", 0.0)
-        self.declare_parameter("stiffness_filter_alpha", 0.1)
+        self.declare_parameter("stiffness_filter_alpha", 0.01)
         self.declare_parameter("max_stiffness_change", 50.0)
         # New parameters (robot controller joint source + initial baseline + EE pose publish)
         self.declare_parameter("joint_state_topic", "/robot_controller/joint_state")
@@ -109,7 +109,7 @@ class TorqueImpedanceControllerNode(Node):
         self.kp_force = float(_p("kp_force") or 0.3)
         self.ki_force = float(_p("ki_force") or 0.0)
         self.stiffness_alpha = float(_p("stiffness_filter_alpha") or 0.1)
-        self.max_k_change = float(_p("max_stiffness_change") or 50.0)
+        self.max_k_change = float(_p("max_stiffness_change") or 1.0)
         self.joint_state_topic = str(_p("joint_state_topic") or "/robot_controller/joint_state")
         self.pos_error_threshold = float(_p("position_error_threshold") or 0.05)
         self.stiffness_logging_enabled = bool(_p("stiffness_logging_enabled") if _p("stiffness_logging_enabled") is not None else True)
@@ -119,7 +119,7 @@ class TorqueImpedanceControllerNode(Node):
             try:
                 os.makedirs(self.stiffness_log_dir, exist_ok=True)
             except Exception as exc:
-                self.get_logger().warn(f"[STIFFNESS_LOG] Failed to create log dir {self.stiffness_log_dir}: {exc}")
+                self.get_logger().warning(f"[STIFFNESS_LOG] Failed to create log dir {self.stiffness_log_dir}: {exc}")
                 self.stiffness_logging_enabled = False
         
         # Parse current_units_scale as array
@@ -172,10 +172,12 @@ class TorqueImpedanceControllerNode(Node):
         self.has_stiffness = False
         self.has_qpos = False
         self.measured_force: Dict[str, float] = {"if": 0.0, "mf": 0.0, "th": 0.0}
+        self.measured_force_vec: Dict[str, np.ndarray] = {"if": np.zeros(3), "mf": np.zeros(3), "th": np.zeros(3)}
         self.has_force: Dict[str, bool] = {"if": False, "mf": False, "th": False}
         self.force_int_err = np.zeros(9)
         self.filtered_stiffness = np.zeros(9)
         self._joint_state_sub_counter = 0
+        self._error_throttle_counter = 0  # Manual throttle counter for error messages
         # Desired EE logging timestamps (per finger)
         self._desired_ee_first_log: Dict[str, bool] = {"if": False, "mf": False, "th": False}
         self._desired_ee_last_log: Dict[str, float] = {"if": 0.0, "mf": 0.0, "th": 0.0}
@@ -190,8 +192,12 @@ class TorqueImpedanceControllerNode(Node):
         self.demo_playback_stage = 0
         self.stiffness_log_active = False
         self.stiffness_log_data: List[Tuple[float, np.ndarray]] = []
+        self.eccentricity_log_data: List[Tuple[float, float]] = []
+        self.force_log_data: List[Tuple[float, Dict[str, np.ndarray]]] = []  # Store fx,fy,fz for each finger
         self.stiffness_log_start_time = 0.0
         self._stiffness_log_session_id = 0
+        self.current_eccentricity = 0.0
+        self.has_eccentricity = False
 
         self.mj_model = None
         self.mj_data = None
@@ -202,6 +208,7 @@ class TorqueImpedanceControllerNode(Node):
 
         # Subscriptions
         self.create_subscription(Float32MultiArray, "/impedance_control/target_stiffness", self.subscribe_stiffness, 10)
+        self.create_subscription(Float32, "/deformity_tracker/eccentricity", self.subscribe_eccentricity, 10)
         # Subscribe to external joint state (robot controller) instead of hardcoded hand tracker
         self.create_subscription(JointState, self.joint_state_topic, self.subscribe_joint_state, 10)
         self.get_logger().info(f"[INIT] JointState subscriber CREATED: topic={self.joint_state_topic}")
@@ -216,10 +223,11 @@ class TorqueImpedanceControllerNode(Node):
         self.get_logger().info("[INIT] Subscribed to /demo_playback_active")
         self.create_subscription(UInt8, "/demo_playback_stage", self.subscribe_playback_stage, 10)
         self.get_logger().info("[INIT] Subscribed to /demo_playback_stage")
-        if self.enable_force_fb:
-            self.create_subscription(WrenchStamped, "/force_sensor/s1/wrench", self.subscribe_wrench_single_s1, 10)
-            self.create_subscription(WrenchStamped, "/force_sensor/s2/wrench", self.subscribe_wrench_single_s2, 10)
-            self.create_subscription(WrenchStamped, "/force_sensor/s3/wrench", self.subscribe_wrench_single_s3, 10)
+        # Always subscribe to force sensors for logging (independent of enable_force_feedback)
+        self.create_subscription(WrenchStamped, "/force_sensor/s1/wrench", self.subscribe_wrench_single_s1, 10)
+        self.create_subscription(WrenchStamped, "/force_sensor/s2/wrench", self.subscribe_wrench_single_s2, 10)
+        self.create_subscription(WrenchStamped, "/force_sensor/s3/wrench", self.subscribe_wrench_single_s3, 10)
+        self.get_logger().info("[INIT] Force sensor subscribers created (s1, s2, s3)")
 
         # Publishers & timer
         self.current_pub = self.create_publisher(Int32MultiArray, "/dynamixel/goal_current", 10)
@@ -245,7 +253,7 @@ class TorqueImpedanceControllerNode(Node):
 
     def _init_mujoco(self) -> None:
         if not MUJOCO_AVAILABLE:
-            self.get_logger().warn("MuJoCo import 실패 -> kinematics 비활성화")
+            self.get_logger().warning("MuJoCo import 실패 -> kinematics 비활성화")
             self.use_mujoco = False
             return
         # 모델 로드
@@ -281,7 +289,7 @@ class TorqueImpedanceControllerNode(Node):
             try:
                 from mujoco import viewer as mj_viewer  # type: ignore
             except Exception as e:
-                self.get_logger().warn(f"mujoco.viewer import 실패 -> headless: {e}")
+                self.get_logger().warning(f"mujoco.viewer import 실패 -> headless: {e}")
                 return
             try:
                 self._mj_viewer = mj_viewer.launch_passive(
@@ -294,7 +302,7 @@ class TorqueImpedanceControllerNode(Node):
                 self.get_logger().info("MuJoCo viewer 시작")
             except Exception as e:
                 self._mj_viewer = None
-                self.get_logger().warn(f"Viewer 시작 실패(headless 진행): {e}")
+                self.get_logger().warning(f"Viewer 시작 실패(headless 진행): {e}")
 
     def _load_initial_qpos_from_config(self) -> Optional[np.ndarray]:
         """Load initial qpos from config.yaml as units (no conversion)."""
@@ -369,7 +377,7 @@ class TorqueImpedanceControllerNode(Node):
         try:
             mj.mj_forward(self.mj_model, self.mj_data)  # type: ignore
         except Exception as e:
-            self.get_logger().warn(f"[MuJoCo] forward failed after initial pose: {e}")
+            self.get_logger().warning(f"[MuJoCo] forward failed after initial pose: {e}")
             return
         
         self.get_logger().info("[MuJoCo] qpos set to initial config values (units→radians)")
@@ -383,19 +391,24 @@ class TorqueImpedanceControllerNode(Node):
                     self.fingers[finger].ee_pos = pos
                     self.get_logger().info(f"[MUJOCO] Initial EE position {finger}: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
             except Exception as e:
-                self.get_logger().warn(f"[MUJOCO] Failed to get initial EE for {finger}: {e}")
+                self.get_logger().warning(f"[MUJOCO] Failed to get initial EE for {finger}: {e}")
 
     # Wrench callbacks
     def subscribe_wrench_single(self, idx: int, msg: WrenchStamped) -> None:
         try:
             if idx < len(self.force_sensor_map):
                 finger = self.force_sensor_map[idx]
+                fx = float(msg.wrench.force.x)
+                fy = float(msg.wrench.force.y)
                 fz = float(msg.wrench.force.z)
                 if finger in self.measured_force:
+                    # Store only fz for backward compatibility (used in force feedback)
                     self.measured_force[finger] = fz
                     self.has_force[finger] = True
+                # Store full force vector for logging
+                self.measured_force_vec[finger] = np.array([fx, fy, fz], dtype=float)
         except Exception as e:
-            self.get_logger().warn(f"wrench 콜백 오류(idx={idx}): {e}", throttle_duration_sec=1.0)
+            self.get_logger().warning(f"wrench 콜백 오류(idx={idx}): {e}")
     def subscribe_wrench_single_s1(self, msg: WrenchStamped) -> None:
         self.subscribe_wrench_single(0, msg)
 
@@ -438,7 +451,7 @@ class TorqueImpedanceControllerNode(Node):
             elif self.demo_playback_stage != 2 and self.stiffness_log_active:
                 self._stop_stiffness_logging(reason=f"stage_{prev_stage}_to_{self.demo_playback_stage}")
         except Exception as exc:
-            self.get_logger().warn(f"[STAGE] subscribe error: {exc}", throttle_duration_sec=1.0)
+            self.get_logger().warning(f"[STAGE] subscribe error: {exc}")
 
     # Generic callbacks
     def subscribe_stiffness(self, msg: Float32MultiArray) -> None:
@@ -463,7 +476,14 @@ class TorqueImpedanceControllerNode(Node):
 
                 self.target_stiffness = self.filtered_stiffness
         except Exception as e:
-            self.get_logger().warn(f"stiffness 콜백 오류: {e}", throttle_duration_sec=1.0)
+            self.get_logger().warning(f"stiffness 콜백 오류: {e}")
+
+    def subscribe_eccentricity(self, msg: Float32) -> None:
+        try:
+            self.current_eccentricity = float(msg.data)
+            self.has_eccentricity = True
+        except Exception as e:
+            self.get_logger().warning(f"eccentricity 콜백 오류: {e}")
 
     def subscribe_joint_state(self, msg: JointState) -> None:
         try:
@@ -481,9 +501,9 @@ class TorqueImpedanceControllerNode(Node):
                 if self.use_mujoco:
                     self._update_kinematics()
             else:
-                self.get_logger().warn("JointState position 값이 비어있음!")
+                self.get_logger().warning("JointState position 값이 비어있음!")
         except Exception as e:
-            self.get_logger().warn(f"qpos 콜백 오류: {e}", throttle_duration_sec=1.0)
+            self.get_logger().warning(f"qpos 콜백 오류: {e}")
 
     def subscribe_desired_pose(self, finger: str, msg: PoseStamped) -> None:
         try:
@@ -509,7 +529,7 @@ class TorqueImpedanceControllerNode(Node):
             #         f"current=[{current_ee[0]:.4f}, {current_ee[1]:.4f}, {current_ee[2]:.4f}]"
             #     )
         except Exception as e:
-            self.get_logger().warn(f"desired pose 오류({finger}): {e}", throttle_duration_sec=1.0)
+            self.get_logger().warning(f"desired pose 오류({finger}): {e}")
     def subscribe_desired_pose_if(self, msg: PoseStamped) -> None:
         self.subscribe_desired_pose("if", msg)
     def subscribe_desired_pose_mf(self, msg: PoseStamped) -> None:
@@ -522,7 +542,7 @@ class TorqueImpedanceControllerNode(Node):
             self.desired_vel[finger] = np.array([v.x, v.y, v.z], dtype=float)
             self.fingers[finger].has_desired_vel = True
         except Exception as e:
-            self.get_logger().warn(f"desired velocity 오류({finger}): {e}", throttle_duration_sec=1.0)
+            self.get_logger().warning(f"desired velocity 오류({finger}): {e}")
     def subscribe_desired_velocity_if(self, msg: TwistStamped) -> None:
         self.subscribe_desired_velocity("if", msg)
     def subscribe_desired_velocity_mf(self, msg: TwistStamped) -> None:
@@ -614,10 +634,10 @@ class TorqueImpedanceControllerNode(Node):
                         self._mj_viewer.sync()  # type: ignore[attr-defined]
                 except Exception as e:
                     if self._joint_state_sub_counter % 100 == 1:
-                        self.get_logger().warn(f"Viewer rendering error: {e}")
+                        self.get_logger().warning(f"Viewer rendering error: {e}")
             # EE pose는 별도 타이머에서 publish됨
         except Exception as e:
-            self.get_logger().warn(f"kinematics 업데이트 오류: {e}", throttle_duration_sec=5.0)
+            self.get_logger().warning(f"kinematics 업데이트 오류: {e}")
     def _compute_jacobian(self, finger: str, site_id: int) -> Optional[np.ndarray]:
         if not self.use_mujoco or self.mj_data is None: return None
         try:
@@ -658,7 +678,7 @@ class TorqueImpedanceControllerNode(Node):
             
             return J_extracted
         except Exception as e:
-            self.get_logger().warn(f"Jacobian 계산 오류({finger}): {e}", throttle_duration_sec=10.0)
+            self.get_logger().warning(f"Jacobian 계산 오류({finger}): {e}")
             return None
     def _compute_damping(self, K_diag: np.ndarray) -> np.ndarray:
         D = np.zeros_like(K_diag)
@@ -669,7 +689,7 @@ class TorqueImpedanceControllerNode(Node):
         torques = np.zeros(9)
         if not (self.has_stiffness and self.has_qpos):
             if not self._logged_no_stiffness_warning and self._log_counter > 0:
-                self.get_logger().warn("[INIT] Waiting for stiffness and joint state data...")
+                self.get_logger().warning("[INIT] Waiting for stiffness and joint state data...")
                 self._logged_no_stiffness_warning = True
             return torques
         
@@ -687,7 +707,7 @@ class TorqueImpedanceControllerNode(Node):
                 # Log once only with detailed status
                 if not self._logged_no_desired_pos_warning:
                     missing = [f for f in ['th', 'if', 'mf'] if not self.fingers[f].has_desired_pos]
-                    self.get_logger().warn(f"[INIT] Waiting for desired EE positions (missing: {missing})")
+                    self.get_logger().warning(f"[INIT] Waiting for desired EE positions (missing: {missing})")
                     self._logged_no_desired_pos_warning = True
                 return torques
         
@@ -696,7 +716,7 @@ class TorqueImpedanceControllerNode(Node):
             if not self.fingers[finger].has_desired_pos:
                 # Log missing desired position periodically
                 if self._log_counter % int(self.rate_hz) == 0:
-                    self.get_logger().warn(f"[TORQUE] Skipping {finger}: no desired_pos")
+                    self.get_logger().warning(f"[TORQUE] Skipping {finger}: no desired_pos")
                 continue
             k_start = f_idx * 3
             k_end = k_start + 3
@@ -727,7 +747,7 @@ class TorqueImpedanceControllerNode(Node):
             # Debug: check Jacobian
             if J is None:
                 if self._log_counter % int(self.rate_hz) == 0:
-                    self.get_logger().warn(f"[TORQUE] {finger}: Jacobian is None!")
+                    self.get_logger().warning(f"[TORQUE] {finger}: Jacobian is None!")
                 continue  # Skip this finger if no Jacobian
             
             # # Debug: log Jacobian values
@@ -751,13 +771,57 @@ class TorqueImpedanceControllerNode(Node):
                 
                 if self.enable_force_fb and self.has_force.get(finger, False):
                     F_meas = np.zeros(3)
-                    F_meas[2] = self.measured_force[finger]
+                    F_meas[2] = self.measured_force[finger] # FZ 값 (그래프상 음수)
                     tau_meas = J.T @ F_meas
-                    tau_err = tau - tau_meas
+                    
                     for i in range(3):
                         joint_idx = k_start + i
-                        self.force_int_err[joint_idx] += tau_err[i] * (1.0 / self.rate_hz)
-                        tau[i] += self.kp_force * tau_err[i] + self.ki_force * self.force_int_err[joint_idx]
+                        target_tau_i = tau[i]
+                        
+                        # ---------------------------------------------------------
+                        # [최종 수정] Stable Constant Booster (상수 기반 쥐는 힘 강화)
+                        # ---------------------------------------------------------
+                        # 문제: 기존 (Force * Gain) 방식은 센서 노이즈를 증폭시켜 진동(발작)을 유발함.
+                        # 해결: 힘이 감지되면 '계산'하지 말고 무조건 '상수(고정값)'를 더해서 꾹 누르게 함.
+                        
+                        # 1. 감지 (FZ는 쥘 때 음수)
+                        current_force_z = F_meas[2]
+                        is_grasping = (current_force_z < -0.15)  # 0.15N 이상 힘이 걸리면
+                        is_closing = (target_tau_i < 0)           # 모터도 쥐는 방향이면
+
+                        if is_grasping and is_closing:
+                            # [핵심 변경 사항]
+                            # 기존: squeeze_torque = F_meas[2] * 2.0 (센서 흔들리면 토크도 흔들림 -> 진동)
+                            # 변경: 기본적으로 -0.5Nm를 깔고 감 (센서가 흔들려도 토크는 일정함 -> 안정적)
+                            
+                            base_squeeze = -0.5   # [튜닝 포인트] 이 값을 늘리면(-0.8 등) 더 꽉 쥡니다.
+                            prop_squeeze = current_force_z * 0.2 # 비례항은 2.0 -> 0.2로 대폭 낮춤 (단순 보조용)
+                            
+                            # 최종 추가 토크 계산
+                            squeeze_total = base_squeeze + prop_squeeze
+                            
+                            # 목표 토크(target_tau_i)에 추가 토크를 더함 (더 음수 쪽으로)
+                            fake_target = target_tau_i + squeeze_total
+                            
+                            tau_err = fake_target - tau_meas[i]
+                            
+                            # 디버깅: 부스터가 얼마나 힘을 보태는지 확인 (1번 조인트만)
+                            if self._log_counter % int(self.rate_hz) == 0 and i == 0:
+                                self.get_logger().info(f"[GRIP] F={current_force_z:.2f} | Added={squeeze_total:.2f}")
+
+                        else:
+                            # 접촉 없거나 펴는 방향이면 원래대로 계산
+                            tau_err = target_tau_i - tau_meas[i]
+                        # ---------------------------------------------------------
+                        
+                        # 적분 제어 (I-term) 적용
+                        self.force_int_err[joint_idx] += tau_err * (1.0 / self.rate_hz)
+                        
+                        # [안전장치] 적분항 클램핑 (-10.0 ~ 10.0)
+                        self.force_int_err[joint_idx] = np.clip(self.force_int_err[joint_idx], -10.0, 10.0)
+                        
+                        # 최종 토크에 P+I 추가
+                        tau[i] += self.kp_force * tau_err + self.ki_force * self.force_int_err[joint_idx]
                 
                 # Assign tau to torques array
                 for i in range(3):
@@ -781,11 +845,11 @@ class TorqueImpedanceControllerNode(Node):
         return torques
 
     def _torques_to_current_units(self, torques: np.ndarray) -> List[int]:
-        # currents_mA = np.where(CURRENT_TO_TORQUE > 0.0, torques / CURRENT_TO_TORQUE, 0.0)
-        # units = currents_mA / CURRENT_UNIT
+        currents_mA = np.where(CURRENT_TO_TORQUE > 0.0, torques / CURRENT_TO_TORQUE, 0.0)
+        units = currents_mA / CURRENT_UNIT
         # Apply per-joint current_units_scale before clipping (element-wise multiplication)
         # units = units * self.current_units_scale
-        units = torques * self.current_units_scale
+        # units = torques * self.current_units_scale
         # Apply asymmetric clipping: positive and negative limits can differ
         units = np.clip(units, -self.max_current_units_neg, self.max_current_units_pos)
         # self.get_logger().info(
@@ -795,15 +859,38 @@ class TorqueImpedanceControllerNode(Node):
         #     f"mf=[{currents_mA[6]:.3f},{currents_mA[7]:.3f},{currents_mA[8]:.3f}]"
         # )
         return [int(round(u)) for u in units]
+    # def _torques_to_current_units(self, torques: np.ndarray) -> List[int]:
+    #     # 1) 토크 → 전류(mA)
+    #     #    CURRENT_TO_TORQUE: N·m / mA
+    #     currents_mA = np.where(
+    #         CURRENT_TO_TORQUE > 0.0,
+    #         torques / CURRENT_TO_TORQUE,
+    #         0.0,
+    #     )
+
+    #     # 2) 전류(mA) → current unit (1 unit ≈ 2.69 mA)
+    #     units = currents_mA / CURRENT_UNIT
+
+    #     # 3) per-joint 튜닝 스케일 (처음엔 1.0으로 두고 시작)
+    #     units = units * self.current_units_scale
+
+    #     # 4) 안전 클리핑
+    #     units = np.clip(units, -self.max_current_units_neg, self.max_current_units_pos)
+
+    #     return [int(round(u)) for u in units]
 
     def _publish_zero_current(self, reason: Optional[str] = None, level: str = "warn") -> None:
-        """Send zero current command to all motors with optional throttled logging."""
-        zero_msg = Int32MultiArray()
-        zero_msg.data = [0] * 9
-        self.current_pub.publish(zero_msg)
-        if reason and self._log_counter % int(self.rate_hz) == 0:
-            logger = self.get_logger().warn if level == "warn" else self.get_logger().info
-            logger(reason)
+            """Send zero current command to all motors with optional throttled logging."""
+            zero_msg = Int32MultiArray()
+            zero_msg.data = [0] * 9
+            self.current_pub.publish(zero_msg)
+            
+            if reason and self._log_counter % int(self.rate_hz) == 0:
+                # 수정된 부분: 동적 할당 대신 if-else로 물리적인 코드 라인을 분리함
+                if level == "warn":
+                    self.get_logger().warning(reason)
+                else:
+                    self.get_logger().info(reason)
 
     def _filter_torques(self, torques: np.ndarray) -> np.ndarray:
         filtered = self.torque_filter_alpha * torques + (1.0 - self.torque_filter_alpha) * self.last_torques
@@ -813,10 +900,12 @@ class TorqueImpedanceControllerNode(Node):
         if not self.stiffness_logging_enabled:
             return
         self.stiffness_log_data = []
+        self.eccentricity_log_data = []
+        self.force_log_data = []
         self.stiffness_log_active = True
         self.stiffness_log_start_time = self.get_clock().now().nanoseconds / 1e9
         self._stiffness_log_session_id += 1
-        self.get_logger().warn(
+        self.get_logger().warning(
             f"[STIFFNESS_LOG] *** Recording STARTED *** (session #{self._stiffness_log_session_id}) - samples will be saved to {self.stiffness_log_dir}"
         )
 
@@ -825,72 +914,183 @@ class TorqueImpedanceControllerNode(Node):
             return
         self.stiffness_log_active = False
         sample_count = len(self.stiffness_log_data)
-        if sample_count == 0:
+        ecc_count = len(self.eccentricity_log_data)
+        force_count = len(self.force_log_data)
+        if sample_count == 0 and ecc_count == 0 and force_count == 0:
             self.get_logger().info(
                 f"[STIFFNESS_LOG] Recording stopped ({reason}) but no samples captured"
             )
             return
         self.get_logger().info(
-            f"[STIFFNESS_LOG] Recording stopped ({reason}), samples={sample_count}"
+            f"[STIFFNESS_LOG] Recording stopped ({reason}), stiffness={sample_count}, ecc={ecc_count}, force={force_count}"
         )
-        self._save_stiffness_log_plot()
+        self._save_stiffness_eccentricity_plot()
+        self._save_force_plot()
         self.stiffness_log_data = []
+        self.eccentricity_log_data = []
+        self.force_log_data = []
 
-    def _save_stiffness_log_plot(self) -> None:
+    def _save_stiffness_eccentricity_plot(self) -> None:
+        """Save stiffness + eccentricity plot (2 subplots)"""
         if not self.stiffness_log_data:
             return
         try:
             import matplotlib.pyplot as plt  # type: ignore
         except ImportError:
-            self.get_logger().warn("[STIFFNESS_LOG] Matplotlib not available - skip plot")
+            self.get_logger().warning("[STIFFNESS_LOG] Matplotlib not available - skip plot")
             return
-        times = np.array([entry[0] for entry in self.stiffness_log_data], dtype=float)
+        
+        times_stiff = np.array([entry[0] for entry in self.stiffness_log_data], dtype=float)
         values = np.stack([entry[1] for entry in self.stiffness_log_data], axis=0)
         component_labels = [
             "th_x", "th_y", "th_z",
             "if_x", "if_y", "if_z",
             "mf_x", "mf_y", "mf_z",
         ]
-        plt.figure(figsize=(10, 6))
+        
+        # Create figure with 2 subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        
+        # Subplot 1: Stiffness
         for idx in range(values.shape[1]):
-            plt.plot(times, values[:, idx], label=component_labels[idx])
-        plt.xlabel("Time (s)")
-        plt.ylabel("Stiffness (N/m)")
-        plt.title("Playback stiffness (stage 2)")
-        plt.grid(True, alpha=0.3)
-        plt.legend(loc="upper right", ncol=3, fontsize=8)
+            ax1.plot(times_stiff, values[:, idx], label=component_labels[idx])
+        ax1.set_ylabel("Stiffness (N/m)")
+        ax1.set_title("Playback stiffness + eccentricity")
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(loc="upper right", ncol=3, fontsize=8)
+        
+        # Subplot 2: Eccentricity
+        if self.eccentricity_log_data:
+            times_ecc = np.array([entry[0] for entry in self.eccentricity_log_data], dtype=float)
+            ecc_vals = np.array([entry[1] for entry in self.eccentricity_log_data], dtype=float)
+            ax2.plot(times_ecc, ecc_vals, color='red', linewidth=1.5, label='Eccentricity')
+            ax2.set_ylabel("Eccentricity")
+            ax2.set_xlabel("Time (s)")
+            ax2.grid(True, alpha=0.3)
+            ax2.legend(loc="upper right")
+        else:
+            ax2.text(0.5, 0.5, "No eccentricity data", ha='center', va='center', transform=ax2.transAxes)
+            ax2.set_ylabel("Eccentricity")
+            ax2.set_xlabel("Time (s)")
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Use PID to ensure unique filenames across process restarts
         import os as _os_module
         pid = _os_module.getpid()
         filename = os.path.join(
             self.stiffness_log_dir,
-            f"stiffness_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
+            f"stiffness_ecc_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
         )
         try:
             plt.tight_layout()
             plt.savefig(filename, dpi=200)
-            self.get_logger().warn(
-                f"[STIFFNESS_LOG] *** SAVED PNG *** with {len(times)} samples -> {filename}"
+            self.get_logger().warning(
+                f"[STIFFNESS_LOG] *** SAVED PLOT 1/2 *** Stiffness+Eccentricity ({len(times_stiff)} samples) -> {filename}"
             )
         except Exception as exc:
-            self.get_logger().error(f"[STIFFNESS_LOG] Failed to save plot: {exc}")
+            self.get_logger().error(f"[STIFFNESS_LOG] Failed to save stiffness plot: {exc}")
             import traceback
             self.get_logger().error(f"[STIFFNESS_LOG] Traceback:\n{traceback.format_exc()}")
         finally:
             plt.close()
 
+    def _save_force_plot(self) -> None:
+        """Save force sensor plot (3 fingers x 3 axes = 9 subplots in 3x3 grid)"""
+        if not self.force_log_data:
+            self.get_logger().info("[FORCE_LOG] No force data to plot")
+            return
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            self.get_logger().warning("[FORCE_LOG] Matplotlib not available - skip plot")
+            return
+        
+        times_force = np.array([entry[0] for entry in self.force_log_data], dtype=float)
+        
+        # Extract force data for each finger and axis
+        force_data: Dict[str, Dict[str, List[float]]] = {
+            'th': {'fx': [], 'fy': [], 'fz': []},
+            'if': {'fx': [], 'fy': [], 'fz': []},
+            'mf': {'fx': [], 'fy': [], 'fz': []}
+        }
+        
+        for _, force_dict in self.force_log_data:
+            for finger in ['th', 'if', 'mf']:
+                if finger in force_dict:
+                    vec = force_dict[finger]
+                    force_data[finger]['fx'].append(vec[0])
+                    force_data[finger]['fy'].append(vec[1])
+                    force_data[finger]['fz'].append(vec[2])
+                else:
+                    force_data[finger]['fx'].append(0.0)
+                    force_data[finger]['fy'].append(0.0)
+                    force_data[finger]['fz'].append(0.0)
+        
+        # Convert to numpy arrays
+        force_arrays: Dict[str, Dict[str, np.ndarray]] = {}
+        for finger in ['th', 'if', 'mf']:
+            force_arrays[finger] = {}
+            for axis in ['fx', 'fy', 'fz']:
+                force_arrays[finger][axis] = np.array(force_data[finger][axis], dtype=float)
+        
+        # Create 3x3 grid: rows=fingers, columns=axes
+        fig, axes = plt.subplots(3, 3, figsize=(15, 10), sharex=True)
+        fig.suptitle("Force Sensors (3 fingers x 3 axes)", fontsize=14)
+        
+        finger_names = {'th': 'Thumb', 'if': 'Index', 'mf': 'Middle'}
+        axis_names = ['fx', 'fy', 'fz']
+        colors = {'fx': 'blue', 'fy': 'green', 'fz': 'red'}
+        
+        for row, finger in enumerate(['th', 'if', 'mf']):
+            for col, axis in enumerate(axis_names):
+                ax = axes[row, col]
+                ax.plot(times_force, force_arrays[finger][axis], color=colors[axis], linewidth=1.2)
+                ax.set_ylabel(f"{finger_names[finger]} (N)")
+                ax.grid(True, alpha=0.3)
+                if row == 0:
+                    ax.set_title(f"{axis.upper()}")
+                if row == 2:
+                    ax.set_xlabel("Time (s)")
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        import os as _os_module
+        pid = _os_module.getpid()
+        filename = os.path.join(
+            self.stiffness_log_dir,
+            f"force_sensors_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
+        )
+        try:
+            plt.tight_layout()
+            plt.savefig(filename, dpi=200)
+            self.get_logger().warning(
+                f"[FORCE_LOG] *** SAVED PLOT 2/2 *** Force sensors ({len(times_force)} samples) -> {filename}"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"[FORCE_LOG] Failed to save force plot: {exc}")
+            import traceback
+            self.get_logger().error(f"[FORCE_LOG] Traceback:\n{traceback.format_exc()}")
+        finally:
+            plt.close()
     def _control_loop(self) -> None:
         try:
             raw_tau = self._compute_torques()
-            if self.stiffness_log_active and self.has_stiffness:
+            if self.stiffness_log_active:
                 now_s = self.get_clock().now().nanoseconds / 1e9
                 rel_t = now_s - self.stiffness_log_start_time
-                self.stiffness_log_data.append((rel_t, self.target_stiffness.copy()))
+                if self.has_stiffness:
+                    self.stiffness_log_data.append((rel_t, self.target_stiffness.copy()))
+                if self.has_eccentricity:
+                    self.eccentricity_log_data.append((rel_t, self.current_eccentricity))
+                # Log force sensor data (all three fingers, all three axes)
+                force_snapshot = {
+                    'th': self.measured_force_vec['th'].copy(),
+                    'if': self.measured_force_vec['if'].copy(),
+                    'mf': self.measured_force_vec['mf'].copy()
+                }
+                self.force_log_data.append((rel_t, force_snapshot))
                 # Debug: log every 100 samples
                 if len(self.stiffness_log_data) % 100 == 1:
                     self.get_logger().info(
-                        f"[STIFFNESS_LOG] Recording... samples={len(self.stiffness_log_data)}, t={rel_t:.2f}s"
+                        f"[STIFFNESS_LOG] Recording... stiffness={len(self.stiffness_log_data)}, ecc={len(self.eccentricity_log_data)}, force={len(self.force_log_data)}, t={rel_t:.2f}s"
                     )
             
             # # Debug: log raw_tau before safety check
@@ -904,27 +1104,26 @@ class TorqueImpedanceControllerNode(Node):
             #     )
             
             # Position error safety check: zero torques if any finger exceeds threshold
-            safety_violation = False
-            violating_finger = None
-            max_err = 0.0
-            for finger in ['th', 'if', 'mf']:
-                if self.fingers[finger].has_desired_pos:
-                    err = np.linalg.norm(self.desired_pos[finger] - self.fingers[finger].ee_pos)
-                    if err > max_err:
-                        max_err = err
-                        violating_finger = finger
-                    if err > self.pos_error_threshold:
-                        safety_violation = True
-                        # Don't break - continue to find max error for logging
+            # safety_violation = False
+            # violating_finger = None
+            # max_err = 0.0
+            # for finger in ['th', 'if', 'mf']:
+            #     if self.fingers[finger].has_desired_pos:
+            #         err = np.linalg.norm(self.desired_pos[finger] - self.fingers[finger].ee_pos)
+            #         if err > max_err:
+            #             max_err = err
+            #             violating_finger = finger
+            #         if err > self.pos_error_threshold:
+            #             safety_violation = True
+            #             # Don't break - continue to find max error for logging
             
-            if safety_violation:
-                raw_tau = np.zeros(9)
-                if self._log_counter % int(self.rate_hz) == 0:
-                    self.get_logger().warn(
-                        f"[SAFETY] Position error exceeded threshold - torques set to ZERO | "
-                        f"worst={violating_finger}: {max_err*1000:.1f}mm > {self.pos_error_threshold*1000:.1f}mm",
-                        throttle_duration_sec=1.0
-                    )
+            # if safety_violation:
+            #     raw_tau = np.zeros(9)
+            #     if self._log_counter % int(self.rate_hz) == 0:
+            #         self.get_logger().warning(
+            #             f"[SAFETY] Position error exceeded threshold - torques set to ZERO | "
+            #             f"worst={violating_finger}: {max_err*1000:.1f}mm > {self.pos_error_threshold*1000:.1f}mm"
+            #         )
             
             # Playback gating: keep torques/currents at zero until playback becomes active
             if not self.demo_playback_active:
@@ -966,9 +1165,9 @@ class TorqueImpedanceControllerNode(Node):
             if self._log_counter % int(self.rate_hz) == 0:
                 # Skip repetitive warnings during initialization
                 if not self.has_qpos and self._log_counter == int(self.rate_hz):
-                    self.get_logger().warn(f"[INIT] Waiting for joint state data...")
+                    self.get_logger().warning(f"[INIT] Waiting for joint state data...")
                 if not self.has_stiffness and self._log_counter == int(self.rate_hz):
-                    self.get_logger().warn(f"[INIT] Waiting for stiffness predictions...")
+                    self.get_logger().warning(f"[INIT] Waiting for stiffness predictions...")
                 
                 # Only log status if we have basic data
                 if self.has_qpos and self.has_stiffness:
@@ -980,7 +1179,7 @@ class TorqueImpedanceControllerNode(Node):
                             err = np.linalg.norm(self.desired_pos[finger] - self.fingers[finger].ee_pos)
                             pos_errors.append(f"{finger}={err*1000:.1f}mm")
                             # if err > self.pos_error_threshold:
-                            # self.get_logger().warn(
+                            # self.get_logger().warning(
                             #     f"[TRACKING LAG] {finger}: error={err*1000:.1f}mm > threshold={self.pos_error_threshold*1000:.1f}mm"
                             # )
                     # error_str = " ".join(pos_errors) if pos_errors else "N/A"
@@ -997,7 +1196,11 @@ class TorqueImpedanceControllerNode(Node):
                         #     f"I_avg={np.mean(np.abs(current_units)):.0f}"
                         # )
         except Exception as e:
-            self.get_logger().error(f"제어 루프 오류: {e}", throttle_duration_sec=1.0)
+            # Manual throttling: log error only once per second
+            self._error_throttle_counter += 1
+            if self._error_throttle_counter >= int(self.rate_hz):
+                self.get_logger().error(f"제어 루프 오류: {e}")
+                self._error_throttle_counter = 0
 
     def destroy_node(self) -> None:
         if self.stiffness_log_active:

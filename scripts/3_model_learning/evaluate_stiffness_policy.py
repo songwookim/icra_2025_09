@@ -464,6 +464,7 @@ def evaluate_models(args: argparse.Namespace) -> None:
             state = _torch_load(artifact_path)
             config = state.get("config", {})
             temporal = bool(config.get("temporal", entry.get("temporal", False)))
+            action_horizon = int(config.get("action_horizon", entry.get("action_horizon", 1)))
             diff = diff_cls(
                 obs_dim=int(
                     config.get(
@@ -480,35 +481,115 @@ def evaluate_models(args: argparse.Namespace) -> None:
                 epochs=int(config.get("epochs", 0)),
                 seed=int(config.get("seed", 0)),
                 temporal=temporal,
+                action_horizon=action_horizon,
                 device="cpu",
                 log_name=f"{model_name}_eval",
             )
             diff.model.load_state_dict(state["state_dict"])
             sample_count = int(entry.get("n_samples", 4))
-            if temporal:
-                if seq_obs.shape[0] == 0:
-                    full_pred = np.full_like(test_act_full, np.nan)
+            
+            # Temporal Ensembling: if action_horizon > 1, apply receding horizon control
+            if action_horizon > 1:
+                print(f"[{model_name}] Using temporal ensembling with action_horizon={action_horizon}")
+                action_buffer: List[np.ndarray] = []
+                if temporal:
+                    obs_input = seq_obs if seq_obs.shape[0] > 0 else test_obs_s
                 else:
-                    pred_seq_scaled = diff.predict(
-                        seq_obs,
+                    obs_input = test_obs_s
+                
+                full_pred_scaled = []
+                for t in range(obs_input.shape[0]):
+                    # Predict action sequence (horizon steps)
+                    obs_t = obs_input[t:t+1]
+                    action_seq_scaled = diff.predict(
+                        obs_t,
                         n_samples=sample_count,
                         sampler=diffusion_sampler,
                         eta=diffusion_eta,
-                    )
-                    pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
-                    full_pred = np.full_like(test_act_full, np.nan)
-                    full_pred[seq_indices] = pred_seq
-                pred_subset = full_pred[:, selected_indices_abs]
-                predictions[model_name] = pred_subset
-                metrics_summary[model_name] = _metrics_with_mask(target_subset, pred_subset)
-                finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
-            else:
-                pred_scaled = diff.predict(test_obs_s, n_samples=sample_count)
+                    )  # Returns (1, act_dim) - only first action after chunking
+                    
+                    # For proper temporal ensembling, we need full sequence
+                    # Workaround: predict with model directly to get full horizon
+                    diff.model.eval()
+                    with torch.no_grad():
+                        obs_tensor = torch.from_numpy(obs_t.astype(np.float32)).to(diff.device)
+                        x = torch.randn(1, diff.act_dim * action_horizon, device=diff.device)
+                        for t_inv in reversed(range(diff.timesteps)):
+                            t_step = torch.full((1,), t_inv, device=diff.device, dtype=torch.long)
+                            pred_noise = diff.model(obs_tensor, x, t_step)
+                            alpha_hat = diff.alpha_cumprod[t_inv]
+                            sqrt_alpha_hat = diff.sqrt_alpha_cumprod[t_inv]
+                            sqrt_one_minus = diff.sqrt_one_minus_alpha_cumprod[t_inv]
+                            pred_x0 = (x - pred_noise * sqrt_one_minus) / sqrt_alpha_hat
+                            if t_inv > 0:
+                                coef1 = diff.posterior_mean_coef1[t_inv]
+                                coef2 = diff.posterior_mean_coef2[t_inv]
+                                mean = coef1 * pred_x0 + coef2 * x
+                                noise_sample = torch.randn_like(x)
+                                var = diff.posterior_variance[t_inv]
+                                x = mean + torch.sqrt(torch.clamp(var, min=1e-6)) * noise_sample
+                            else:
+                                x = pred_x0
+                        action_seq_full = x.cpu().numpy().reshape(action_horizon, diff.act_dim)
+                    
+                    action_buffer.append(action_seq_full)
+                    
+                    # Temporal ensembling: average overlapping predictions
+                    valid_actions = []
+                    for i, buffered_seq in enumerate(action_buffer):
+                        offset = t - (len(action_buffer) - 1 - i)
+                        if 0 <= offset < action_horizon:
+                            valid_actions.append(buffered_seq[offset])
+                    
+                    if valid_actions:
+                        ensembled_action = np.mean(valid_actions, axis=0)
+                    else:
+                        ensembled_action = action_seq_full[0]
+                    
+                    full_pred_scaled.append(ensembled_action)
+                    
+                    # Keep buffer size = action_horizon
+                    if len(action_buffer) > action_horizon:
+                        action_buffer.pop(0)
+                
+                pred_scaled = np.array(full_pred_scaled)
                 pred = act_scaler.inverse_transform(pred_scaled)
                 pred_subset = pred[:, selected_indices_abs]
                 predictions[model_name] = pred_subset
-                metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+                if temporal and seq_obs.shape[0] > 0:
+                    full_pred = np.full_like(test_act_full, np.nan)
+                    full_pred[seq_indices] = pred
+                    pred_subset = full_pred[:, selected_indices_abs]
+                    metrics_summary[model_name] = _metrics_with_mask(target_subset, pred_subset)
+                else:
+                    metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
                 finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
+            else:
+                # Original single-step prediction
+                if temporal:
+                    if seq_obs.shape[0] == 0:
+                        full_pred = np.full_like(test_act_full, np.nan)
+                    else:
+                        pred_seq_scaled = diff.predict(
+                            seq_obs,
+                            n_samples=sample_count,
+                            sampler=diffusion_sampler,
+                            eta=diffusion_eta,
+                        )
+                        pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
+                        full_pred = np.full_like(test_act_full, np.nan)
+                        full_pred[seq_indices] = pred_seq
+                    pred_subset = full_pred[:, selected_indices_abs]
+                    predictions[model_name] = pred_subset
+                    metrics_summary[model_name] = _metrics_with_mask(target_subset, pred_subset)
+                    finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
+                else:
+                    pred_scaled = diff.predict(test_obs_s, n_samples=sample_count, sampler=diffusion_sampler, eta=diffusion_eta)
+                    pred = act_scaler.inverse_transform(pred_scaled)
+                    pred_subset = pred[:, selected_indices_abs]
+                    predictions[model_name] = pred_subset
+                    metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+                    finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             continue
 
         if kind == "lstm_gmm":
@@ -806,6 +887,7 @@ def evaluate_per_finger_models(args: argparse.Namespace) -> None:
                     state = _torch_load(artifact_path)
                     config = state.get("config", {})
                     temporal = bool(config.get("temporal", entry.get("temporal", False)))
+                    action_horizon = int(config.get("action_horizon", entry.get("action_horizon", 1)))
                     diff = diff_cls(
                         obs_dim=int(config.get("obs_dim", seq_obs.shape[-1] if temporal and seq_obs.size else test_obs_s.shape[1])),
                         act_dim=int(config.get("act_dim", test_act_full.shape[1])),
@@ -817,26 +899,91 @@ def evaluate_per_finger_models(args: argparse.Namespace) -> None:
                         epochs=int(config.get("epochs", 0)),
                         seed=int(config.get("seed", 0)),
                         temporal=temporal,
+                        action_horizon=action_horizon,
                         device="cpu",
                         log_name=f"{model_name}_eval",
                     )
                     diff.model.load_state_dict(state["state_dict"])
                     sample_count = int(entry.get("n_samples", 4))
-                    if temporal:
-                        if seq_obs.shape[0] == 0:
-                            pred = np.full_like(test_act_full, np.nan)
-                        else:
-                            pred_seq_scaled = diff.predict(seq_obs, n_samples=sample_count, sampler=diffusion_sampler, eta=diffusion_eta)
-                            pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
-                            pred = np.full_like(test_act_full, np.nan)
-                            pred[seq_indices] = pred_seq
-                        predictions[model_name] = pred
-                        metrics_summary[model_name] = _metrics_with_mask(test_act_full, pred)
-                    else:
-                        pred_scaled = diff.predict(test_obs_s, n_samples=sample_count)
+                    
+                    # Temporal Ensembling for per-finger mode
+                    if action_horizon > 1:
+                        print(f"[{model_name}] Finger {finger.upper()}: Using temporal ensembling with action_horizon={action_horizon}")
+                        action_buffer: List[np.ndarray] = []
+                        obs_input = seq_obs if temporal and seq_obs.shape[0] > 0 else test_obs_s
+                        
+                        full_pred_scaled = []
+                        for t in range(obs_input.shape[0]):
+                            obs_t = obs_input[t:t+1]
+                            # Get full action sequence using model directly
+                            diff.model.eval()
+                            with torch.no_grad():
+                                obs_tensor = torch.from_numpy(obs_t.astype(np.float32)).to(diff.device)
+                                x = torch.randn(1, diff.act_dim * action_horizon, device=diff.device)
+                                for t_inv in reversed(range(diff.timesteps)):
+                                    t_step = torch.full((1,), t_inv, device=diff.device, dtype=torch.long)
+                                    pred_noise = diff.model(obs_tensor, x, t_step)
+                                    alpha_hat = diff.alpha_cumprod[t_inv]
+                                    sqrt_alpha_hat = diff.sqrt_alpha_cumprod[t_inv]
+                                    sqrt_one_minus = diff.sqrt_one_minus_alpha_cumprod[t_inv]
+                                    pred_x0 = (x - pred_noise * sqrt_one_minus) / sqrt_alpha_hat
+                                    if t_inv > 0:
+                                        coef1 = diff.posterior_mean_coef1[t_inv]
+                                        coef2 = diff.posterior_mean_coef2[t_inv]
+                                        mean = coef1 * pred_x0 + coef2 * x
+                                        noise_sample = torch.randn_like(x)
+                                        var = diff.posterior_variance[t_inv]
+                                        x = mean + torch.sqrt(torch.clamp(var, min=1e-6)) * noise_sample
+                                    else:
+                                        x = pred_x0
+                                action_seq_full = x.cpu().numpy().reshape(action_horizon, diff.act_dim)
+                            
+                            action_buffer.append(action_seq_full)
+                            
+                            # Temporal ensembling
+                            valid_actions = []
+                            for i, buffered_seq in enumerate(action_buffer):
+                                offset = t - (len(action_buffer) - 1 - i)
+                                if 0 <= offset < action_horizon:
+                                    valid_actions.append(buffered_seq[offset])
+                            
+                            if valid_actions:
+                                ensembled_action = np.mean(valid_actions, axis=0)
+                            else:
+                                ensembled_action = action_seq_full[0]
+                            
+                            full_pred_scaled.append(ensembled_action)
+                            
+                            if len(action_buffer) > action_horizon:
+                                action_buffer.pop(0)
+                        
+                        pred_scaled = np.array(full_pred_scaled)
                         pred = act_scaler.inverse_transform(pred_scaled)
-                        predictions[model_name] = pred
-                        metrics_summary[model_name] = compute_metrics(test_act_full, pred)
+                        if temporal and seq_obs.shape[0] > 0:
+                            full_pred = np.full_like(test_act_full, np.nan)
+                            full_pred[seq_indices] = pred
+                            predictions[model_name] = full_pred
+                            metrics_summary[model_name] = _metrics_with_mask(test_act_full, full_pred)
+                        else:
+                            predictions[model_name] = pred
+                            metrics_summary[model_name] = compute_metrics(test_act_full, pred)
+                    else:
+                        # Original single-step prediction
+                        if temporal:
+                            if seq_obs.shape[0] == 0:
+                                pred = np.full_like(test_act_full, np.nan)
+                            else:
+                                pred_seq_scaled = diff.predict(seq_obs, n_samples=sample_count, sampler=diffusion_sampler, eta=diffusion_eta)
+                                pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
+                                pred = np.full_like(test_act_full, np.nan)
+                                pred[seq_indices] = pred_seq
+                            predictions[model_name] = pred
+                            metrics_summary[model_name] = _metrics_with_mask(test_act_full, pred)
+                        else:
+                            pred_scaled = diff.predict(test_obs_s, n_samples=sample_count, sampler=diffusion_sampler, eta=diffusion_eta)
+                            pred = act_scaler.inverse_transform(pred_scaled)
+                            predictions[model_name] = pred
+                            metrics_summary[model_name] = compute_metrics(test_act_full, pred)
                 
                 elif kind == "lstm_gmm":
                     lstm_cls = _ensure_baseline_available("LSTM-GMM", LSTMGMMBaseline)

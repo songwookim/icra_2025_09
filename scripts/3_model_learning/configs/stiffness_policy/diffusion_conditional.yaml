@@ -13,3 +13,6 @@ epochs: 200
 sampler: ddpm
 # eta: DDIM 노이즈 계수. 0은 완전 결정적, 0.5~1.0은 무작위성 증가. DDPM에는 영향 없습니다.
 eta: 0.0
+# action_horizon: Action Chunking을 위한 미래 예측 길이 (Temporal Ensembling)
+# horizon > 1이면 (B, horizon, act_dim) 형태로 학습하고 receding horizon control로 추론
+action_horizon: 16

@@ -171,6 +171,12 @@ class RunPolicyNode(Node):
         # Stiffness prediction buffer for smoothing
         self.stiffness_buffer: List[np.ndarray] = []
 
+        # Temporal ensembling for diffusion policy (action chunking)
+        self.action_horizon = 16  # prediction horizon from manifest
+        self.action_buffer: List[np.ndarray] = []  # stores (horizon, 9) predictions
+        self.exec_horizon = 1  # how many steps to execute per prediction
+        self.action_step_counter = 0  # tracks current step in action sequence
+
         # Model and scalers
         self.model: Optional[Any] = None
         self.obs_scaler: Optional[Any] = None
@@ -261,7 +267,7 @@ class RunPolicyNode(Node):
                 )
                 self._force_logged[idx] = True
         except Exception as e:
-            self.get_logger().warn(f"Force callback error (s{idx+1}): {e}", throttle_duration_sec=5.0)
+            self.get_logger().warning(f"Force callback error (s{idx+1}): {e}")
 
     def _on_deform_ecc(self, msg: Float32):
         """Callback for deformity eccentricity."""
@@ -279,7 +285,7 @@ class RunPolicyNode(Node):
                 self.get_logger().info(f"EE if first msg pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f})")
                 self._ee_logged["if"] = True
         except Exception as e:
-            self.get_logger().warn(f"EE pose callback error (if): {e}", throttle_duration_sec=5.0)
+            self.get_logger().warning(f"EE pose callback error (if): {e}")
 
     def _on_ee_pose_mf(self, msg: PoseStamped):
         """Callback for middle finger end-effector pose."""
@@ -290,7 +296,7 @@ class RunPolicyNode(Node):
                 self.get_logger().info(f"EE mf first msg pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f})")
                 self._ee_logged["mf"] = True
         except Exception as e:
-            self.get_logger().warn(f"EE pose callback error (mf): {e}", throttle_duration_sec=5.0)
+            self.get_logger().warning(f"EE pose callback error (mf): {e}")
 
     def _on_ee_pose_th(self, msg: PoseStamped):
         """Callback for thumb end-effector pose."""
@@ -301,7 +307,7 @@ class RunPolicyNode(Node):
                 self.get_logger().info(f"EE th first msg pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f})")
                 self._ee_logged["th"] = True
         except Exception as e:
-            self.get_logger().warn(f"EE pose callback error (th): {e}", throttle_duration_sec=5.0)
+            self.get_logger().warning(f"EE pose callback error (th): {e}")
 
     def _find_latest_artifact(self) -> Optional[str]:
         """Auto-detect latest artifact directory for the specified mode."""
@@ -356,6 +362,12 @@ class RunPolicyNode(Node):
             with open(manifest_path, "r") as f:
                 self.manifest = json.load(f)
                 self.get_logger().info(f"Loaded manifest: {self.manifest}")
+                
+                # Extract action horizon from manifest if available
+                model_config = self.manifest.get("models", {}).get(self.model_type, {})
+                if model_config.get("temporal", False):
+                    self.action_horizon = model_config.get("seq_len", 16)
+                    self.get_logger().info(f"[TEMPORAL] Action horizon set to {self.action_horizon}")
 
         # Load scalers
         scaler_path = artifact_path / "scalers.pkl"
@@ -367,10 +379,10 @@ class RunPolicyNode(Node):
                 self.act_scaler = scalers.get("act_scaler") or scalers.get("act")
             self.get_logger().info("Loaded observation and action scalers")
         else:
-            self.get_logger().warn("No scalers found - using raw values (may degrade performance)")
+            self.get_logger().warning("No scalers found - using raw values (may degrade performance)")
 
         # Load model based on type
-        if self.model_type in ["bc", "diffusion_c", "diffusion_t"]:
+        if self.model_type in ["bc", "diffusion_c", "diffusion_t", "diffusion_t_ddim"]:
             if not TORCH_AVAILABLE:
                 raise RuntimeError(f"PyTorch required for {self.model_type} model but not available")
             self._load_torch_model(artifact_path)
@@ -387,8 +399,8 @@ class RunPolicyNode(Node):
             "bc": "bc.pt",
             "diffusion_c": "diffusion_c.pt",
             "diffusion_t": "diffusion_t.pt",
+            "diffusion_t_ddim": "diffusion_t.pt",
         }
-
         model_path = artifact_path / model_map[self.model_type]
         checkpoint = torch.load(model_path, map_location="cpu")
 
@@ -508,8 +520,46 @@ class RunPolicyNode(Node):
                 act_scaled = self.model(obs_t).numpy()
 
         elif "diffusion" in self.model_type:
-            # Diffusion policy prediction
-            act_scaled = self.model.predict(obs_scaled, n_samples=1, sampler="ddpm", eta=0.0)
+            # Diffusion policy with temporal ensembling
+            # Determine sampler from manifest or model_type
+            sampler = "ddpm"  # default
+            if self.manifest:
+                model_config = self.manifest.get("models", {}).get(self.model_type, {})
+                sampler = model_config.get("sampler", "ddpm")
+            
+            # Predict action sequence (shape: (1, horizon, 9) or (1, 9))
+            action_seq = self.model.predict(obs_scaled, n_samples=1, sampler=sampler, eta=0.0)
+            
+            # Check if temporal model (returns sequence)
+            if len(action_seq.shape) == 3 and action_seq.shape[1] == self.action_horizon:
+                # Temporal ensembling: store prediction and average overlapping actions
+                self.action_buffer.append(action_seq[0])  # (horizon, 9)
+                
+                # Keep only recent predictions (sliding window)
+                max_buffer = self.action_horizon
+                if len(self.action_buffer) > max_buffer:
+                    self.action_buffer.pop(0)
+                
+                # Temporal ensembling: average all predictions for current timestep
+                current_step = self.action_step_counter
+                valid_actions = []
+                for i, pred_seq in enumerate(self.action_buffer):
+                    # pred_seq[j] corresponds to timestep (buffer_start + i + j)
+                    # We want actions for current_step
+                    offset = current_step - (len(self.action_buffer) - 1 - i)
+                    if 0 <= offset < len(pred_seq):
+                        valid_actions.append(pred_seq[offset])
+                
+                if valid_actions:
+                    act_scaled = np.mean(valid_actions, axis=0, keepdims=True)  # (1, 9)
+                else:
+                    act_scaled = action_seq[0:1, 0, :]  # fallback to first action
+                
+                self.action_step_counter += 1
+            else:
+                # Non-temporal or single action
+                act_scaled = action_seq.reshape(1, -1)
+                self.action_step_counter += 1
 
         elif self.model_type == "gmm":
             # GMM sampling
@@ -571,11 +621,11 @@ class RunPolicyNode(Node):
             absent_force = [t for t in self.force_topics if t not in names_types]
             absent_ee = [t for t in [self.ee_pose_if_topic, self.ee_pose_mf_topic, self.ee_pose_th_topic] if t not in names_types]
             if absent_force:
-                self.get_logger().warn(f"Force topics absent in graph: {absent_force}")
+                self.get_logger().warning(f"Force topics absent in graph: {absent_force}")
             if absent_ee:
-                self.get_logger().warn(f"EE pose topics absent in graph: {absent_ee}")
+                self.get_logger().warning(f"EE pose topics absent in graph: {absent_ee}")
         except Exception as e:
-            self.get_logger().warn(f"Topic scan error: {e}")
+            self.get_logger().warning(f"Topic scan error: {e}")
 
     def _control_callback(self):
         """Main control loop callback - runs at rate_hz frequency."""
@@ -599,7 +649,7 @@ class RunPolicyNode(Node):
                 if not all(v is not None for v in self.ee_positions.values()):
                     missing_fingers = [k for k,v in self.ee_positions.items() if v is None]
                     missing.append(f"ee_poses({missing_fingers})")
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"[INIT] Waiting for sensor data: {', '.join(missing)}"
                 )
                 self._sensor_waiting_logged = True
@@ -641,7 +691,7 @@ class RunPolicyNode(Node):
             self._log_counter += 1
 
         except Exception as e:
-            # self.get_logger().error(f"Control callback error: {e}", throttle_duration_sec=1.0)
+            # self.get_logger().error(f"Control callback error: {e}")
             pass
 
 

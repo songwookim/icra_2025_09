@@ -927,6 +927,7 @@ if torch is not None:
             seed: int = 0,
             log_name: str = "diffusion",
             temporal: bool = False,
+            action_horizon: int = 1,
         ):
             torch.manual_seed(seed)
             self.obs_dim = obs_dim
@@ -934,8 +935,11 @@ if torch is not None:
             self.timesteps = timesteps
             self.batch_size = batch_size
             self.epochs = epochs
+            self.action_horizon = action_horizon
             self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-            self.model = ConditionalDiffusionModel(obs_dim, act_dim, hidden_dim, time_dim, temporal=temporal).to(self.device)
+            # Model output dimension: act_dim * action_horizon for chunking
+            model_act_dim = act_dim * action_horizon
+            self.model = ConditionalDiffusionModel(obs_dim, model_act_dim, hidden_dim, time_dim, temporal=temporal).to(self.device)
             self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
             self.log_name = log_name
             self.betas: Any = None
@@ -975,9 +979,18 @@ if torch is not None:
             setattr(self, name, tensor.to(self.device))
 
         def fit(self, obs: np.ndarray, act: np.ndarray, writer: Any = None, verbose: bool = True) -> None:
+            # Flatten action horizon: (B, act_dim) -> (B, act_dim * horizon) by repeating
+            # This assumes single-step actions should be repeated across horizon during training
+            if self.action_horizon > 1:
+                # Expand to (B, horizon, act_dim) then flatten to (B, horizon * act_dim)
+                act_expanded = np.repeat(act[:, np.newaxis, :], self.action_horizon, axis=1)
+                act_flat = act_expanded.reshape(act.shape[0], -1)
+            else:
+                act_flat = act
+            
             dataset = TensorDataset(
                 torch.from_numpy(obs.astype(np.float32)),
-                torch.from_numpy(act.astype(np.float32)),
+                torch.from_numpy(act_flat.astype(np.float32)),
             )
             loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
             for epoch in range(1, self.epochs + 1):
@@ -1021,8 +1034,9 @@ if torch is not None:
             if mode not in {"ddpm", "ddim"}:
                 raise ValueError(f"Unsupported sampler '{sampler}'. Choose 'ddpm' or 'ddim'.")
             eta = max(0.0, float(eta))
+            model_act_dim = self.act_dim * self.action_horizon
             for _ in range(max(1, n_samples)):
-                x = torch.randn(batch, self.act_dim, device=self.device)
+                x = torch.randn(batch, model_act_dim, device=self.device)
                 for t_inv in reversed(range(self.timesteps)):
                     t = torch.full((batch,), t_inv, device=self.device, dtype=torch.long)
                     pred_noise = self.model(obs_tensor, x, t)
@@ -1052,8 +1066,13 @@ if torch is not None:
                         else:
                             x = pred_x0
                 preds.append(x.cpu())
-            stacked = torch.stack(preds, dim=0).mean(dim=0)
-            return stacked.numpy()
+            stacked = torch.stack(preds, dim=0).mean(dim=0)  # (B, act_dim * horizon)
+            # Reshape to (B, horizon, act_dim) and return only first action
+            if self.action_horizon > 1:
+                stacked_reshaped = stacked.reshape(batch, self.action_horizon, self.act_dim)
+                return stacked_reshaped[:, 0, :].numpy()  # (B, act_dim)
+            else:
+                return stacked.numpy()
 
 
     class LSTMGMMHead(nn.Module):

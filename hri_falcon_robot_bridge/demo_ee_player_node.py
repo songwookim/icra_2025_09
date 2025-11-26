@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """Demo EE Pose Player Node
 
-CSV 데모 궤적을 읽어 모든 손가락(th, if, mf)의 /ee_pose_desired_* 토픽으로 재생.
+CSV 데모 궤적 또는 DMP PKL 파일을 읽어 모든 손가락(th, if, mf)의 /ee_pose_desired_* 토픽으로 재생.
 
 특징:
  - 모든 손가락에 대해 동시 퍼블리시 (th, if, mf)
- - 단일 또는 다중 CSV 지원 (glob 패턴)
+ - DMP PKL 파일 우선 로딩 (연장된 목표점 자동 반영)
+ - CSV 백업 지원 (glob 패턴)
  - 다중 CSV인 경우 선형 시간 정규화 후 평균 궤적 생성 (DTW 미적용)
  - 재생 속도(scale) 조절, 반복(loop) 옵션
  - 컬럼 자동 탐색: ee_{finger}_px 형태
 
-필수 컬럼:
+필수 컬럼 (CSV):
  ee_th_px, ee_th_py, ee_th_pz
  ee_if_px, ee_if_py, ee_if_pz
  ee_mf_px, ee_mf_py, ee_mf_pz
 
 사용 예:
+ # DMP PKL 사용 (권장 - 연장된 목표점 반영)
+ ros2 run hri_falcon_robot_bridge demo_ee_player_node --ros-args \
+   -p pkl_pattern:="dmp_models/dmp_*_multi_10demos.pkl" -p loop:=true
+   
+ # CSV 사용 (백업)
  ros2 run hri_falcon_robot_bridge demo_ee_player_node --ros-args \
    -p csv_pattern:="outputs/demo_*.csv" -p loop:=true
 """
@@ -26,6 +32,7 @@ from std_msgs.msg import Bool, UInt8
 
 import numpy as np
 import pandas as pd
+import pickle
 from pathlib import Path
 from glob import glob
 from scipy.interpolate import interp1d
@@ -38,6 +45,7 @@ class DemoEEPlayerNode(Node):
     def __init__(self):
         super().__init__('demo_ee_player_node')
         # Parameters
+        self.declare_parameter('pkl_pattern', '')  # DMP PKL 파일 패턴 (우선순위)
         self.declare_parameter('csv', '')
         self.declare_parameter('csv_pattern', '')
         self.declare_parameter('rate_hz', 100.0)
@@ -68,6 +76,7 @@ class DemoEEPlayerNode(Node):
         self.initial_pos_sent = not self.manual_start  # 초기 위치 전송 완료 여부
         self.prev_pos = {}  # velocity 계산용 이전 위치
 
+        pkl_pattern = str(p('pkl_pattern'))
         csv = str(p('csv'))
         csv_pattern = str(p('csv_pattern'))
         self.target_len = int(p('target_len') or 0)
@@ -94,18 +103,34 @@ class DemoEEPlayerNode(Node):
         self._set_playback_stage(init_stage)
 
         # Load trajectories (모든 손가락)
+        # 우선순위: PKL > CSV
         self.trajs = {}
         self.N = 0
-        for finger in self.fingers:
-            traj = self._load_trajectory(csv, csv_pattern, finger)
-            self.trajs[finger] = traj
-            if len(traj) > 0:
-                if self.N == 0:
-                    self.N = len(traj)
-                elif self.N != len(traj):
-                    self.get_logger().warn(f"Trajectory length mismatch for {finger}: {len(traj)} vs {self.N}")
-                    self.N = min(self.N, len(traj))
-            self.get_logger().info(f"Loaded trajectory for {finger}: len={len(traj)}")
+        
+        if pkl_pattern:
+            self.get_logger().info(f"[PKL MODE] Loading DMP models from: {pkl_pattern}")
+            for finger in self.fingers:
+                traj = self._load_dmp_trajectory(pkl_pattern, finger)
+                self.trajs[finger] = traj
+                if len(traj) > 0:
+                    if self.N == 0:
+                        self.N = len(traj)
+                    elif self.N != len(traj):
+                        self.get_logger().warn(f"Trajectory length mismatch for {finger}: {len(traj)} vs {self.N}")
+                        self.N = min(self.N, len(traj))
+                self.get_logger().info(f"  Loaded DMP trajectory for {finger}: len={len(traj)}")
+        else:
+            self.get_logger().info("[CSV MODE] Loading trajectories from CSV files")
+            for finger in self.fingers:
+                traj = self._load_trajectory(csv, csv_pattern, finger)
+                self.trajs[finger] = traj
+                if len(traj) > 0:
+                    if self.N == 0:
+                        self.N = len(traj)
+                    elif self.N != len(traj):
+                        self.get_logger().warn(f"Trajectory length mismatch for {finger}: {len(traj)} vs {self.N}")
+                        self.N = min(self.N, len(traj))
+                self.get_logger().info(f"Loaded trajectory for {finger}: len={len(traj)}")
         
         if self.N == 0:
             self.get_logger().error("No trajectory data loaded. Node idle.")
@@ -132,6 +157,81 @@ class DemoEEPlayerNode(Node):
         # Keyboard check timer (10Hz)
         if self.manual_start:
             self.key_timer = self.create_timer(0.1, self._check_keyboard)
+
+    def _load_dmp_trajectory(self, pkl_pattern: str, finger: str) -> np.ndarray:
+        """Load DMP model from PKL file and generate trajectory
+        
+        Args:
+            pkl_pattern: Glob pattern for PKL files (e.g., "dmp_models/dmp_*_multi_10demos.pkl")
+            finger: Finger identifier (th, if, mf)
+        
+        Returns:
+            np.ndarray: Generated trajectory from DMP rollout (N, 3)
+        """
+        # Find matching PKL file for this finger
+        pattern = pkl_pattern.replace('*', finger).replace('{finger}', finger)
+        if '*' in pattern:
+            # Pattern still has wildcards - search for files
+            matching_files = sorted(glob(pattern))
+            # Filter for exact finger match
+            pkl_files = [f for f in matching_files if f"dmp_{finger}_" in Path(f).name]
+        else:
+            # Exact path provided
+            pkl_files = [pattern] if Path(pattern).exists() else []
+        
+        if len(pkl_files) == 0:
+            self.get_logger().warn(f"No PKL file found for {finger} with pattern: {pkl_pattern}")
+            return np.zeros((0, 3))
+        
+        # Use the first matching file (or most recent if multiple)
+        pkl_path = pkl_files[-1]  # Last in sorted list
+        self.get_logger().info(f"Loading DMP for {finger}: {Path(pkl_path).name}")
+        
+        try:
+            with open(pkl_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            # Extract DMP parameters
+            y0 = data['y0']
+            goal = data['goal']  # This is the EXTENDED goal (연장된 목표점)
+            w = data['w']
+            dt = data.get('dt', 0.02)
+            tau = data.get('tau', 30.0)
+            n_bfs = data.get('n_bfs', 50)
+            alpha_y = data.get('alpha_y', 25.0)
+            beta_y = data.get('beta_y', 6.25)
+            a_x = 1.0
+            
+            # DMP rollout (same logic as DiscreteDMP.rollout)
+            n_steps = int(tau / dt)
+            y = y0.copy()
+            dy = np.zeros_like(y)
+            path = []
+            x = 1.0
+            
+            def gaussian_basis(x_val, n_bfs, a_x):
+                centers = np.exp(-a_x * np.linspace(0, 1, n_bfs))
+                widths = (np.diff(centers)[0] if n_bfs > 1 else 1.0) ** 2
+                h = np.exp(-((x_val - centers) ** 2) / (2 * widths))
+                return h
+            
+            for _ in range(n_steps):
+                path.append(y.copy())
+                x_next = x - a_x * x * (dt / tau)
+                psi = gaussian_basis(x, n_bfs, a_x)
+                f = np.dot(psi * x, w) / (np.sum(psi) + 1e-10)
+                ddy = alpha_y * (beta_y * (goal - y) - dy) + f
+                dy += ddy * (dt / tau)
+                y += dy * (dt / tau)
+                x = x_next
+            
+            traj = np.array(path)
+            self.get_logger().info(f"  ✅ DMP rollout complete: len={len(traj)}, extended_goal={goal}")
+            return traj
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to load DMP for {finger}: {e}")
+            return np.zeros((0, 3))
 
     def _load_trajectory(self, csv: str, csv_pattern: str, finger: str) -> np.ndarray:
         files = []
