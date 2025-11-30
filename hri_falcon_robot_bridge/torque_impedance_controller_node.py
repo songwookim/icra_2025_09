@@ -193,11 +193,19 @@ class TorqueImpedanceControllerNode(Node):
         self.stiffness_log_active = False
         self.stiffness_log_data: List[Tuple[float, np.ndarray]] = []
         self.eccentricity_log_data: List[Tuple[float, float]] = []
+        self.eccentricity_smoothed_log_data: List[Tuple[float, float]] = []  # Smoothed eccentricity from run_policy_node
         self.force_log_data: List[Tuple[float, Dict[str, np.ndarray]]] = []  # Store fx,fy,fz for each finger
+        self.ee_pos_log_data: List[Tuple[float, Dict[str, np.ndarray]]] = []  # Store actual EE positions
+        self.desired_pos_log_data: List[Tuple[float, Dict[str, np.ndarray]]] = []  # Store desired EE positions
+        self.torque_log_data: List[Tuple[float, np.ndarray]] = []  # Store computed torques
+        self.current_units_log_data: List[Tuple[float, np.ndarray]] = []  # Store current units (clipped)
+        self.current_units_raw_log_data: List[Tuple[float, np.ndarray]] = []  # Store raw current units (before clipping)
         self.stiffness_log_start_time = 0.0
         self._stiffness_log_session_id = 0
         self.current_eccentricity = 0.0
+        self.current_eccentricity_smoothed = 0.0
         self.has_eccentricity = False
+        self.has_eccentricity_smoothed = False
 
         self.mj_model = None
         self.mj_data = None
@@ -209,6 +217,7 @@ class TorqueImpedanceControllerNode(Node):
         # Subscriptions
         self.create_subscription(Float32MultiArray, "/impedance_control/target_stiffness", self.subscribe_stiffness, 10)
         self.create_subscription(Float32, "/deformity_tracker/eccentricity", self.subscribe_eccentricity, 10)
+        self.create_subscription(Float32, "/deformity_tracker/eccentricity_smoothed", self.subscribe_eccentricity_smoothed, 10)
         # Subscribe to external joint state (robot controller) instead of hardcoded hand tracker
         self.create_subscription(JointState, self.joint_state_topic, self.subscribe_joint_state, 10)
         self.get_logger().info(f"[INIT] JointState subscriber CREATED: topic={self.joint_state_topic}")
@@ -484,6 +493,13 @@ class TorqueImpedanceControllerNode(Node):
             self.has_eccentricity = True
         except Exception as e:
             self.get_logger().warning(f"eccentricity 콜백 오류: {e}")
+    
+    def subscribe_eccentricity_smoothed(self, msg: Float32) -> None:
+        try:
+            self.current_eccentricity_smoothed = float(msg.data)
+            self.has_eccentricity_smoothed = True
+        except Exception as e:
+            self.get_logger().warning(f"eccentricity_smoothed 콜백 오류: {e}")
 
     def subscribe_joint_state(self, msg: JointState) -> None:
         try:
@@ -618,6 +634,12 @@ class TorqueImpedanceControllerNode(Node):
                         self._mj_viewer.user_scn.ngeom = 0  # type: ignore[attr-defined]
                         # Add desired positions as visual markers
                         rendered_count = 0
+                        # Finger-specific colors: mf=[0.3,1,0.3,1], th=[0.3,0.3,1,1], if=[1,0.3,0.3,1]
+                        finger_colors = {
+                            'mf': [0.3, 1.0, 0.3, 1.0],  # Green-ish
+                            'th': [0.3, 0.3, 1.0, 1.0],  # Blue-ish
+                            'if': [1.0, 0.3, 0.3, 1.0],  # Red-ish
+                        }
                         for finger in ['th', 'if', 'mf']:
                             if self.fingers[finger].has_desired_pos:
                                 pos = self.desired_pos[finger]
@@ -625,9 +647,9 @@ class TorqueImpedanceControllerNode(Node):
                                 if geom_idx < self._mj_viewer.user_scn.maxgeom:  # type: ignore[attr-defined]
                                     geom = self._mj_viewer.user_scn.geoms[geom_idx]  # type: ignore[attr-defined]
                                     geom.type = mj.mjtGeom.mjGEOM_SPHERE  # type: ignore
-                                    geom.size[:] = [0.03, 0.03, 0.03]  # 3cm radius - much larger
+                                    geom.size[:] = [0.01, 0.01, 0.01]  # 3cm radius - much larger
                                     geom.pos[:] = pos
-                                    geom.rgba[:] = [1.0, 0.0, 0.0, 1.0]  # Bright red
+                                    geom.rgba[:] = finger_colors[finger]  # Finger-specific color
                                     geom.mat[:] = np.eye(3).reshape(3, 3)  # 3x3 identity matrix
                                     self._mj_viewer.user_scn.ngeom += 1  # type: ignore[attr-defined]
                                     rendered_count += 1
@@ -720,7 +742,7 @@ class TorqueImpedanceControllerNode(Node):
                 continue
             k_start = f_idx * 3
             k_end = k_start + 3
-            K_vec = self.target_stiffness[k_start:k_end]
+            K_vec = self.target_stiffness[k_start:k_end] * self.stiffness_scale  # Apply stiffness scaling
             D_vec = self._compute_damping(K_vec)
             pos_err = self.desired_pos[finger] - self.fingers[finger].ee_pos
             vel_err = self.desired_vel[finger] - self.fingers[finger].ee_vel
@@ -835,54 +857,62 @@ class TorqueImpedanceControllerNode(Node):
                 #     )
         
         # 루프 종료 후 전체 torques 출력
-        # if self._log_counter % int(self.rate_hz) == 0:
-        #     self.get_logger().info(
-        #         f"[TORQUE_FULL] "
-        #         f"th=[{torques[0]:.3f},{torques[1]:.3f},{torques[2]:.3f}] "
-        #         f"if=[{torques[3]:.3f},{torques[4]:.3f},{torques[5]:.3f}] "
-        #         f"mf=[{torques[6]:.3f},{torques[7]:.3f},{torques[8]:.3f}]"
-        #     )
+        if self._log_counter % int(self.rate_hz) == 0:
+            self.get_logger().info(
+                f"[TORQUE_FULL] "
+                f"th=[{torques[0]:.3f},{torques[1]:.3f},{torques[2]:.3f}] "
+                f"if=[{torques[3]:.3f},{torques[4]:.3f},{torques[5]:.3f}] "
+                f"mf=[{torques[6]:.3f},{torques[7]:.3f},{torques[8]:.3f}]"
+            )
         return torques
 
-    def _torques_to_current_units(self, torques: np.ndarray) -> List[int]:
-        currents_mA = np.where(CURRENT_TO_TORQUE > 0.0, torques / CURRENT_TO_TORQUE, 0.0)
-        units = currents_mA / CURRENT_UNIT
-        # Apply per-joint current_units_scale before clipping (element-wise multiplication)
-        # units = units * self.current_units_scale
-        # units = torques * self.current_units_scale
-        # Apply asymmetric clipping: positive and negative limits can differ
-        units = np.clip(units, -self.max_current_units_neg, self.max_current_units_pos)
-        # self.get_logger().info(
-        #     f"[TORQUE_DEBUG] current_units ,{self.current_units_scale} "
-        #     f"th=[{currents_mA[0]:.3f},{currents_mA[1]:.3f},{currents_mA[2]:.3f}] "
-        #     f"if=[{currents_mA[3]:.3f},{currents_mA[4]:.3f},{currents_mA[5]:.3f}] "
-        #     f"mf=[{currents_mA[6]:.3f},{currents_mA[7]:.3f},{currents_mA[8]:.3f}]"
-        # )
-        return [int(round(u)) for u in units]
     # def _torques_to_current_units(self, torques: np.ndarray) -> List[int]:
-    #     # 1) 토크 → 전류(mA)
-    #     #    CURRENT_TO_TORQUE: N·m / mA
-    #     currents_mA = np.where(
-    #         CURRENT_TO_TORQUE > 0.0,
-    #         torques / CURRENT_TO_TORQUE,
-    #         0.0,
-    #     )
-
-    #     # 2) 전류(mA) → current unit (1 unit ≈ 2.69 mA)
+    #     currents_mA = np.where(CURRENT_TO_TORQUE > 0.0, torques / CURRENT_TO_TORQUE, 0.0)
     #     units = currents_mA / CURRENT_UNIT
-
-    #     # 3) per-joint 튜닝 스케일 (처음엔 1.0으로 두고 시작)
-    #     units = units * self.current_units_scale
-
-    #     # 4) 안전 클리핑
+    #     # Apply per-joint current_units_scale before clipping (element-wise multiplication)
+    #     # units = units * self.current_units_scale
+    #     # units = torques * self.current_units_scale
+    #     # Apply asymmetric clipping: positive and negative limits can differ
     #     units = np.clip(units, -self.max_current_units_neg, self.max_current_units_pos)
-
+    #     # self.get_logger().info(
+    #     #     f"[TORQUE_DEBUG] current_units ,{self.current_units_scale} "
+    #     #     f"th=[{currents_mA[0]:.3f},{currents_mA[1]:.3f},{currents_mA[2]:.3f}] "
+    #     #     f"if=[{currents_mA[3]:.3f},{currents_mA[4]:.3f},{currents_mA[5]:.3f}] "
+    #     #     f"mf=[{currents_mA[6]:.3f},{currents_mA[7]:.3f},{currents_mA[8]:.3f}]"
+    #     # )
     #     return [int(round(u)) for u in units]
+    def _torques_to_current_units(self, torques: np.ndarray) -> tuple[List[int], List[int]]:
+        """
+        Convert torques to current units.
+        
+        Returns:
+            tuple: (clipped_units, raw_units_before_clipping) - both as List[int]
+        """
+        # 1) 토크 → 전류(mA)
+        #    CURRENT_TO_TORQUE: N·m / mA
+        currents_mA = np.where(
+            CURRENT_TO_TORQUE > 0.0,
+            torques / CURRENT_TO_TORQUE,
+            0.0,
+        )
+
+        # 2) 전류(mA) → current unit (1 unit ≈ 2.69 mA)
+        units = currents_mA / CURRENT_UNIT
+        # 3) per-joint 튜닝 스케일 (처음엔 1.0으로 두고 시작)
+        units = torques * self.current_units_scale
+        
+        # Store raw units before clipping (as int list)
+        units_raw = [int(round(u)) for u in units]
+
+        # 4) 안전 클리핑
+        units = np.clip(units, -self.max_current_units_neg, self.max_current_units_pos)
+
+        return [int(round(u)) for u in units], units_raw
 
     def _publish_zero_current(self, reason: Optional[str] = None, level: str = "warn") -> None:
             """Send zero current command to all motors with optional throttled logging."""
             zero_msg = Int32MultiArray()
-            zero_msg.data = [0] * 9
+            zero_msg.data = [1] * 9 
             self.current_pub.publish(zero_msg)
             
             if reason and self._log_counter % int(self.rate_hz) == 0:
@@ -901,7 +931,13 @@ class TorqueImpedanceControllerNode(Node):
             return
         self.stiffness_log_data = []
         self.eccentricity_log_data = []
+        self.eccentricity_smoothed_log_data = []
         self.force_log_data = []
+        self.ee_pos_log_data = []
+        self.desired_pos_log_data = []
+        self.torque_log_data = []
+        self.current_units_log_data = []
+        self.current_units_raw_log_data = []
         self.stiffness_log_active = True
         self.stiffness_log_start_time = self.get_clock().now().nanoseconds / 1e9
         self._stiffness_log_session_id += 1
@@ -916,19 +952,29 @@ class TorqueImpedanceControllerNode(Node):
         sample_count = len(self.stiffness_log_data)
         ecc_count = len(self.eccentricity_log_data)
         force_count = len(self.force_log_data)
-        if sample_count == 0 and ecc_count == 0 and force_count == 0:
+        ee_pos_count = len(self.ee_pos_log_data)
+        torque_count = len(self.torque_log_data)
+        if sample_count == 0 and ecc_count == 0 and force_count == 0 and ee_pos_count == 0 and torque_count == 0:
             self.get_logger().info(
                 f"[STIFFNESS_LOG] Recording stopped ({reason}) but no samples captured"
             )
             return
         self.get_logger().info(
-            f"[STIFFNESS_LOG] Recording stopped ({reason}), stiffness={sample_count}, ecc={ecc_count}, force={force_count}"
+            f"[STIFFNESS_LOG] Recording stopped ({reason}), stiffness={sample_count}, ecc={ecc_count}, force={force_count}, ee_pos={ee_pos_count}, torque={torque_count}"
         )
         self._save_stiffness_eccentricity_plot()
         self._save_force_plot()
+        self._save_ee_position_plot()
+        self._save_torque_current_plot()
         self.stiffness_log_data = []
         self.eccentricity_log_data = []
+        self.eccentricity_smoothed_log_data = []
         self.force_log_data = []
+        self.ee_pos_log_data = []
+        self.desired_pos_log_data = []
+        self.torque_log_data = []
+        self.current_units_log_data = []
+        self.current_units_raw_log_data = []
 
     def _save_stiffness_eccentricity_plot(self) -> None:
         """Save stiffness + eccentricity plot (2 subplots)"""
@@ -955,18 +1001,24 @@ class TorqueImpedanceControllerNode(Node):
         for idx in range(values.shape[1]):
             ax1.plot(times_stiff, values[:, idx], label=component_labels[idx])
         ax1.set_ylabel("Stiffness (N/m)")
-        ax1.set_title("Playback stiffness + eccentricity")
+        ax1.set_title("stiffness P(k|obs) + eccentricity")
         ax1.grid(True, alpha=0.3)
         ax1.legend(loc="upper right", ncol=3, fontsize=8)
         
-        # Subplot 2: Eccentricity
+        # Subplot 2: Eccentricity (raw and smoothed)
         if self.eccentricity_log_data:
             times_ecc = np.array([entry[0] for entry in self.eccentricity_log_data], dtype=float)
             ecc_vals = np.array([entry[1] for entry in self.eccentricity_log_data], dtype=float)
-            ax2.plot(times_ecc, ecc_vals, color='red', linewidth=1.5, label='Eccentricity')
+            ax2.plot(times_ecc, ecc_vals, color='red', linewidth=1.0, alpha=0.6, label='Eccentricity (raw)')
+        if self.eccentricity_smoothed_log_data:
+            times_ecc_sm = np.array([entry[0] for entry in self.eccentricity_smoothed_log_data], dtype=float)
+            ecc_vals_sm = np.array([entry[1] for entry in self.eccentricity_smoothed_log_data], dtype=float)
+            ax2.plot(times_ecc_sm, ecc_vals_sm, color='blue', linewidth=1.5, label='Eccentricity (smoothed)')
+        if self.eccentricity_log_data or self.eccentricity_smoothed_log_data:
             ax2.set_ylabel("Eccentricity")
             ax2.set_xlabel("Time (s)")
             ax2.grid(True, alpha=0.3)
+            ax2.legend(loc="upper right")
             ax2.legend(loc="upper right")
         else:
             ax2.text(0.5, 0.5, "No eccentricity data", ha='center', va='center', transform=ax2.transAxes)
@@ -1070,6 +1122,196 @@ class TorqueImpedanceControllerNode(Node):
             self.get_logger().error(f"[FORCE_LOG] Traceback:\n{traceback.format_exc()}")
         finally:
             plt.close()
+
+    def _save_ee_position_plot(self) -> None:
+        """Save EE position tracking plot: desired vs actual (3 fingers x 3 axes = 9 subplots)"""
+        if not self.ee_pos_log_data or not self.desired_pos_log_data:
+            self.get_logger().info("[EE_POS_LOG] No EE position data to plot")
+            return
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            self.get_logger().warning("[EE_POS_LOG] Matplotlib not available - skip plot")
+            return
+        
+        times_ee = np.array([entry[0] for entry in self.ee_pos_log_data], dtype=float)
+        times_desired = np.array([entry[0] for entry in self.desired_pos_log_data], dtype=float)
+        
+        # Extract position data for each finger and axis
+        ee_data: Dict[str, Dict[str, List[float]]] = {
+            'th': {'x': [], 'y': [], 'z': []},
+            'if': {'x': [], 'y': [], 'z': []},
+            'mf': {'x': [], 'y': [], 'z': []}
+        }
+        desired_data: Dict[str, Dict[str, List[float]]] = {
+            'th': {'x': [], 'y': [], 'z': []},
+            'if': {'x': [], 'y': [], 'z': []},
+            'mf': {'x': [], 'y': [], 'z': []}
+        }
+        
+        for _, pos_dict in self.ee_pos_log_data:
+            for finger in ['th', 'if', 'mf']:
+                if finger in pos_dict:
+                    vec = pos_dict[finger]
+                    ee_data[finger]['x'].append(vec[0])
+                    ee_data[finger]['y'].append(vec[1])
+                    ee_data[finger]['z'].append(vec[2])
+                else:
+                    ee_data[finger]['x'].append(0.0)
+                    ee_data[finger]['y'].append(0.0)
+                    ee_data[finger]['z'].append(0.0)
+        
+        for _, pos_dict in self.desired_pos_log_data:
+            for finger in ['th', 'if', 'mf']:
+                if finger in pos_dict:
+                    vec = pos_dict[finger]
+                    desired_data[finger]['x'].append(vec[0])
+                    desired_data[finger]['y'].append(vec[1])
+                    desired_data[finger]['z'].append(vec[2])
+                else:
+                    desired_data[finger]['x'].append(0.0)
+                    desired_data[finger]['y'].append(0.0)
+                    desired_data[finger]['z'].append(0.0)
+        
+        # Convert to numpy arrays
+        ee_arrays: Dict[str, Dict[str, np.ndarray]] = {}
+        desired_arrays: Dict[str, Dict[str, np.ndarray]] = {}
+        for finger in ['th', 'if', 'mf']:
+            ee_arrays[finger] = {}
+            desired_arrays[finger] = {}
+            for axis in ['x', 'y', 'z']:
+                ee_arrays[finger][axis] = np.array(ee_data[finger][axis], dtype=float)
+                desired_arrays[finger][axis] = np.array(desired_data[finger][axis], dtype=float)
+        
+        # Create 3x3 grid: rows=fingers, columns=axes
+        fig, axes = plt.subplots(3, 3, figsize=(15, 10), sharex=True)
+        fig.suptitle("EE Position Tracking: Desired vs Actual", fontsize=14)
+        
+        finger_names = {'th': 'Thumb', 'if': 'Index', 'mf': 'Middle'}
+        axis_names = ['x', 'y', 'z']
+        
+        for row, finger in enumerate(['th', 'if', 'mf']):
+            for col, axis in enumerate(axis_names):
+                ax = axes[row, col]
+                # Plot desired position (dashed line)
+                ax.plot(times_desired, desired_arrays[finger][axis], 
+                       color='red', linestyle='--', linewidth=1.5, label='Desired', alpha=0.7)
+                # Plot actual position (solid line)
+                ax.plot(times_ee, ee_arrays[finger][axis], 
+                       color='blue', linestyle='-', linewidth=1.2, label='Actual')
+                ax.set_ylabel(f"{finger_names[finger]} (m)")
+                ax.grid(True, alpha=0.3)
+                if row == 0:
+                    ax.set_title(f"{axis.upper()}")
+                if row == 2:
+                    ax.set_xlabel("Time (s)")
+                if row == 0 and col == 2:
+                    ax.legend(loc='upper right', fontsize=8)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        import os as _os_module
+        pid = _os_module.getpid()
+        filename = os.path.join(
+            self.stiffness_log_dir,
+            f"ee_position_tracking_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
+        )
+        try:
+            plt.tight_layout()
+            plt.savefig(filename, dpi=200)
+            self.get_logger().warning(
+                f"[EE_POS_LOG] *** SAVED PLOT 3/4 *** EE Position Tracking ({len(times_ee)} samples) -> {filename}"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"[EE_POS_LOG] Failed to save EE position plot: {exc}")
+            import traceback
+            self.get_logger().error(f"[EE_POS_LOG] Traceback:\n{traceback.format_exc()}")
+        finally:
+            plt.close()
+
+    def _save_torque_current_plot(self) -> None:
+        """Save torque and current units plot (9 joints x 2 metrics = 9 subplots with 3 lines each: torque, clipped current, raw current)"""
+        if not self.torque_log_data or not self.current_units_log_data:
+            self.get_logger().info("[TORQUE_LOG] No torque/current data to plot")
+            return
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            self.get_logger().warning("[TORQUE_LOG] Matplotlib not available - skip plot")
+            return
+        
+        times_torque = np.array([entry[0] for entry in self.torque_log_data], dtype=float)
+        times_current = np.array([entry[0] for entry in self.current_units_log_data], dtype=float)
+        times_current_raw = np.array([entry[0] for entry in self.current_units_raw_log_data], dtype=float) if self.current_units_raw_log_data else times_current
+        
+        # Extract torque and current data (9 joints each)
+        torques_array = np.stack([entry[1] for entry in self.torque_log_data], axis=0)  # shape: (N, 9)
+        currents_array = np.stack([entry[1] for entry in self.current_units_log_data], axis=0).astype(int)  # shape: (N, 9), force int
+        currents_raw_array = np.stack([entry[1] for entry in self.current_units_raw_log_data], axis=0).astype(int) if self.current_units_raw_log_data else currents_array  # shape: (N, 9), force int
+        
+        # Create 3x3 grid for 9 joints
+        fig, axes = plt.subplots(3, 3, figsize=(15, 10), sharex=True)
+        fig.suptitle("Torque Inputs vs Current Units (9 joints)\nBlue: Torque | Red: Clipped Current | Orange: Raw Current (before clipping)", fontsize=14)
+        
+        joint_labels = [
+            'TH_J0', 'TH_J1', 'TH_J2',
+            'IF_J0', 'IF_J1', 'IF_J2',
+            'MF_J0', 'MF_J1', 'MF_J2'
+        ]
+        
+        for joint_idx in range(9):
+            row = joint_idx // 3
+            col = joint_idx % 3
+            ax = axes[row, col]
+            
+            # Plot torque on primary y-axis
+            ax.plot(times_torque, torques_array[:, joint_idx], 
+                   color='blue', linewidth=1.2, label='Torque (Nm)')
+            ax.set_ylabel("Torque (Nm)", color='blue')
+            ax.tick_params(axis='y', labelcolor='blue')
+            ax.grid(True, alpha=0.3)
+            
+            # Plot current units on secondary y-axis
+            ax2 = ax.twinx()
+            # Plot raw current (before clipping) - orange dashed
+            if self.current_units_raw_log_data:
+                ax2.plot(times_current_raw, currents_raw_array[:, joint_idx], 
+                        color='orange', linewidth=1.0, linestyle='--', label='Raw Current (pre-clip)', alpha=0.5)
+            # Plot clipped current - red solid
+            ax2.plot(times_current, currents_array[:, joint_idx], 
+                    color='red', linewidth=1.2, label='Clipped Current', alpha=0.8)
+            ax2.set_ylabel("Current Units", color='red')
+            ax2.tick_params(axis='y', labelcolor='red')
+            
+            ax.set_title(joint_labels[joint_idx], fontsize=10)
+            if row == 2:
+                ax.set_xlabel("Time (s)")
+            
+            # Add legend only to first subplot
+            if joint_idx == 0:
+                lines1, labels1 = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=7)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        import os as _os_module
+        pid = _os_module.getpid()
+        filename = os.path.join(
+            self.stiffness_log_dir,
+            f"torque_current_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
+        )
+        try:
+            plt.tight_layout()
+            plt.savefig(filename, dpi=200)
+            self.get_logger().warning(
+                f"[TORQUE_LOG] *** SAVED PLOT 4/4 *** Torque vs Current ({len(times_torque)} samples) -> {filename}"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"[TORQUE_LOG] Failed to save torque/current plot: {exc}")
+            import traceback
+            self.get_logger().error(f"[TORQUE_LOG] Traceback:\n{traceback.format_exc()}")
+        finally:
+            plt.close()
+
     def _control_loop(self) -> None:
         try:
             raw_tau = self._compute_torques()
@@ -1080,6 +1322,8 @@ class TorqueImpedanceControllerNode(Node):
                     self.stiffness_log_data.append((rel_t, self.target_stiffness.copy()))
                 if self.has_eccentricity:
                     self.eccentricity_log_data.append((rel_t, self.current_eccentricity))
+                if self.has_eccentricity_smoothed:
+                    self.eccentricity_smoothed_log_data.append((rel_t, self.current_eccentricity_smoothed))
                 # Log force sensor data (all three fingers, all three axes)
                 force_snapshot = {
                     'th': self.measured_force_vec['th'].copy(),
@@ -1087,11 +1331,26 @@ class TorqueImpedanceControllerNode(Node):
                     'mf': self.measured_force_vec['mf'].copy()
                 }
                 self.force_log_data.append((rel_t, force_snapshot))
+                # Log EE positions (actual and desired)
+                ee_pos_snapshot = {
+                    'th': self.fingers['th'].ee_pos.copy() if self.fingers['th'].ee_pos is not None else np.zeros(3),
+                    'if': self.fingers['if'].ee_pos.copy() if self.fingers['if'].ee_pos is not None else np.zeros(3),
+                    'mf': self.fingers['mf'].ee_pos.copy() if self.fingers['mf'].ee_pos is not None else np.zeros(3)
+                }
+                self.ee_pos_log_data.append((rel_t, ee_pos_snapshot))
+                desired_pos_snapshot = {
+                    'th': self.desired_pos['th'].copy(),
+                    'if': self.desired_pos['if'].copy(),
+                    'mf': self.desired_pos['mf'].copy()
+                }
+                self.desired_pos_log_data.append((rel_t, desired_pos_snapshot))
+                # Log torques (will be populated after filtering)
+                self.torque_log_data.append((rel_t, raw_tau.copy()))
                 # Debug: log every 100 samples
-                if len(self.stiffness_log_data) % 100 == 1:
-                    self.get_logger().info(
-                        f"[STIFFNESS_LOG] Recording... stiffness={len(self.stiffness_log_data)}, ecc={len(self.eccentricity_log_data)}, force={len(self.force_log_data)}, t={rel_t:.2f}s"
-                    )
+                # if len(self.stiffness_log_data) % 100 == 1:
+                #     self.get_logger().info(
+                #         f"[STIFFNESS_LOG] Recording... stiffness={len(self.stiffness_log_data)}, ecc={len(self.eccentricity_log_data)}, force={len(self.force_log_data)}, t={rel_t:.2f}s"
+                #     )
             
             # # Debug: log raw_tau before safety check
             # if self._log_counter % int(self.rate_hz) == 0:
@@ -1139,8 +1398,15 @@ class TorqueImpedanceControllerNode(Node):
             
             raw_tau = np.clip(raw_tau, -self.max_torque, self.max_torque)
             
-            filt_tau = self._filter_torques(raw_tau)
-            current_units = self._torques_to_current_units(filt_tau)
+            # filt_tau = self._filter_torques(raw_tau)
+            current_units, current_units_raw = self._torques_to_current_units(raw_tau)
+            
+            # Log current units if logging active
+            if self.stiffness_log_active:
+                now_s = self.get_clock().now().nanoseconds / 1e9
+                rel_t = now_s - self.stiffness_log_start_time
+                self.current_units_log_data.append((rel_t, np.array(current_units, dtype=int)))
+                self.current_units_raw_log_data.append((rel_t, np.array(current_units_raw, dtype=int)))
             
             # Debug: log filtered torque and current units
             if self._log_counter % int(self.rate_hz) == 0:
@@ -1151,10 +1417,16 @@ class TorqueImpedanceControllerNode(Node):
                     f"mf=[{filt_tau[6]:.3f},{filt_tau[7]:.3f},{filt_tau[8]:.3f}]"
                 )
                 self.get_logger().info(
-                    f"[TORQUE_DEBUG] current_units , "
-                    f"th=[{current_units[0]:.3f},{current_units[1]:.3f},{current_units[2]:.3f}] "
-                    f"if=[{current_units[3]:.3f},{current_units[4]:.3f},{current_units[5]:.3f}] "
-                    f"mf=[{current_units[6]:.3f},{current_units[7]:.3f},{current_units[8]:.3f}]"
+                    f"[TORQUE_DEBUG] current_units (clipped), "
+                    f"th=[{current_units[0]},{current_units[1]},{current_units[2]}] "
+                    f"if=[{current_units[3]},{current_units[4]},{current_units[5]}] "
+                    f"mf=[{current_units[6]},{current_units[7]},{current_units[8]}]"
+                )
+                self.get_logger().info(
+                    f"[TORQUE_DEBUG] current_units_raw (before clip), "
+                    f"th=[{current_units_raw[0]},{current_units_raw[1]},{current_units_raw[2]}] "
+                    f"if=[{current_units_raw[3]},{current_units_raw[4]},{current_units_raw[5]}] "
+                    f"mf=[{current_units_raw[6]},{current_units_raw[7]},{current_units_raw[8]}]"
                 )
             
             cur_msg = Int32MultiArray()
@@ -1186,15 +1458,15 @@ class TorqueImpedanceControllerNode(Node):
                     # self.get_logger().info(f"[STATUS] desired_ee: {desired_status} | pos_err: {error_str}")
                     if self.has_stiffness:
                         k = self.target_stiffness
-                        # self.get_logger().info(
-                        #     f"K_rcv: [TH: {k[0]:5.1f} {k[1]:5.1f} {k[2]:5.1f} | "
-                        #     f"IF: {k[3]:5.1f} {k[4]:5.1f} {k[5]:5.1f} | "
-                        #     f"MF: {k[6]:5.1f} {k[7]:5.1f} {k[8]:5.1f}]\n"
-                        #     f"       τ_out: [TH: {filt_tau[0]:5.3f} {filt_tau[1]:5.3f} {filt_tau[2]:5.3f} | "
-                        #     f"IF: {filt_tau[3]:5.3f} {filt_tau[4]:5.3f} {filt_tau[5]:5.3f} | "
-                        #     f"MF: {filt_tau[6]:5.3f} {filt_tau[7]:5.3f} {filt_tau[8]:5.3f}] | "
-                        #     f"I_avg={np.mean(np.abs(current_units)):.0f}"
-                        # )
+                        self.get_logger().info(
+                            f"K_rcv: [TH: {k[0]:5.1f} {k[1]:5.1f} {k[2]:5.1f} | "
+                            f"IF: {k[3]:5.1f} {k[4]:5.1f} {k[5]:5.1f} | "
+                            f"MF: {k[6]:5.1f} {k[7]:5.1f} {k[8]:5.1f}]\n"
+                            f"       τ_out: [TH: {filt_tau[0]:5.3f} {filt_tau[1]:5.3f} {filt_tau[2]:5.3f} | "
+                            f"IF: {filt_tau[3]:5.3f} {filt_tau[4]:5.3f} {filt_tau[5]:5.3f} | "
+                            f"MF: {filt_tau[6]:5.3f} {filt_tau[7]:5.3f} {filt_tau[8]:5.3f}] | "
+                            f"I_avg={np.mean(np.abs(current_units)):.0f}"
+                        )
         except Exception as e:
             # Manual throttling: log error only once per second
             self._error_throttle_counter += 1

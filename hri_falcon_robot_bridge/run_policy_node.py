@@ -35,12 +35,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import rclpy
+from scipy.signal import butter, lfilter  # For low-pass filter
 import threading
 import select
 import termios
 import tty
 import time
 from geometry_msgs.msg import PoseStamped, WrenchStamped
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Float32, Float32MultiArray
@@ -101,9 +103,12 @@ class RunPolicyNode(Node):
 
     def __init__(self):
         super().__init__("run_policy_node")
+        
+        # Create reentrant callback group to allow parallel execution of callbacks
+        self.callback_group = ReentrantCallbackGroup()
 
-        # Declare parameters
-        self.declare_parameter("model_type", "bc")
+        # Declare all parameters
+        self.declare_parameter("model_type", "diffusion_t")  # Default: diffusion_t (temporal, best performance)
         self.declare_parameter("mode", "unified")
         self.declare_parameter("artifact_dir", "")
         self.declare_parameter("rate_hz", 100.0)
@@ -111,6 +116,14 @@ class RunPolicyNode(Node):
         self.declare_parameter("stiffness_min", 0.0)
         self.declare_parameter("stiffness_max", 1000.0)
         self.declare_parameter("smooth_window", 5)
+        # Low-pass filter parameters (Butterworth) - recommended: 3Hz cutoff for smooth stiffness
+        self.declare_parameter("lowpass_enabled", True)  # Enable LP filter by default
+        self.declare_parameter("lowpass_cutoff_hz", 3.0)  # Cutoff frequency in Hz (best: 3.0Hz)
+        self.declare_parameter("lowpass_order", 2)  # Filter order
+        # Time-based stiffness scaling parameters
+        self.declare_parameter("time_ramp_duration", 5.0)  # seconds to ramp up
+        self.declare_parameter("initial_stiffness_scale", 0.3)  # initial 30%
+        self.declare_parameter("final_stiffness_scale", 1.0)  # final 100%
         # (NEW) Sensor topic parameters for flexibility
         self.declare_parameter("force_topics", [
             "/force_sensor/s1/wrench",
@@ -142,6 +155,12 @@ class RunPolicyNode(Node):
         self.stiffness_min: float = float(_p("stiffness_min") or 0.0)
         self.stiffness_max: float = float(_p("stiffness_max") or 1000.0)
         self.smooth_window: int = max(1, int(_p("smooth_window") or 5))
+        
+        # Low-pass filter parameters
+        self.lowpass_enabled: bool = bool(_p("lowpass_enabled") if _p("lowpass_enabled") is not None else True)
+        self.lowpass_cutoff_hz: float = float(_p("lowpass_cutoff_hz") or 3.0)
+        self.lowpass_order: int = int(_p("lowpass_order") or 2)
+        
         ft = _p("force_topics") or []
         self.force_topics: List[str] = list(ft)
         self.deform_topic: str = str(_p("deform_topic") or "/deformity_tracker/eccentricity")
@@ -149,6 +168,13 @@ class RunPolicyNode(Node):
         self.ee_pose_mf_topic: str = str(_p("ee_pose_mf_topic") or "/ee_pose_mf")
         self.ee_pose_th_topic: str = str(_p("ee_pose_th_topic") or "/ee_pose_th")
         self.debug_inputs: bool = bool(_p("debug_inputs") if _p("debug_inputs") is not None else True)
+        
+        # Time-based stiffness scaling
+        self.time_ramp_duration: float = float(_p("time_ramp_duration") or 5.0)
+        self.initial_scale: float = float(_p("initial_stiffness_scale") or 0.3)
+        self.final_scale: float = float(_p("final_stiffness_scale") or 1.0)
+        self.policy_start_time: Optional[float] = None  # Set when first prediction starts
+        
         # Mock mode removed: always wait for real sensor data
         self.allow_mock_missing: bool = False
         self.mock_start_timeout_sec: float = 0.0
@@ -165,17 +191,40 @@ class RunPolicyNode(Node):
 
         # State holders for sensor data
         self.forces = [None, None, None]  # s1, s2, s3
-        self.deform_ecc = None
+        self.deform_ecc_raw = None  # RAW eccentricity for observation (policy uses this!)
+        self.deform_ecc_smoothed = None  # Smoothed eccentricity for plotting only
         self.ee_positions = {"if": None, "mf": None, "th": None}
+        
+        # Deformity smoothing buffer (for plotting only, NOT for observation!)
+        self.deform_buffer: List[float] = []
+        self.deform_buffer_size = 10
 
         # Stiffness prediction buffer for smoothing
         self.stiffness_buffer: List[np.ndarray] = []
+        
+        # Low-pass filter state (Butterworth IIR filter)
+        self._lp_b: Optional[np.ndarray] = None
+        self._lp_a: Optional[np.ndarray] = None
+        self._lp_zi: Optional[np.ndarray] = None  # Filter state for each dimension
+        self._lp_initialized = False
+        if self.lowpass_enabled:
+            self._init_lowpass_filter()
+
+        # === DEBUG LOGGING: Save observations & predictions for analysis ===
+        self.debug_log_data: List[Dict] = []  # Store all data for CSV export
+        self.debug_log_enabled = True  # Enable/disable logging
+        self.debug_log_max_samples = 10000  # Max samples to keep in memory
 
         # Temporal ensembling for diffusion policy (action chunking)
         self.action_horizon = 16  # prediction horizon from manifest
         self.action_buffer: List[np.ndarray] = []  # stores (horizon, 9) predictions
         self.exec_horizon = 1  # how many steps to execute per prediction
         self.action_step_counter = 0  # tracks current step in action sequence
+        
+        # [DEBUG] Sensor callback counters
+        self._force_callback_count = [0, 0, 0]
+        self._deform_callback_count = 0
+        self._ee_callback_count = {"if": 0, "mf": 0, "th": 0}
 
         # Model and scalers
         self.model: Optional[Any] = None
@@ -193,18 +242,23 @@ class RunPolicyNode(Node):
         self.stiffness_pub = self.create_publisher(
             Float32MultiArray, "/impedance_control/target_stiffness", 10
         )
+        
+        # Publisher for smoothed eccentricity (for comparison in plots)
+        self.smoothed_ecc_pub = self.create_publisher(
+            Float32, "/deformity_tracker/eccentricity_smoothed", 10
+        )
 
         # Attractor publisher (removed emg_bc support)
 
-        # Control timer
+        # Control timer (using reentrant callback group)
         period = 1.0 / self.rate_hz
-        self.timer = self.create_timer(period, self._control_callback)
+        self.timer = self.create_timer(period, self._control_callback, callback_group=self.callback_group)
 
         # Topic scan timer (diagnostics)
         self.debug_topic_scan: bool = bool(_p("debug_topic_scan") if _p("debug_topic_scan") is not None else True)
         self._scan_counter = 0
         if self.debug_topic_scan:
-            self._scan_timer = self.create_timer(2.0, self._scan_topics)
+            self._scan_timer = self.create_timer(2.0, self._scan_topics, callback_group=self.callback_group)
         else:
             self._scan_timer = None
 
@@ -225,25 +279,44 @@ class RunPolicyNode(Node):
         # Mock fallback state
         self._mock_activated = False
         self._node_start_time = time.time()
+        
+        # Register shutdown callback to save debug log
+        import atexit
+        atexit.register(self._save_debug_log)
 
     def _setup_subscribers(self):
         """Setup ROS topic subscribers for sensor data."""
         # Force sensors (3 sensors) using parameterized topics
         for i in range(3):
             topic = self.force_topics[i] if i < len(self.force_topics) else f"/force_sensor/s{i+1}/wrench"
-            self.create_subscription(WrenchStamped, topic, lambda msg, idx=i: self._on_force(idx, msg), 10)
+            self.create_subscription(
+                WrenchStamped, topic, lambda msg, idx=i: self._on_force(idx, msg), 10,
+                callback_group=self.callback_group
+            )
             if self.debug_inputs:
                 self.get_logger().info(f"Subscribed force[{i}] -> {topic}")
 
         # Deformity eccentricity
-        self.create_subscription(Float32, self.deform_topic, self._on_deform_ecc, 10)
+        self.create_subscription(
+            Float32, self.deform_topic, self._on_deform_ecc, 10,
+            callback_group=self.callback_group
+        )
         if self.debug_inputs:
             self.get_logger().info(f"Subscribed deform_ecc -> {self.deform_topic}")
 
         # End-effector positions (3 fingers)
-        self.create_subscription(PoseStamped, self.ee_pose_if_topic, self._on_ee_pose_if, 10)
-        self.create_subscription(PoseStamped, self.ee_pose_mf_topic, self._on_ee_pose_mf, 10)
-        self.create_subscription(PoseStamped, self.ee_pose_th_topic, self._on_ee_pose_th, 10)
+        self.create_subscription(
+            PoseStamped, self.ee_pose_if_topic, self._on_ee_pose_if, 10,
+            callback_group=self.callback_group
+        )
+        self.create_subscription(
+            PoseStamped, self.ee_pose_mf_topic, self._on_ee_pose_mf, 10,
+            callback_group=self.callback_group
+        )
+        self.create_subscription(
+            PoseStamped, self.ee_pose_th_topic, self._on_ee_pose_th, 10,
+            callback_group=self.callback_group
+        )
         if self.debug_inputs:
             self.get_logger().info(
                 f"Subscribed EE poses -> if:{self.ee_pose_if_topic}, mf:{self.ee_pose_mf_topic}, th:{self.ee_pose_th_topic}"
@@ -261,6 +334,7 @@ class RunPolicyNode(Node):
                 "ty": w.torque.y,
                 "tz": w.torque.z,
             }
+            self._force_callback_count[idx] += 1
             if self.debug_inputs and not self._force_logged[idx]:
                 self.get_logger().info(
                     f"Force s{idx+1} first msg fx={w.force.x:.2f} fy={w.force.y:.2f} fz={w.force.z:.2f}"
@@ -270,10 +344,26 @@ class RunPolicyNode(Node):
             self.get_logger().warning(f"Force callback error (s{idx+1}): {e}")
 
     def _on_deform_ecc(self, msg: Float32):
-        """Callback for deformity eccentricity."""
-        self.deform_ecc = msg.data
+        """Callback for deformity eccentricity. Smoothed value goes to observation."""
+        raw_value = msg.data
+        
+        # Store RAW value for logging/comparison
+        self.deform_ecc_raw = raw_value
+        
+        # Add to buffer for smoothing
+        self.deform_buffer.append(raw_value)
+        if len(self.deform_buffer) > self.deform_buffer_size:
+            self.deform_buffer.pop(0)
+        
+        # Compute smoothed value - THIS IS USED IN OBSERVATION!
+        self.deform_ecc_smoothed = sum(self.deform_buffer) / len(self.deform_buffer)
+        
+        # Publish smoothed eccentricity for comparison in plots
+        self.smoothed_ecc_pub.publish(Float32(data=self.deform_ecc_smoothed))
+        
+        self._deform_callback_count += 1
         if self.debug_inputs and not self._deform_logged:
-            self.get_logger().info(f"Deform eccentricity first msg ecc={self.deform_ecc:.3f}")
+            self.get_logger().info(f"Deform eccentricity first msg raw={raw_value:.3f}, smoothed={self.deform_ecc_smoothed:.3f}")
             self._deform_logged = True
 
     def _on_ee_pose_if(self, msg: PoseStamped):
@@ -281,6 +371,7 @@ class RunPolicyNode(Node):
         try:
             pos = msg.pose.position
             self.ee_positions["if"] = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
+            self._ee_callback_count["if"] += 1
             if self.debug_inputs and not self._ee_logged["if"]:
                 self.get_logger().info(f"EE if first msg pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f})")
                 self._ee_logged["if"] = True
@@ -292,6 +383,7 @@ class RunPolicyNode(Node):
         try:
             pos = msg.pose.position
             self.ee_positions["mf"] = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
+            self._ee_callback_count["mf"] += 1
             if self.debug_inputs and not self._ee_logged["mf"]:
                 self.get_logger().info(f"EE mf first msg pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f})")
                 self._ee_logged["mf"] = True
@@ -303,6 +395,7 @@ class RunPolicyNode(Node):
         try:
             pos = msg.pose.position
             self.ee_positions["th"] = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
+            self._ee_callback_count["th"] += 1
             if self.debug_inputs and not self._ee_logged["th"]:
                 self.get_logger().info(f"EE th first msg pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f})")
                 self._ee_logged["th"] = True
@@ -471,12 +564,15 @@ class RunPolicyNode(Node):
         self.get_logger().info(f"GMM/GMR model loaded from {model_path}")
 
     def _get_observation(self) -> Optional[np.ndarray]:
-        """Construct 19D observation vector from current sensor data."""
-        # ALL sensors are REQUIRED: forces, ee_positions, deform_ecc
+        """Construct 19D observation vector from current sensor data.
+        
+        Uses SMOOTHED eccentricity for stable policy predictions.
+        """
+        # ALL sensors are REQUIRED: forces, ee_positions, deform_ecc_smoothed
         forces_ready = all(f is not None for f in self.forces)
         ee_ready = all((p is not None and isinstance(p, np.ndarray) and p.size == 3 and np.all(np.isfinite(p)))
                        for p in self.ee_positions.values())
-        deform_ready = self.deform_ecc is not None and isinstance(self.deform_ecc, (int, float))
+        deform_ready = self.deform_ecc_smoothed is not None and isinstance(self.deform_ecc_smoothed, (int, float))
         
         if not (forces_ready and ee_ready and deform_ready):
             return None
@@ -492,8 +588,8 @@ class RunPolicyNode(Node):
                 # Should not happen since we gate on forces_ready
                 obs.extend([0.0, 0.0, 0.0])
 
-        # Eccentricity (1D)
-        obs.append(self.deform_ecc if self.deform_ecc is not None else 0.0)
+        # Eccentricity (1D) - USE SMOOTHED VALUE for stable policy!
+        obs.append(self.deform_ecc_smoothed if self.deform_ecc_smoothed is not None else 0.0)
 
         # End-effector positions (9D: if/mf/th px/py/pz)
         for finger in ["if", "mf", "th"]:
@@ -507,11 +603,27 @@ class RunPolicyNode(Node):
 
     def _predict_stiffness(self, obs: np.ndarray) -> np.ndarray:
         """Predict stiffness from observation using loaded model (9D)."""
+        import time as time_module
+        t_start = time_module.time()
+        
+        # [DEBUG] Log raw observation (every 2 seconds)
+        if self._log_counter % int(self.rate_hz * 2) == 0:
+            self.get_logger().info(
+                f"[POLICY] Raw obs (first 6): {obs[:6]}, "
+                f"force_cb=[{self._force_callback_count[0]},{self._force_callback_count[1]},{self._force_callback_count[2]}], "
+                f"deform_cb={self._deform_callback_count}, "
+                f"ee_cb=[{self._ee_callback_count['if']},{self._ee_callback_count['mf']},{self._ee_callback_count['th']}]"
+            )
+        
         # Scale observation
         if self.obs_scaler:
             obs_scaled = self.obs_scaler.transform(obs.reshape(1, -1))
         else:
             obs_scaled = obs.reshape(1, -1)
+
+        # [DEBUG] Log scaled observation (every 2 seconds)
+        if self._log_counter % int(self.rate_hz * 2) == 0:
+            self.get_logger().info(f"[POLICY] Scaled obs (first 6): {obs_scaled[0, :6]}")
 
         # Predict based on model type
         if self.model_type == "bc":
@@ -521,11 +633,18 @@ class RunPolicyNode(Node):
 
         elif "diffusion" in self.model_type:
             # Diffusion policy with temporal ensembling
-            # Determine sampler from manifest or model_type
-            sampler = "ddpm"  # default
+            # [PERFORMANCE FIX] Force DDIM sampler for faster inference (10x speedup)
+            sampler = "ddim"  # Force DDIM instead of DDPM
             if self.manifest:
                 model_config = self.manifest.get("models", {}).get(self.model_type, {})
-                sampler = model_config.get("sampler", "ddpm")
+                manifest_sampler = model_config.get("sampler", "ddpm")
+                # Only use manifest sampler if it's already DDIM
+                if manifest_sampler == "ddim":
+                    sampler = manifest_sampler
+                else:
+                    self.get_logger().warn(
+                        f"[PERFORMANCE] Overriding sampler '{manifest_sampler}' → 'ddim' for real-time performance"
+                    )
             
             # Predict action sequence (shape: (1, horizon, 9) or (1, 9))
             action_seq = self.model.predict(obs_scaled, n_samples=1, sampler=sampler, eta=0.0)
@@ -581,18 +700,75 @@ class RunPolicyNode(Node):
         else:
             act_scaled = np.zeros((1, 9))
 
+        # [DEBUG] Log scaled action (every 2 seconds)
+        if self._log_counter % int(self.rate_hz * 2) == 0:
+            self.get_logger().info(f"[POLICY] Scaled action (act_scaled): {act_scaled[0, :3]}")
+
         # Inverse scale
         if self.act_scaler:
             stiffness = self.act_scaler.inverse_transform(act_scaled)
         else:
             stiffness = act_scaled
 
+        # [DEBUG] Log inverse-transformed stiffness (before smoothing)
+        if self._log_counter % int(self.rate_hz * 2) == 0:
+            t_elapsed = (time_module.time() - t_start) * 1000  # ms
+            self.get_logger().info(f"[POLICY] Raw stiffness (before smooth): {stiffness[0, :3]}, prediction_time={t_elapsed:.1f}ms")
+
         return stiffness.flatten()
 
     # _predict_action removed (emg_bc no longer supported)
 
+    def _init_lowpass_filter(self) -> None:
+        """Initialize Butterworth low-pass filter coefficients."""
+        try:
+            nyquist = self.rate_hz / 2.0
+            normalized_cutoff = self.lowpass_cutoff_hz / nyquist
+            normalized_cutoff = min(normalized_cutoff, 0.99)  # Ensure valid range
+            
+            self._lp_b, self._lp_a = butter(self.lowpass_order, normalized_cutoff, btype='low')
+            # Initialize filter state for 9D stiffness
+            from scipy.signal import lfilter_zi
+            zi = lfilter_zi(self._lp_b, self._lp_a)
+            self._lp_zi = np.tile(zi[:, np.newaxis], (1, 9))  # (order, 9)
+            self._lp_initialized = True
+            
+            self.get_logger().info(
+                f"Low-pass filter initialized: cutoff={self.lowpass_cutoff_hz}Hz, "
+                f"order={self.lowpass_order}, sample_rate={self.rate_hz}Hz"
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to initialize low-pass filter: {e}")
+            self.lowpass_enabled = False
+
+    def _apply_lowpass_filter(self, stiffness: np.ndarray) -> np.ndarray:
+        """Apply real-time low-pass filter to stiffness prediction."""
+        if not self.lowpass_enabled or not self._lp_initialized:
+            return stiffness
+        
+        try:
+            # Apply IIR filter with state preservation for real-time processing
+            filtered = np.zeros_like(stiffness)
+            for dim in range(len(stiffness)):
+                # lfilter returns (filtered_value, new_zi)
+                filtered_val, self._lp_zi[:, dim] = lfilter(
+                    self._lp_b, self._lp_a, 
+                    [stiffness[dim]], 
+                    zi=self._lp_zi[:, dim]
+                )
+                filtered[dim] = filtered_val[0]
+            return filtered
+        except Exception as e:
+            # Fallback to raw value on error
+            return stiffness
+
     def _smooth_stiffness(self, stiffness: np.ndarray) -> np.ndarray:
-        """Apply moving average smoothing to stiffness predictions."""
+        """Apply low-pass filter and moving average smoothing to stiffness predictions."""
+        # First apply low-pass filter (if enabled)
+        if self.lowpass_enabled:
+            stiffness = self._apply_lowpass_filter(stiffness)
+        
+        # Then apply moving average smoothing
         self.stiffness_buffer.append(stiffness)
 
         if len(self.stiffness_buffer) > self.smooth_window:
@@ -644,7 +820,7 @@ class RunPolicyNode(Node):
                 if not all(f is not None for f in self.forces):
                     missing_idx = [i for i in range(3) if self.forces[i] is None]
                     missing.append(f"forces({[self.force_topics[i] for i in missing_idx]})")
-                if self.deform_ecc is None:
+                if self.deform_ecc_smoothed is None:
                     missing.append(f"deform_ecc({self.deform_topic})")
                 if not all(v is not None for v in self.ee_positions.values()):
                     missing_fingers = [k for k,v in self.ee_positions.items() if v is None]
@@ -656,36 +832,89 @@ class RunPolicyNode(Node):
             return
 
         try:
+            # Start timing when first observation is ready
+            if self.policy_start_time is None:
+                self.policy_start_time = time.time()
+                self.get_logger().info(
+                    f"[TIME_SCALE] Policy started! Ramping {self.initial_scale:.0%} → {self.final_scale:.0%} over {self.time_ramp_duration:.1f}s"
+                )
+            
             if not self._ready_announced:
                 self.get_logger().info("All required sensor inputs received -> starting policy predictions")
                 self._ready_announced = True
 
-            # [DEBUG] Before prediction
-            # if self._log_counter % int(self.rate_hz * 2) == 0:
-            #     self.get_logger().info(f"[DEBUG] About to predict stiffness")
+            # Compute time-based scale factor (ramp up over time)
+            elapsed = time.time() - self.policy_start_time
+            ramp_progress = min(elapsed / self.time_ramp_duration, 1.0)
+            time_scale = self.initial_scale + (self.final_scale - self.initial_scale) * ramp_progress
 
             # Predict stiffness (9D)
             stiffness = self._predict_stiffness(obs)
 
+            # Apply time-based scaling BEFORE smoothing
+            stiffness_before_scale = stiffness.copy()
+            stiffness = stiffness * time_scale
+
             # Smooth and scale
             stiffness = self._smooth_stiffness(stiffness)
 
-            # [DEBUG] Before publish
-            # if self._log_counter % int(self.rate_hz * 2) == 0:
-            #     self.get_logger().info(f"[DEBUG] About to publish stiffness: {stiffness[:3]}")
+            # === DEBUG: Collect data for analysis ===
+            if self.debug_log_enabled and len(self.debug_log_data) < self.debug_log_max_samples:
+                f1, f2, f3 = self.forces[0], self.forces[1], self.forces[2]
+                # Scale observation for comparison
+                obs_scaled = self.obs_scaler.transform(obs.reshape(1, -1))[0] if self.obs_scaler else obs
+                
+                log_entry = {
+                    'time_s': time.time() - self.policy_start_time,
+                    # Raw observation (19D)
+                    's1_fx': f1['fx'], 's1_fy': f1['fy'], 's1_fz': f1['fz'],
+                    's2_fx': f2['fx'], 's2_fy': f2['fy'], 's2_fz': f2['fz'],
+                    's3_fx': f3['fx'], 's3_fy': f3['fy'], 's3_fz': f3['fz'],
+                    'deform_ecc': self.deform_ecc_smoothed,
+                    'ee_if_px': self.ee_positions['if'][0], 'ee_if_py': self.ee_positions['if'][1], 'ee_if_pz': self.ee_positions['if'][2],
+                    'ee_mf_px': self.ee_positions['mf'][0], 'ee_mf_py': self.ee_positions['mf'][1], 'ee_mf_pz': self.ee_positions['mf'][2],
+                    'ee_th_px': self.ee_positions['th'][0], 'ee_th_py': self.ee_positions['th'][1], 'ee_th_pz': self.ee_positions['th'][2],
+                    # Scaled observation (for model input comparison)
+                    's1_fz_scaled': obs_scaled[2], 's2_fz_scaled': obs_scaled[5], 's3_fz_scaled': obs_scaled[8],
+                    'deform_ecc_scaled': obs_scaled[9],
+                    # Policy output (before time scale, after time scale, after smoothing)
+                    'th_k1_raw': stiffness_before_scale[0], 'th_k2_raw': stiffness_before_scale[1], 'th_k3_raw': stiffness_before_scale[2],
+                    'mf_k1_raw': stiffness_before_scale[6], 'mf_k2_raw': stiffness_before_scale[7], 'mf_k3_raw': stiffness_before_scale[8],
+                    'th_k1': stiffness[0], 'th_k2': stiffness[1], 'th_k3': stiffness[2],
+                    'if_k1': stiffness[3], 'if_k2': stiffness[4], 'if_k3': stiffness[5],
+                    'mf_k1': stiffness[6], 'mf_k2': stiffness[7], 'mf_k3': stiffness[8],
+                    'time_scale': time_scale,
+                }
+                self.debug_log_data.append(log_entry)
+
+            # [DEBUG] After smoothing (every 2 seconds)
+            if self._log_counter % int(self.rate_hz * 2) == 0:
+                # Log observation values for debugging
+                f1, f2, f3 = self.forces[0], self.forces[1], self.forces[2]
+                self.get_logger().info(
+                    f"[OBS] Force: s1=({f1['fx']:.2f},{f1['fy']:.2f},{f1['fz']:.2f}), "
+                    f"s2=({f2['fx']:.2f},{f2['fy']:.2f},{f2['fz']:.2f}), "
+                    f"s3=({f3['fx']:.2f},{f3['fy']:.2f},{f3['fz']:.2f})"
+                )
+                self.get_logger().info(
+                    f"[OBS] ecc={self.deform_ecc_smoothed:.3f}, "
+                    f"EE_z: if={self.ee_positions['if'][2]:.4f}, mf={self.ee_positions['mf'][2]:.4f}, th={self.ee_positions['th'][2]:.4f}"
+                )
+                self.get_logger().info(
+                    f"[POLICY] time_scale={time_scale:.0%}, stiffness={stiffness[:3]} (th), {stiffness[3:6]} (if), {stiffness[6:9]} (mf)"
+                )
+                # Training data reference
+                self.get_logger().info(
+                    f"[REF] Training force range: s1_fz=[-3.2,0.1], s2_fz=[-4.8,0.1], s3_fz=[-5.6,0.1]"
+                )
+                self.get_logger().info(
+                    f"[DEBUG] Logged {len(self.debug_log_data)} samples so far"
+                )
 
             # Publish stiffness command
             msg = Float32MultiArray()
             msg.data = stiffness.tolist()
             self.stiffness_pub.publish(msg)
-
-            # # Log every publish (매 퍼블리시마다 즉시 출력)
-            # self.get_logger().info(
-            #     f"K_cmd: ["
-            #     f"TH: {stiffness[0]:5.1f} {stiffness[1]:5.1f} {stiffness[2]:5.1f} | "
-            #     f"IF: {stiffness[3]:5.1f} {stiffness[4]:5.1f} {stiffness[5]:5.1f} | "
-            #     f"MF: {stiffness[6]:5.1f} {stiffness[7]:5.1f} {stiffness[8]:5.1f}]"
-            # )
 
             # Increment counter after successful prediction
             self._log_counter += 1
@@ -693,6 +922,45 @@ class RunPolicyNode(Node):
         except Exception as e:
             # self.get_logger().error(f"Control callback error: {e}")
             pass
+
+    def _save_debug_log(self):
+        """Save collected debug data to CSV for analysis."""
+        if not self.debug_log_data:
+            return
+        
+        try:
+            import pandas as pd
+            from datetime import datetime
+            
+            # Create output directory
+            output_dir = Path(_PKG_ROOT) / "outputs" / "policy_debug_logs"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = output_dir / f"policy_debug_{timestamp}.csv"
+            
+            # Save to CSV
+            df = pd.DataFrame(self.debug_log_data)
+            df.to_csv(output_path, index=False)
+            
+            print(f"\\n{'='*60}")
+            print(f"[DEBUG LOG SAVED] {output_path}")
+            print(f"  Samples: {len(self.debug_log_data)}")
+            print(f"  Duration: {df['time_s'].max():.1f}s")
+            print(f"\\n  Force ranges:")
+            print(f"    s1_fz: [{df['s1_fz'].min():.3f}, {df['s1_fz'].max():.3f}]  (training: [-3.2, 0.1])")
+            print(f"    s2_fz: [{df['s2_fz'].min():.3f}, {df['s2_fz'].max():.3f}]  (training: [-4.8, 0.1])")
+            print(f"    s3_fz: [{df['s3_fz'].min():.3f}, {df['s3_fz'].max():.3f}]  (training: [-5.6, 0.1])")
+            print(f"\\n  Deformity range:")
+            print(f"    ecc: [{df['deform_ecc'].min():.3f}, {df['deform_ecc'].max():.3f}]  (training: [0.02, 0.54])")
+            print(f"\\n  Stiffness (mf_k3) range:")
+            print(f"    raw: [{df['mf_k3_raw'].min():.1f}, {df['mf_k3_raw'].max():.1f}]")
+            print(f"    final: [{df['mf_k3'].min():.1f}, {df['mf_k3'].max():.1f}]  (training: [91, 655])")
+            print(f"{'='*60}\\n")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to save debug log: {e}")
 
 
 def main(args=None):

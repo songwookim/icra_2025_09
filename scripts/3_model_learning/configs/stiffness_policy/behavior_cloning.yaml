@@ -8,6 +8,6 @@ batch_size: 256
 # learning_rate: 학습률. 발산하면 낮추고, 수렴이 느리면 조금 높입니다.
 learning_rate: 1.0e-3
 # epochs: 전체 에폭 수. 데이터가 적으면 100 이하도 충분, 더 복잡하면 늘립니다.
-epochs: 200
+epochs: 300
 # weight_decay: L2 정규화 계수. 과적합 억제용이며 지나치면 성능 하락.
 weight_decay: 1.0e-4

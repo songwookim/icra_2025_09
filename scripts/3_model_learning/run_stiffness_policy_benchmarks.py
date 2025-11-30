@@ -844,7 +844,6 @@ class GMMConditional:
         return -float(np.mean(log_probs))
 
 if torch is not None:
-
     class SinusoidalTimeEmbedding(nn.Module):
         def __init__(self, dim: int):
             super().__init__()
@@ -979,19 +978,42 @@ if torch is not None:
             setattr(self, name, tensor.to(self.device))
 
         def fit(self, obs: np.ndarray, act: np.ndarray, writer: Any = None, verbose: bool = True) -> None:
-            # Flatten action horizon: (B, act_dim) -> (B, act_dim * horizon) by repeating
-            # This assumes single-step actions should be repeated across horizon during training
-            if self.action_horizon > 1:
-                # Expand to (B, horizon, act_dim) then flatten to (B, horizon * act_dim)
-                act_expanded = np.repeat(act[:, np.newaxis, :], self.action_horizon, axis=1)
-                act_flat = act_expanded.reshape(act.shape[0], -1)
-            else:
-                act_flat = act
+            """Train diffusion policy.
             
-            dataset = TensorDataset(
-                torch.from_numpy(obs.astype(np.float32)),
-                torch.from_numpy(act_flat.astype(np.float32)),
-            )
+            For action_horizon > 1 (action chunking):
+            - obs: (B, obs_dim) or (B, seq_len, obs_dim) for temporal
+            - act: (B, act_dim) - we create consecutive action sequences
+            
+            When action_horizon > 1, we slide window through actions to create
+            target action chunks: [a_t, a_{t+1}, ..., a_{t+horizon-1}]
+            """
+            if self.action_horizon > 1:
+                # Create consecutive action sequences for action chunking
+                # obs[i] -> predict [act[i], act[i+1], ..., act[i+horizon-1]]
+                n_samples = obs.shape[0] - self.action_horizon + 1
+                if n_samples <= 0:
+                    raise ValueError(f"Not enough samples for action_horizon={self.action_horizon}. "
+                                     f"Need at least {self.action_horizon} samples, got {obs.shape[0]}")
+                
+                # Create chunked actions: (n_samples, horizon * act_dim)
+                act_chunks = np.zeros((n_samples, self.action_horizon * self.act_dim), dtype=np.float32)
+                for i in range(n_samples):
+                    # Stack horizon consecutive actions and flatten
+                    act_chunks[i] = act[i:i+self.action_horizon].flatten()
+                
+                # Truncate observations to match
+                obs_chunked = obs[:n_samples]
+                
+                if verbose:
+                    print(f"[info] Action chunking: {obs.shape[0]} samples -> {n_samples} chunks (horizon={self.action_horizon})")
+                
+                obs_tensor = torch.from_numpy(obs_chunked.astype(np.float32))
+                act_tensor = torch.from_numpy(act_chunks)
+            else:
+                obs_tensor = torch.from_numpy(obs.astype(np.float32))
+                act_tensor = torch.from_numpy(act.astype(np.float32))
+            
+            dataset = TensorDataset(obs_tensor, act_tensor)
             loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
             for epoch in range(1, self.epochs + 1):
                 loss_accum = 0.0
@@ -1850,7 +1872,7 @@ def parse_args() -> argparse.Namespace:
         "--models",
         type=str,
         default="diffusion_c,diffusion_t",
-        help="Comma-separated models: gmm,gmr,bc,diffusion_c,diffusion_t,lstm_gmm,ibc,gp,mdn,all (default: all)",
+        help="Comma-separated models: gmm,gmr,bc,diffusion_c,diffusion_t,diffusion_t_h4,diffusion_t_h8,lstm_gmm,ibc,gp,mdn,all (default: all)",
     )
     parser.add_argument("--test-size", type=float, default=test_size_default, help="Fraction of trajectories reserved for testing")
     parser.add_argument(
@@ -1995,6 +2017,12 @@ def main() -> None:
     if "all" in models_requested or not models_requested:
         # 'all' 기본 집합에서 gp, mdn 제외 (요청사항)
         models_requested = {"gmm", "gmr", "bc", "ibc", "diffusion_c", "diffusion_t", "lstm_gmm"}
+    # Add chunking variants if explicitly requested
+    if "diffusion_chunking" in models_requested or "chunking" in models_requested:
+        models_requested.discard("diffusion_chunking")
+        models_requested.discard("chunking")
+        models_requested.add("diffusion_t_h4")
+        models_requested.add("diffusion_t_h8")
     # Exclude any requested heavy models
     if exclude_requested:
         before = sorted(models_requested)
@@ -2798,7 +2826,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
         pred_seq_ddim = act_scaler.inverse_transform(pred_seq_scaled_ddim)
         metrics_t_ddim = compute_metrics(test_seq_act_raw, pred_seq_ddim)
         metrics_t_ddim["nll"] = float("nan")
-        results["diffusion_t_ddim"] = metrics_t_ddim
+        results["diffusion_t_ddim"] = metrics_t_ddim 
         manifest["models"]["diffusion_t_ddim"] = {
             "kind": "diffusion",
             "path": diffusion_t_artifact.name,
@@ -2825,6 +2853,124 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
         if diff_t_writer is not None:
             diff_t_writer.flush()
             diff_t_writer.close()
+
+    # ============================================================================
+    # Action Chunking Diffusion Policies (horizon > 1)
+    # ============================================================================
+    for horizon_val in [4, 8]:
+        model_key = f"diffusion_t_h{horizon_val}"
+        if model_key not in models_requested:
+            continue
+        if torch is None:
+            raise RuntimeError(f"Requested {model_key} but PyTorch is not installed.")
+        if train_seq_obs.shape[0] == 0:
+            raise RuntimeError(
+                f"{model_key} requires sequence data in the training split. "
+                "Reduce --sequence-window or provide longer demonstrations."
+            )
+        if test_seq_obs.shape[0] == 0:
+            raise RuntimeError(f"{model_key} requires sequence data. Increase --sequence-window or trajectory length.")
+        
+        artifact_path = artifacts_root / f"{model_key}.pt"
+        writer = None
+        
+        if args.skip_existing and artifact_path.exists():
+            print(f"[skip] {model_key} artifact exists → load {artifact_path.name}")
+            checkpoint = torch.load(artifact_path, map_location="cpu")
+            cfg = checkpoint.get("config", {})
+            trainer = DiffusionPolicyBaseline(
+                obs_dim=cfg.get("obs_dim", train_seq_obs.shape[-1]),
+                act_dim=cfg.get("act_dim", train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1]),
+                timesteps=cfg.get("timesteps", args.diffusion_steps),
+                hidden_dim=cfg.get("hidden_dim", args.diffusion_hidden),
+                lr=args.diffusion_lr,
+                batch_size=args.diffusion_batch,
+                epochs=0,
+                seed=args.seed,
+                log_name=model_key,
+                temporal=True,
+                action_horizon=horizon_val,
+            )
+            trainer.model.load_state_dict(checkpoint["state_dict"])
+        else:
+            print(f"[info] training diffusion policy (temporal, horizon={horizon_val}) ...")
+            trainer = DiffusionPolicyBaseline(
+                obs_dim=train_seq_obs.shape[-1],
+                act_dim=train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
+                timesteps=args.diffusion_steps,
+                hidden_dim=args.diffusion_hidden,
+                lr=args.diffusion_lr,
+                batch_size=args.diffusion_batch,
+                epochs=args.diffusion_epochs,
+                seed=args.seed,
+                log_name=model_key,
+                temporal=True,
+                action_horizon=horizon_val,
+            )
+            writer = make_writer(run_tensorboard_dir, model_key)
+            trainer.fit(train_seq_obs, train_seq_act_s, writer=writer)
+            if writer is not None:
+                writer.flush()
+                writer.close()
+        
+        # Save config and model
+        config = {
+            "obs_dim": train_seq_obs.shape[-1],
+            "act_dim": train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
+            "timesteps": args.diffusion_steps,
+            "hidden_dim": args.diffusion_hidden,
+            "time_dim": trainer.model.time_embed.dim if hasattr(trainer.model.time_embed, "dim") else 64,
+            "lr": args.diffusion_lr,
+            "batch_size": args.diffusion_batch,
+            "epochs": args.diffusion_epochs,
+            "seed": args.seed,
+            "temporal": True,
+            "seq_len": window,
+            "action_horizon": horizon_val,
+        }
+        torch.save(
+            {
+                "config": config,
+                "state_dict": {k: v.cpu() for k, v in trainer.model.state_dict().items()},
+            },
+            artifact_path,
+        )
+        
+        # Register in manifest
+        manifest["models"][model_key] = {
+            "kind": "diffusion",
+            "path": artifact_path.name,
+            "temporal": True,
+            "seq_len": window,
+            "action_horizon": horizon_val,
+            "sampler": "ddim",
+            "eta": diffusion_eta,
+        }
+        
+        # Evaluate with DDIM sampler
+        pred_seq_scaled = trainer.predict(test_seq_obs, n_samples=4, sampler="ddim", eta=diffusion_eta)
+        pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
+        metrics_chunk = compute_metrics(test_seq_act_raw, pred_seq)
+        metrics_chunk["nll"] = float("nan")
+        results[model_key] = metrics_chunk
+        
+        full_pred_chunk = np.full_like(test_act, np.nan)
+        full_pred_chunk[test_seq_indices] = pred_seq
+        
+        print(
+            f"[{model_key}|ddim] rmse={metrics_chunk['rmse']:.4f} "
+            f"mae={metrics_chunk['mae']:.4f} r2={metrics_chunk['r2']:.4f}"
+        )
+        
+        if args.save_predictions:
+            save_predictions(
+                args.output_dir / f"{model_key}_predictions_{timestamp}.csv",
+                test_obs,
+                test_act,
+                full_pred_chunk,
+                OBS_COLUMNS,
+                ACTION_COLUMNS,
+            )
 
     if "lstm_gmm" in models_requested:
         if torch is None:

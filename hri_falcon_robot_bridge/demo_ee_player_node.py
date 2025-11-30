@@ -52,6 +52,10 @@ class DemoEEPlayerNode(Node):
         self.declare_parameter('target_len', 0)  # 0이면 원본 길이 유지(단일), 다중은 자동 설정
         self.declare_parameter('play_speed', 1.0)  # 1.0 = 실시간, 2.0 = 두배 속도
         self.declare_parameter('loop', True)
+        self.declare_parameter('tau_scale', 1.0)  # DMP 속도 조절: 0.5 = 2배 빠름, 2.0 = 2배 느림
+        self.declare_parameter('hold_time', 0.0)  # 끝 위치 유지 시간 (초)
+        self.declare_parameter('speed_profile', 'constant')  # constant, accelerating, decelerating, sigmoid
+        self.declare_parameter('accel_factor', 2.0)  # 가속/감속 강도 (1.0=선형, 2.0=제곱, 3.0=세제곱)
         self.declare_parameter('frame_id', 'world')
         self.declare_parameter('exclude_aug', True)
         self.declare_parameter('publish_topics_suffix', '_desired')  # "_desired" → /ee_pose_desired_*
@@ -71,6 +75,10 @@ class DemoEEPlayerNode(Node):
         self.manual_start = bool(p('manual_start') if p('manual_start') is not None else True)
         self.start_key = str(p('start_key') or 'p')
         self.stop_key = str(p('stop_key') or 'k')
+        self.tau_scale = float(p('tau_scale') or 1.0)  # DMP 속도 조절
+        self.hold_time = float(p('hold_time') or 0.0)  # 끝 유지 시간
+        self.speed_profile = str(p('speed_profile') or 'constant')  # 속도 프로파일
+        self.accel_factor = float(p('accel_factor') or 2.0)  # 가속 강도
         
         self.is_running = not self.manual_start  # manual_start=False면 즉시 시작
         self.initial_pos_sent = not self.manual_start  # 초기 위치 전송 완료 여부
@@ -196,7 +204,7 @@ class DemoEEPlayerNode(Node):
             goal = data['goal']  # This is the EXTENDED goal (연장된 목표점)
             w = data['w']
             dt = data.get('dt', 0.02)
-            tau = data.get('tau', 30.0)
+            tau = data.get('tau', 30.0) * self.tau_scale  # Apply speed scaling
             n_bfs = data.get('n_bfs', 50)
             alpha_y = data.get('alpha_y', 25.0)
             beta_y = data.get('beta_y', 6.25)
@@ -215,18 +223,46 @@ class DemoEEPlayerNode(Node):
                 h = np.exp(-((x_val - centers) ** 2) / (2 * widths))
                 return h
             
-            for _ in range(n_steps):
+            for step_idx in range(n_steps):
                 path.append(y.copy())
-                x_next = x - a_x * x * (dt / tau)
+                
+                # 진행도 계산 (0.0 ~ 1.0)
+                progress = step_idx / max(n_steps - 1, 1)
+                
+                # 속도 프로파일에 따른 동적 tau 조절
+                if self.speed_profile == 'accelerating':
+                    # 초반 느림(tau 큼) → 후반 빠름(tau 작음)
+                    tau_dynamic = tau * (1.0 + (1.0 - progress**self.accel_factor) * 2.0)
+                elif self.speed_profile == 'decelerating':
+                    # 초반 빠름(tau 작음) → 후반 느림(tau 큼)
+                    tau_dynamic = tau * (1.0 + progress**self.accel_factor * 2.0)
+                elif self.speed_profile == 'sigmoid':
+                    # S자 곡선: 중간에 가장 빠름
+                    sigmoid = 1.0 / (1.0 + np.exp(-10 * (progress - 0.5)))
+                    tau_dynamic = tau * (2.0 - sigmoid)
+                else:  # 'constant'
+                    tau_dynamic = tau
+                
+                x_next = x - a_x * x * (dt / tau_dynamic)
                 psi = gaussian_basis(x, n_bfs, a_x)
                 f = np.dot(psi * x, w) / (np.sum(psi) + 1e-10)
                 ddy = alpha_y * (beta_y * (goal - y) - dy) + f
-                dy += ddy * (dt / tau)
-                y += dy * (dt / tau)
+                dy += ddy * (dt / tau_dynamic)
+                y += dy * (dt / tau_dynamic)
                 x = x_next
             
             traj = np.array(path)
-            self.get_logger().info(f"  ✅ DMP rollout complete: len={len(traj)}, extended_goal={goal}")
+            
+            # Hold at final position if hold_time > 0
+            if self.hold_time > 0.0:
+                hold_steps = int(self.hold_time / dt)
+                final_pos = traj[-1].copy()
+                hold_traj = np.tile(final_pos, (hold_steps, 1))
+                traj = np.vstack([traj, hold_traj])
+                self.get_logger().info(f"  ✅ DMP rollout complete: len={len(traj)} (motion={n_steps}, hold={hold_steps}), tau_scale={self.tau_scale:.2f}, profile={self.speed_profile}, accel={self.accel_factor:.1f}, goal={goal}")
+            else:
+                self.get_logger().info(f"  ✅ DMP rollout complete: len={len(traj)}, tau_scale={self.tau_scale:.2f}, profile={self.speed_profile}, accel={self.accel_factor:.1f}, goal={goal}")
+            
             return traj
             
         except Exception as e:
@@ -393,10 +429,9 @@ class DemoEEPlayerNode(Node):
         if self.idx < 0 or self.N == 0:
             return
         
-        # Publish playback status
+        # Publish playback status (only True when actually running)
         status_msg = Bool()
-        active_preplayback = self.initial_pos_sent and not self.is_running and self.idx >= 0
-        status_msg.data = self.is_running or active_preplayback
+        status_msg.data = self.is_running
         self.playback_status_pub.publish(status_msg)
         
         # If not running yet (waiting for 'p' key), do NOT publish any position

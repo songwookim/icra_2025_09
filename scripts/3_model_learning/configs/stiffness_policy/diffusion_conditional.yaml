@@ -8,7 +8,7 @@ batch_size: 256
 # learning_rate: 학습률. 발산하면 줄이고, 너무 느리면 약간 올립니다.
 learning_rate: 1.0e-3
 # epochs: 전체 에폭 수. 데이터가 많거나 수렴이 느리면 늘립니다.
-epochs: 200
+epochs: 300
 # sampler: ddpm 기본, ddim으로 바꾸면 eta에 따라 더 결정적/빠른 샘플링이 가능합니다.
 sampler: ddpm
 # eta: DDIM 노이즈 계수. 0은 완전 결정적, 0.5~1.0은 무작위성 증가. DDPM에는 영향 없습니다.

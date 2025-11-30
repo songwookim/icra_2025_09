@@ -279,6 +279,208 @@ def _plot_model_grid(
     plt.close(fig)
 
 
+def _plot_model_grid_by_finger(
+    time_idx: np.ndarray,
+    target: np.ndarray,
+    predictions: Dict[str, np.ndarray],
+    model_order: Sequence[str],
+    axes_labels: Sequence[str],
+    out_path: Path,
+    observations: Optional[np.ndarray] = None,
+    obs_labels: Optional[Sequence[str]] = None,
+) -> None:
+    """Plot grid with same finger's k1/k2/k3 overlaid on same subplot.
+    
+    Layout: rows = models, cols = fingers (th, if, mf)
+    Each subplot shows k1, k2, k3 for that finger overlaid.
+    """
+    # Group columns by finger
+    finger_groups: Dict[str, List[int]] = {}
+    for idx, label in enumerate(axes_labels):
+        # Parse finger from label like "th_k1" or "TH_k1"
+        parts = label.lower().split("_")
+        if len(parts) >= 2:
+            finger = parts[0]
+        else:
+            finger = label[:2].lower()
+        finger_groups.setdefault(finger, []).append(idx)
+    
+    finger_order = ["th", "if", "mf"]
+    finger_order = [f for f in finger_order if f in finger_groups]
+    
+    if not finger_order:
+        # Fallback to original plot
+        _plot_model_grid(time_idx, target, predictions, model_order, axes_labels, out_path, observations, obs_labels)
+        return
+    
+    n_fingers = len(finger_order)
+    n_models = len(model_order)
+    
+    # Add row for observations if provided
+    total_rows = n_models + 1 if observations is not None else n_models
+    
+    fig, axes = plt.subplots(total_rows, n_fingers, figsize=(5.5 * n_fingers, 3.0 * total_rows), sharex=True)
+    axes_array = np.atleast_2d(axes)
+    
+    # Colors for k1, k2, k3
+    k_colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # blue, orange, green
+    k_styles_gt = ['-', '-', '-']
+    k_styles_pred = ['--', '--', '--']
+    
+    row_offset = 0
+    
+    # Plot observations in first row if provided
+    if observations is not None and obs_labels is not None:
+        # Group observation columns by finger and type
+        # Force sensor mapping: s1 -> th, s2 -> if, s3 -> mf
+        force_finger_map = {"s1": "th", "s2": "if", "s3": "mf"}
+        
+        obs_by_finger: Dict[str, Dict[str, List[int]]] = {f: {"ee": [], "force": [], "deform": []} for f in finger_order}
+        
+        for idx, label in enumerate(obs_labels):
+            label_lower = label.lower()
+            
+            if "ee" in label_lower:
+                # ee_if_px -> if, ee_th_px -> th, ee_mf_px -> mf
+                parts = label_lower.split("_")
+                if len(parts) >= 2:
+                    finger_key = parts[1][:2]
+                    if finger_key in obs_by_finger:
+                        obs_by_finger[finger_key]["ee"].append(idx)
+            elif label_lower.startswith("s") and "_f" in label_lower:
+                # s1_fz -> th, s2_fz -> if, s3_fz -> mf
+                sensor_id = label_lower.split("_")[0]  # s1, s2, s3
+                if sensor_id in force_finger_map:
+                    finger_key = force_finger_map[sensor_id]
+                    if finger_key in obs_by_finger:
+                        obs_by_finger[finger_key]["force"].append(idx)
+            elif "deform" in label_lower or "ecc" in label_lower:
+                # Deformity is shared across all fingers
+                for f in finger_order:
+                    obs_by_finger[f]["deform"].append(idx)
+        
+        # Color scheme for observation types
+        ee_colors = ['#1f77b4', '#aec7e8', '#6baed6']  # blues for EE (px, py, pz)
+        force_colors = ['#d62728', '#ff9896', '#e377c2']  # reds for Force (fx, fy, fz)
+        deform_color = '#2ca02c'  # green for deformity
+        
+        for col, finger in enumerate(finger_order):
+            ax = axes_array[0, col]
+            legend_handles = []
+            
+            # Plot EE positions (secondary y-axis not used, just different colors)
+            ee_indices = obs_by_finger[finger]["ee"]
+            for i, obs_idx in enumerate(ee_indices):
+                if obs_idx < observations.shape[1]:
+                    line, = ax.plot(time_idx, observations[:, obs_idx], 
+                                   color=ee_colors[i % len(ee_colors)],
+                                   linewidth=0.8, alpha=0.7, 
+                                   label=f"EE:{obs_labels[obs_idx].split('_')[-1]}")
+                    legend_handles.append(line)
+            
+            # Plot Force (use twin axis for better scaling)
+            force_indices = obs_by_finger[finger]["force"]
+            if force_indices:
+                ax2 = ax.twinx()
+                for i, obs_idx in enumerate(force_indices):
+                    if obs_idx < observations.shape[1]:
+                        # Only plot fz (most relevant for contact)
+                        if "fz" in obs_labels[obs_idx].lower():
+                            line, = ax2.plot(time_idx, observations[:, obs_idx], 
+                                           color=force_colors[0],
+                                           linewidth=1.2, alpha=0.8, 
+                                           linestyle='-',
+                                           label=f"Force:fz")
+                            legend_handles.append(line)
+                        elif "fx" in obs_labels[obs_idx].lower():
+                            line, = ax2.plot(time_idx, observations[:, obs_idx], 
+                                           color=force_colors[1],
+                                           linewidth=0.6, alpha=0.5, 
+                                           linestyle='--',
+                                           label=f"Force:fx")
+                        elif "fy" in obs_labels[obs_idx].lower():
+                            line, = ax2.plot(time_idx, observations[:, obs_idx], 
+                                           color=force_colors[2],
+                                           linewidth=0.6, alpha=0.5, 
+                                           linestyle='--',
+                                           label=f"Force:fy")
+                ax2.set_ylabel("Force [N]", fontsize=8, color=force_colors[0])
+                ax2.tick_params(axis='y', labelcolor=force_colors[0], labelsize=7)
+            
+            # Plot Deformity (only once per figure, on first column)
+            deform_indices = obs_by_finger[finger]["deform"]
+            if deform_indices and col == 0:  # Show deform label only on first column
+                for obs_idx in deform_indices[:1]:  # Only first deform column (avoid duplicates)
+                    if obs_idx < observations.shape[1]:
+                        line, = ax.plot(time_idx, observations[:, obs_idx], 
+                                       color=deform_color,
+                                       linewidth=1.0, alpha=0.9, 
+                                       linestyle='-.',
+                                       label=f"Deform:ecc")
+                        legend_handles.append(line)
+            elif deform_indices:
+                for obs_idx in deform_indices[:1]:
+                    if obs_idx < observations.shape[1]:
+                        ax.plot(time_idx, observations[:, obs_idx], 
+                               color=deform_color,
+                               linewidth=1.0, alpha=0.9, 
+                               linestyle='-.')
+            
+            # Sensor mapping info in title
+            sensor_map = {"th": "S1", "if": "S2", "mf": "S3"}
+            ax.set_title(f"Obs: {finger.upper()} ({sensor_map.get(finger, '')})", fontsize=10)
+            ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.5)
+            
+            # Compact legend
+            if legend_handles:
+                ax.legend(handles=legend_handles, loc="upper right", fontsize=6, ncol=2)
+            
+            if col == 0:
+                ax.set_ylabel("EE pos / Deform", fontsize=8)
+        
+        row_offset = 1
+    
+    # Plot model predictions - each subplot shows k1/k2/k3 overlaid for one finger
+    for row, model_name in enumerate(model_order):
+        plot_row = row + row_offset
+        for col, finger in enumerate(finger_order):
+            ax = axes_array[plot_row, col]
+            k_indices = finger_groups[finger]
+            
+            for i, k_idx in enumerate(k_indices):
+                k_label = axes_labels[k_idx].split("_")[-1] if "_" in axes_labels[k_idx] else f"k{i+1}"
+                color = k_colors[i % len(k_colors)]
+                
+                # Ground truth (solid)
+                ax.plot(time_idx, target[:, k_idx], 
+                       color=color, linestyle=k_styles_gt[i % len(k_styles_gt)],
+                       linewidth=1.5, alpha=0.8, label=f"GT {k_label}")
+                
+                # Prediction (dashed)
+                pred = predictions[model_name][:, k_idx]
+                ax.plot(time_idx, pred, 
+                       color=color, linestyle=k_styles_pred[i % len(k_styles_pred)],
+                       linewidth=1.5, alpha=0.9, label=f"Pred {k_label}")
+            
+            if row == 0:
+                ax.set_title(f"{finger.upper()} (k1/k2/k3)", fontsize=11)
+            if plot_row == total_rows - 1:
+                ax.set_xlabel("Sample index", fontsize=9)
+            if col == 0:
+                ax.set_ylabel(f"{model_name}", fontsize=10)
+            ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.6)
+            
+            # Legend only for first model row, last finger column
+            if row == 0 and col == n_fingers - 1:
+                ax.legend(loc="upper right", fontsize=7, ncol=2)
+    
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"[info] Finger-grouped plot saved to {out_path}")
+
+
 def _torch_load(path: Path) -> Dict[str, Any]:
     if torch is None:
         raise RuntimeError("PyTorch is required to load neural model checkpoints.")
@@ -682,6 +884,8 @@ def evaluate_models(args: argparse.Namespace) -> None:
     obs_subset_labels = [obs_columns[i] if i < len(obs_columns) else f"obs_{i}" for i in obs_subset_indices]
     
     plot_dir = args.output_dir if args.output_dir else (artifact_dir / "plots")
+    
+    # Original grid plot
     plot_path = plot_dir / f"{eval_name}_comparison.png"
     _plot_model_grid(
         time_idx, 
@@ -690,6 +894,19 @@ def evaluate_models(args: argparse.Namespace) -> None:
         model_order, 
         selected_labels, 
         plot_path,
+        observations=test_obs[:, obs_subset_indices] if args.show_obs else None,
+        obs_labels=obs_subset_labels if args.show_obs else None,
+    )
+    
+    # NEW: Finger-grouped plot (same finger's k1/k2/k3 overlaid)
+    plot_path_finger = plot_dir / f"{eval_name}_comparison_by_finger.png"
+    _plot_model_grid_by_finger(
+        time_idx, 
+        target_subset, 
+        predictions, 
+        model_order, 
+        selected_labels, 
+        plot_path_finger,
         observations=test_obs[:, obs_subset_indices] if args.show_obs else None,
         obs_labels=obs_subset_labels if args.show_obs else None,
     )
@@ -1074,7 +1291,7 @@ def evaluate_per_finger_models(args: argparse.Namespace) -> None:
         # Use first finger's time index (should be same for all if same demo)
         time_idx = all_finger_data[first_finger]["time_idx"]
         
-        # Create unified plot
+        # Create unified plot (original grid)
         plot_dir = args.output_dir if args.output_dir else (base_artifact_dir / "plots")
         plot_path = plot_dir / f"{eval_name}_all_fingers_comparison.png"
         _plot_model_grid(
@@ -1084,6 +1301,17 @@ def evaluate_per_finger_models(args: argparse.Namespace) -> None:
             model_order,
             combined_labels,
             plot_path,
+        )
+        
+        # NEW: Finger-grouped plot (same finger's k1/k2/k3 overlaid)
+        plot_path_finger = plot_dir / f"{eval_name}_all_fingers_by_finger.png"
+        _plot_model_grid_by_finger(
+            time_idx,
+            combined_target,
+            combined_preds_final,
+            model_order,
+            combined_labels,
+            plot_path_finger,
         )
         
         print(f"[done] Unified plot saved to {plot_path}")
@@ -1124,7 +1352,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifact-dir",
         type=Path,
-        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_unified/artifacts/20251124_183103",
+        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_unified/artifacts/20251130_063538",
         help="Optional explicit artifact directory (timestamped run). If omitted, latest run is auto-selected per mode.",
     )
     parser.add_argument(
@@ -1148,7 +1376,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-sampler",
         type=str,
-        default="ddpm",
+        default="ddim",
         choices=["ddpm", "ddim"],
         help="Sampler to use when generating diffusion policy rollouts.",
     )
@@ -1161,12 +1389,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-demo",
         type=str,
-        default=None,
+        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/stiffness_profiles_signaligned/20251122_023936_synced_signaligned.csv",
         help="Optional demonstration stem (without .csv). Defaults to manifest entry or latest _synced.",
     )
     parser.add_argument(
         "--augment",
         action="store_true",
+        default=True,
         help="Include on-disk augmented stiffness profiles (*_augN.csv) when loading dataset",
     )
     parser.add_argument(

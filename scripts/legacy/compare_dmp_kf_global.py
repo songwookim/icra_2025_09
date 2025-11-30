@@ -158,15 +158,29 @@ class DiscreteDMP:
             pickle.dump(data, f)
         print(f"💾 Model saved to: {path}")
 
-    def rollout(self, dt=None, tau=None):
+    def rollout(self, dt=None, tau=None, tau_scale=1.0, hold_time=0.0, 
+                speed_profile='constant', accel_factor=2.0):
         """
         DMP 궤적 생성 (학습 시 설정된 연장된 goal 사용)
+        
+        Args:
+            dt: 시간 간격
+            tau: 전체 시간
+            tau_scale: 속도 조절 (0.5=2배 빠름, 2.0=2배 느림)
+            hold_time: 끝 위치 유지 시간 (초)
+            speed_profile: 속도 프로파일 ('constant', 'accelerating', 'decelerating', 'sigmoid')
+                - 'constant': 일정 속도
+                - 'accelerating': 초반 느림 → 후반 빠름
+                - 'decelerating': 초반 빠름 → 후반 느림
+                - 'sigmoid': S자 곡선 (smooth acceleration)
+            accel_factor: 가속/감속 강도 (1.0=선형, 2.0=제곱, 3.0=세제곱)
         """
         if dt is None:
             dt = self.dt
         if tau is None:
             tau = self.tau
         
+        tau = tau * tau_scale  # Apply speed scaling
         n_steps = int(tau / dt)
         y = self.y0.copy()
         dy = np.zeros_like(y)
@@ -174,17 +188,45 @@ class DiscreteDMP:
         x = 1.0
         
         # 학습 시 저장된 goal 사용 (이미 연장된 값)
-        for _ in range(n_steps):
+        for step_idx in range(n_steps):
             path.append(y.copy())
-            x_next = x - self.a_x * x * (dt / tau)
+            
+            # 진행도 계산 (0.0 ~ 1.0)
+            progress = step_idx / max(n_steps - 1, 1)
+            
+            # 속도 프로파일에 따른 동적 tau 조절
+            if speed_profile == 'accelerating':
+                # 초반 느림(tau 큼) → 후반 빠름(tau 작음)
+                # progress^accel_factor: 0→0, 0.5→0.25(accel=2), 1→1
+                tau_dynamic = tau * (1.0 + (1.0 - progress**accel_factor) * 2.0)
+            elif speed_profile == 'decelerating':
+                # 초반 빠름(tau 작음) → 후반 느림(tau 큼)
+                tau_dynamic = tau * (1.0 + progress**accel_factor * 2.0)
+            elif speed_profile == 'sigmoid':
+                # S자 곡선: 중간에 가장 빠름
+                sigmoid = 1.0 / (1.0 + np.exp(-10 * (progress - 0.5)))
+                tau_dynamic = tau * (2.0 - sigmoid)
+            else:  # 'constant'
+                tau_dynamic = tau
+            
+            x_next = x - self.a_x * x * (dt / tau_dynamic)
             psi = self._gaussian_basis(np.array([x]))[0]
             f = np.dot(psi * x, self.w) / (np.sum(psi) + 1e-10)
             ddy = self.alpha_y * (self.beta_y * (self.goal - y) - dy) + f
-            dy += ddy * (dt / tau)
-            y += dy * (dt / tau)
+            dy += ddy * (dt / tau_dynamic)
+            y += dy * (dt / tau_dynamic)
             x = x_next
         
-        return np.array(path)
+        traj = np.array(path)
+        
+        # Hold at final position if hold_time > 0
+        if hold_time > 0.0:
+            hold_steps = int(hold_time / dt)
+            final_pos = traj[-1].copy()
+            hold_traj = np.tile(final_pos, (hold_steps, 1))
+            traj = np.vstack([traj, hold_traj])
+        
+        return traj
 
 
 # ======================================================
@@ -262,7 +304,7 @@ def main():
     parser.add_argument('--visualize_alignment', action='store_true', default=False)
     
     # [핵심] 진행 방향 연장 거리 (기본값 0.03m = 3cm)
-    parser.add_argument('--goal_extension', type=float, default=0.05, 
+    parser.add_argument('--goal_extension', type=float, default=0.2, 
                         help='Extend goal along trajectory direction (m) - default for all fingers')
     
     # 손가락별 개별 연장 거리 (옵션)
@@ -273,10 +315,40 @@ def main():
     parser.add_argument('--goal_extension_mf', type=float, default=None,
                         help='Goal extension for middle finger (mf) - overrides --goal_extension')
     
-    # 수동 오프셋 (필요시 사용, 기본 0)
+    # 수동 오프셋 (전체 손가락 공통, 기본 0)
     parser.add_argument('--goal_offset_x', type=float, default=0.0)
     parser.add_argument('--goal_offset_y', type=float, default=0.0)
     parser.add_argument('--goal_offset_z', type=float, default=0.0)
+    
+    # 손가락별 축별 오프셋 (특정 손가락의 특정 축만 조정, 예: mf의 z를 -0.1)
+    parser.add_argument('--th_offset_x', type=float, default=0.0, help='Thumb X-axis offset (m)')
+    parser.add_argument('--th_offset_y', type=float, default=0.0, help='Thumb Y-axis offset (m)')
+    parser.add_argument('--th_offset_z', type=float, default=0.025, help='Thumb Z-axis offset (m)')
+    
+    parser.add_argument('--if_offset_x', type=float, default=0.05, help='Index finger X-axis offset (m)') # 
+    parser.add_argument('--if_offset_y', type=float, default=0.0, help='Index finger Y-axis offset (m)')
+    parser.add_argument('--if_offset_z', type=float, default=-0.025, help='Index finger Z-axis offset (m)')
+    
+    parser.add_argument('--mf_offset_x', type=float, default=0.0, help='Middle finger X-axis offset (m)')
+    parser.add_argument('--mf_offset_y', type=float, default=0.0, help='Middle finger Y-axis offset (m)')
+    parser.add_argument('--mf_offset_z', type=float, default=-0.025, help='Middle finger Z-axis offset (m, e.g., -0.1 to lower)') # -0.25
+    
+    # DMP 실행 설정
+    parser.add_argument('--tau_scale', type=float, default=0.25,
+                        help='DMP speed scaling: 0.5=2x faster, 2.0=2x slower')
+    parser.add_argument('--hold_time', type=float, default=7.5,
+                        help='Hold time at final position (seconds)')
+    
+    # [NEW] 속도 프로파일 설정
+    parser.add_argument('--speed_profile', type=str, default='decelerating',
+                        choices=['constant', 'accelerating', 'decelerating', 'sigmoid'],
+                        help='Speed profile during trajectory execution:\n'
+                             '  constant: uniform speed\n'
+                             '  accelerating: slow start → fast end\n'
+                             '  decelerating: fast start → slow end\n'
+                             '  sigmoid: smooth S-curve acceleration')
+    parser.add_argument('--accel_factor', type=float, default=2.0,
+                        help='Acceleration/deceleration strength (1.0=linear, 2.0=quadratic, 3.0=cubic)')
     
     # Plot 설정
     parser.add_argument('--save_plots', action='store_true', default=True,
@@ -288,6 +360,7 @@ def main():
     
     args = parser.parse_args()
 
+    # 전체 공통 오프셋
     manual_offset = np.array([args.goal_offset_x, args.goal_offset_y, args.goal_offset_z])
     
     # 손가락별 연장 거리 설정
@@ -297,13 +370,26 @@ def main():
         'mf': args.goal_extension_mf if args.goal_extension_mf is not None else args.goal_extension,
     }
     
+    # 손가락별 축별 오프셋 설정
+    finger_offsets = {
+        'th': np.array([args.th_offset_x, args.th_offset_y, args.th_offset_z]),
+        'if': np.array([args.if_offset_x, args.if_offset_y, args.if_offset_z]),
+        'mf': np.array([args.mf_offset_x, args.mf_offset_y, args.mf_offset_z]),
+    }
+    
     print(f"🔧 Config:")
     print(f"   Default Goal Extension: {args.goal_extension*100:.1f} cm")
     print(f"   Per-Finger Extensions:")
     print(f"      Thumb (th):  {finger_extensions['th']*100:.1f} cm")
     print(f"      Index (if):  {finger_extensions['if']*100:.1f} cm")
     print(f"      Middle (mf): {finger_extensions['mf']*100:.1f} cm")
-    print(f"   Manual Offset: [{args.goal_offset_x:.3f}, {args.goal_offset_y:.3f}, {args.goal_offset_z:.3f}] m")
+    print(f"   Global Manual Offset: [{args.goal_offset_x:.3f}, {args.goal_offset_y:.3f}, {args.goal_offset_z:.3f}] m")
+    print(f"   Per-Finger Axis Offsets:")
+    print(f"      Thumb (th):  [{args.th_offset_x:.3f}, {args.th_offset_y:.3f}, {args.th_offset_z:.3f}] m")
+    print(f"      Index (if):  [{args.if_offset_x:.3f}, {args.if_offset_y:.3f}, {args.if_offset_z:.3f}] m")
+    print(f"      Middle (mf): [{args.mf_offset_x:.3f}, {args.mf_offset_y:.3f}, {args.mf_offset_z:.3f}] m")
+    print(f"   Speed Profile: {args.speed_profile} (accel_factor={args.accel_factor})")
+    print(f"   Tau Scale: {args.tau_scale}, Hold Time: {args.hold_time}s")
 
     # ========================================
     # Multi-CSV Mode
@@ -342,12 +428,14 @@ def main():
                         
                         # Compute auto offset for this demo (손가락별 연장 거리)
                         auto_offset = compute_auto_offset(x_attr_raw, finger_extensions[finger])
-                        final_offset = auto_offset + manual_offset
+                        # 최종 오프셋 = 자동 연장 + 전체 공통 오프셋 + 손가락별 축 오프셋
+                        final_offset = auto_offset + manual_offset + finger_offsets[finger]
                         
                         # Train DMP on this single demo (with extended goal)
                         dmp = DiscreteDMP(n_bfs=args.n_bfs)
                         dmp.train(x_attr_raw, dt=0.02, goal_offset=final_offset)
-                        x_attr_dmp = dmp.rollout()
+                        x_attr_dmp = dmp.rollout(tau_scale=args.tau_scale, hold_time=args.hold_time,
+                                                speed_profile=args.speed_profile, accel_factor=args.accel_factor)
                         
                         demo_data[finger] = {
                             'pos_demo': x_demo,
@@ -366,7 +454,7 @@ def main():
                 # Generate plot (similar to compare_dmp_kf.py style)
                 from mpl_toolkits.mplot3d import Axes3D
                 fig = plt.figure(figsize=(18, 18))
-                finger_colors = {'th': 'red', 'if': 'green', 'mf': 'blue'}
+                finger_colors = {'th': 'blue', 'if': 'red', 'mf': 'green'}
                 
                 # 3D Plot - All three fingers (top-left)
                 ax3d = fig.add_subplot(3, 3, 1, projection='3d')
@@ -483,16 +571,20 @@ def main():
             
             # 2. [핵심] 진행 방향 벡터 계산 및 목표 연장 (손가락별)
             auto_offset = compute_auto_offset(x_attr_mean, finger_extensions[finger])
-            final_offset = auto_offset + manual_offset
+            # 최종 오프셋 = 자동 연장 + 전체 공통 오프셋 + 손가락별 축 오프셋
+            final_offset = auto_offset + manual_offset + finger_offsets[finger]
             
             print(f"  🚀 Auto Extension: [{auto_offset[0]*100:.2f}, {auto_offset[1]*100:.2f}, {auto_offset[2]*100:.2f}] cm")
+            print(f"  🎯 Finger-specific Offset: [{finger_offsets[finger][0]*100:.2f}, {finger_offsets[finger][1]*100:.2f}, {finger_offsets[finger][2]*100:.2f}] cm")
+            print(f"  📍 Final Total Offset: [{final_offset[0]*100:.2f}, {final_offset[1]*100:.2f}, {final_offset[2]*100:.2f}] cm")
 
             # 3. DMP 학습 (연장된 goal로 학습)
             dmp = DiscreteDMP(n_bfs=args.n_bfs)
             dmp.train(x_attr_mean, dt=0.02, goal_offset=final_offset)
             
-            # 4. 궤적 생성 (이미 연장된 goal 사용)
-            x_reproduced = dmp.rollout()
+            # 4. 궤적 생성 (이미 연장된 goal 사용, 속도 조절 및 끝 유지)
+            x_reproduced = dmp.rollout(tau_scale=args.tau_scale, hold_time=args.hold_time,
+                                      speed_profile=args.speed_profile, accel_factor=args.accel_factor)
 
             if args.visualize_alignment:
                 print("  [Alignment Check] plotting demos + mean + DMP output...")
@@ -602,9 +694,12 @@ def main():
 
         # 목표 연장 계산 (손가락별)
         auto_offset = compute_auto_offset(x_attr_raw, finger_extensions[finger])
-        final_offset = auto_offset + manual_offset
+        # 최종 오프셋 = 자동 연장 + 전체 공통 오프셋 + 손가락별 축 오프셋
+        final_offset = auto_offset + manual_offset + finger_offsets[finger]
         
         print(f"  🚀 Auto Extension: [{auto_offset[0]*100:.2f}, {auto_offset[1]*100:.2f}, {auto_offset[2]*100:.2f}] cm")
+        print(f"  🎯 Finger-specific Offset: [{finger_offsets[finger][0]*100:.2f}, {finger_offsets[finger][1]*100:.2f}, {finger_offsets[finger][2]*100:.2f}] cm")
+        print(f"  📍 Final Total Offset: [{final_offset[0]*100:.2f}, {final_offset[1]*100:.2f}, {final_offset[2]*100:.2f}] cm")
         print(f"  Training DMP (n_bfs={args.n_bfs}) with extended goal...")
         
         dmp = DiscreteDMP(n_bfs=args.n_bfs)
@@ -613,7 +708,8 @@ def main():
         dmp.save(save_name)
         print(f"  ✅ Saved model: {save_name}")
 
-        x_reproduced = dmp.rollout()
+        x_reproduced = dmp.rollout(tau_scale=args.tau_scale, hold_time=args.hold_time,
+                                  speed_profile=args.speed_profile, accel_factor=args.accel_factor)
         
         # 시각화: 3D 궤적
         from mpl_toolkits.mplot3d import Axes3D
