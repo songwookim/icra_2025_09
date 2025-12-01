@@ -1047,7 +1047,19 @@ if torch is not None:
             n_samples: int = 1,
             sampler: str = "ddpm",
             eta: float = 0.0,
+            n_inference_steps: Optional[int] = None,  # [NEW] DDIM can use fewer steps
         ) -> np.ndarray:
+            """Predict action from observation.
+            
+            Args:
+                obs: Observation array (B, obs_dim) or (B, seq_len, obs_dim)
+                n_samples: Number of samples to average
+                sampler: 'ddpm' or 'ddim'
+                eta: DDIM stochasticity (0 = deterministic)
+                n_inference_steps: [DDIM ONLY] Number of denoising steps.
+                    If None, uses all timesteps. For real-time, use 10-20.
+                    DDIM can skip steps by interpolating the alpha schedule.
+            """
             self.model.eval()
             obs_tensor = torch.from_numpy(obs.astype(np.float32)).to(self.device)
             batch = obs_tensor.size(0)
@@ -1057,15 +1069,36 @@ if torch is not None:
                 raise ValueError(f"Unsupported sampler '{sampler}'. Choose 'ddpm' or 'ddim'.")
             eta = max(0.0, float(eta))
             model_act_dim = self.act_dim * self.action_horizon
+            
+            # [DDIM ACCELERATION] Create step schedule
+            if mode == "ddim" and n_inference_steps is not None and n_inference_steps < self.timesteps:
+                # Use uniform step spacing for DDIM
+                step_ratio = self.timesteps / n_inference_steps
+                timestep_schedule = [int(i * step_ratio) for i in range(n_inference_steps)]
+                timestep_schedule = list(reversed(timestep_schedule))  # Start from T, go to 0
+                # [DEBUG] Log accelerated inference
+                if not hasattr(self, '_ddim_logged'):
+                    print(f"[DDIM ACCEL] Using {n_inference_steps} steps (was {self.timesteps}), schedule={timestep_schedule[:5]}...")
+                    self._ddim_logged = True
+            else:
+                # Full schedule (DDPM or DDIM without acceleration)
+                timestep_schedule = list(reversed(range(self.timesteps)))
+                # [DEBUG] Log full schedule
+                if not hasattr(self, '_full_logged'):
+                    print(f"[DDIM FULL] Using full {self.timesteps} steps (mode={mode}, n_inference_steps={n_inference_steps})")
+                    self._full_logged = True
+            
             for _ in range(max(1, n_samples)):
                 x = torch.randn(batch, model_act_dim, device=self.device)
-                for t_inv in reversed(range(self.timesteps)):
+                
+                for i, t_inv in enumerate(timestep_schedule):
                     t = torch.full((batch,), t_inv, device=self.device, dtype=torch.long)
                     pred_noise = self.model(obs_tensor, x, t)
                     alpha_hat = self.alpha_cumprod[t_inv]
                     sqrt_alpha_hat = self.sqrt_alpha_cumprod[t_inv]
                     sqrt_one_minus = self.sqrt_one_minus_alpha_cumprod[t_inv]
                     pred_x0 = (x - pred_noise * sqrt_one_minus) / sqrt_alpha_hat
+                    
                     if mode == "ddpm":
                         coef1 = self.posterior_mean_coef1[t_inv]
                         coef2 = self.posterior_mean_coef2[t_inv]
@@ -1076,9 +1109,15 @@ if torch is not None:
                             x = mean + torch.sqrt(torch.clamp(var, min=1e-6)) * noise
                         else:
                             x = mean
-                    else:  # DDIM
+                    else:  # DDIM with step skipping support
+                        # Get next timestep (or 0 if last step)
+                        if i + 1 < len(timestep_schedule):
+                            t_next = timestep_schedule[i + 1]
+                            alpha_prev = self.alpha_cumprod[t_next]
+                        else:
+                            alpha_prev = torch.tensor(1.0, device=self.device)  # t=0
+                        
                         if t_inv > 0:
-                            alpha_prev = self.alpha_cumprod_prev[t_inv]
                             base = (1.0 - alpha_prev) / (1.0 - alpha_hat) * (1.0 - alpha_hat / alpha_prev)
                             base = torch.clamp(base, min=0.0)
                             sigma = eta * torch.sqrt(base)
@@ -1852,6 +1891,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stiffness-dir",
         type=Path,
+        # default=DEFAULT_STIFFNESS_DIR,
         default=DEFAULT_STIFFNESS_DIR,
         help="Directory with stiffness profile CSVs (contains both obs and actions)",
     )

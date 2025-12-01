@@ -14,6 +14,11 @@ import os
 import yaml  # type: ignore
 import math
 from datetime import datetime
+import threading
+import sys
+import select
+import termios
+import tty
 
 import numpy as np
 import rclpy
@@ -87,6 +92,7 @@ class TorqueImpedanceControllerNode(Node):
         self.declare_parameter("current_units_scale", [1.0] * 9)  # Per-joint scaling factor for current units output
         self.declare_parameter("stiffness_logging_enabled", True)
         self.declare_parameter("stiffness_log_dir", default_stiffness_log_dir)
+        self.declare_parameter("max_pwm_limit", 400)  # PWM safety limit for plotting (matches robot_controller)
 
         def _p(name: str):
             return self.get_parameter(name).value
@@ -113,6 +119,7 @@ class TorqueImpedanceControllerNode(Node):
         self.joint_state_topic = str(_p("joint_state_topic") or "/robot_controller/joint_state")
         self.pos_error_threshold = float(_p("position_error_threshold") or 0.05)
         self.stiffness_logging_enabled = bool(_p("stiffness_logging_enabled") if _p("stiffness_logging_enabled") is not None else True)
+        self.max_pwm_limit = int(_p("max_pwm_limit") or 400)  # PWM limit for plotting
         log_dir_param = _p("stiffness_log_dir")
         self.stiffness_log_dir = str(log_dir_param) if log_dir_param else default_stiffness_log_dir
         if self.stiffness_logging_enabled:
@@ -200,12 +207,14 @@ class TorqueImpedanceControllerNode(Node):
         self.torque_log_data: List[Tuple[float, np.ndarray]] = []  # Store computed torques
         self.current_units_log_data: List[Tuple[float, np.ndarray]] = []  # Store current units (clipped)
         self.current_units_raw_log_data: List[Tuple[float, np.ndarray]] = []  # Store raw current units (before clipping)
+        self.pwm_log_data: List[Tuple[float, np.ndarray]] = []  # Store PWM values (9 joints)
         self.stiffness_log_start_time = 0.0
         self._stiffness_log_session_id = 0
         self.current_eccentricity = 0.0
         self.current_eccentricity_smoothed = 0.0
         self.has_eccentricity = False
         self.has_eccentricity_smoothed = False
+        self.current_pwm: Optional[np.ndarray] = None  # Latest PWM values
 
         self.mj_model = None
         self.mj_data = None
@@ -237,6 +246,9 @@ class TorqueImpedanceControllerNode(Node):
         self.create_subscription(WrenchStamped, "/force_sensor/s2/wrench", self.subscribe_wrench_single_s2, 10)
         self.create_subscription(WrenchStamped, "/force_sensor/s3/wrench", self.subscribe_wrench_single_s3, 10)
         self.get_logger().info("[INIT] Force sensor subscribers created (s1, s2, s3)")
+        # Subscribe to PWM topic for monitoring and logging
+        self.create_subscription(Int32MultiArray, "/dynamixel/present_pwm", self.subscribe_pwm, 10)
+        self.get_logger().info("[INIT] PWM subscriber created (/dynamixel/present_pwm)")
 
         # Publishers & timer
         self.current_pub = self.create_publisher(Int32MultiArray, "/dynamixel/goal_current", 10)
@@ -259,6 +271,15 @@ class TorqueImpedanceControllerNode(Node):
             # Timer for continuous EE pose publishing (same rate as control loop)
             self.create_timer(1.0 / self.rate_hz, self.publish_ee_pose_message)
             self.get_logger().info(f"EE pose publish timer created: rate={self.rate_hz}Hz")
+
+        # Goal position publisher for initial pose movement
+        self._goal_position_pub = self.create_publisher(Int32MultiArray, "/dynamixel/goal_position", 10)
+        
+        # Keyboard listener thread (non-blocking)
+        self._keyboard_enabled = True
+        self._keyboard_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
+        self._keyboard_thread.start()
+        self.get_logger().info("[KEYBOARD] Listener started - Press 'i' to move to initial pose, 'q' to quit keyboard listener")
 
     def _init_mujoco(self) -> None:
         if not MUJOCO_AVAILABLE:
@@ -402,6 +423,71 @@ class TorqueImpedanceControllerNode(Node):
             except Exception as e:
                 self.get_logger().warning(f"[MUJOCO] Failed to get initial EE for {finger}: {e}")
 
+    def move_to_initial_pose(self) -> None:
+        """Move robot to initial pose by publishing initial_qpos to /dynamixel/goal_position."""
+        self.get_logger().info("[KEYBOARD] 'i' pressed -> Moving to INITIAL POSE")
+        
+        # Publish goal position (initial_qpos in units)
+        try:
+            goal_pos_msg = Int32MultiArray()
+            goal_pos_msg.data = [int(q) for q in self.initial_qpos]
+            
+            # Create publisher if not exists
+            if not hasattr(self, '_goal_position_pub') or self._goal_position_pub is None:
+                self._goal_position_pub = self.create_publisher(Int32MultiArray, "/dynamixel/goal_position", 10)
+            
+            self._goal_position_pub.publish(goal_pos_msg)
+            self.get_logger().info(f"[INITIAL POSE] Published goal_position: {goal_pos_msg.data}")
+            
+            # Reset desired positions so impedance controller doesn't fight
+            for finger in ['th', 'if', 'mf']:
+                self.fingers[finger].has_desired_pos = False
+            
+            # Also reset MuJoCo visualization
+            self._apply_initial_mujoco_pose()
+            
+        except Exception as e:
+            self.get_logger().error(f"[INITIAL POSE] Failed to move: {e}")
+
+    def _keyboard_listener(self) -> None:
+        """Non-blocking keyboard listener thread for initial pose command."""
+        self.get_logger().info("[KEYBOARD] Listener thread running...")
+        
+        # Check if running in a terminal with stdin
+        if not sys.stdin.isatty():
+            self.get_logger().warning("[KEYBOARD] Not a TTY - keyboard listener disabled")
+            return
+        
+        try:
+            old_settings = termios.tcgetattr(sys.stdin)
+        except Exception as e:
+            self.get_logger().warning(f"[KEYBOARD] Failed to get terminal settings: {e}")
+            return
+        
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+            
+            while self._keyboard_enabled and rclpy.ok():
+                # Non-blocking check for key press
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    key = sys.stdin.read(1)
+                    
+                    if key == 'i' or key == 'I':
+                        self.move_to_initial_pose()
+                    elif key == 'q' or key == 'Q':
+                        self.get_logger().info("[KEYBOARD] 'q' pressed -> Disabling keyboard listener")
+                        self._keyboard_enabled = False
+                        break
+                        
+        except Exception as e:
+            self.get_logger().error(f"[KEYBOARD] Listener error: {e}")
+        finally:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+            self.get_logger().info("[KEYBOARD] Listener thread ended")
+
     # Wrench callbacks
     def subscribe_wrench_single(self, idx: int, msg: WrenchStamped) -> None:
         try:
@@ -468,22 +554,35 @@ class TorqueImpedanceControllerNode(Node):
             if len(msg.data) >= 9:
                 raw_k = np.array(msg.data[:9], dtype=float)
 
-                if not self.has_stiffness:
-                    self.filtered_stiffness = raw_k
-                    self.target_stiffness = raw_k
-                    self.has_stiffness = True
-                    return
-
-                delta = raw_k - self.filtered_stiffness
-                delta = np.clip(delta, -self.max_k_change, self.max_k_change)
-                target_k_limited = self.filtered_stiffness + delta
-
-                self.filtered_stiffness = (
-                    self.stiffness_alpha * target_k_limited
-                    + (1.0 - self.stiffness_alpha) * self.filtered_stiffness
-                )
-
-                self.target_stiffness = self.filtered_stiffness
+                # [DEBUG] Bypass all filtering - use raw value from policy node
+                # Policy node already applies LP filter, so no additional filtering needed here
+                # This helps debug whether step function comes from policy or controller
+                self.filtered_stiffness = raw_k
+                self.target_stiffness = raw_k
+                self.has_stiffness = True
+                
+                # [ORIGINAL CODE - DISABLED FOR DEBUGGING]
+                # The combination of rate limiting (max_k_change=1.0) and exponential
+                # smoothing (alpha=0.1) was causing step-function behavior by:
+                # 1. Limiting changes to 1 N/m per step (too restrictive)
+                # 2. Only applying 10% of new value (too slow response)
+                #
+                # if not self.has_stiffness:
+                #     self.filtered_stiffness = raw_k
+                #     self.target_stiffness = raw_k
+                #     self.has_stiffness = True
+                #     return
+                #
+                # delta = raw_k - self.filtered_stiffness
+                # delta = np.clip(delta, -self.max_k_change, self.max_k_change)
+                # target_k_limited = self.filtered_stiffness + delta
+                #
+                # self.filtered_stiffness = (
+                #     self.stiffness_alpha * target_k_limited
+                #     + (1.0 - self.stiffness_alpha) * self.filtered_stiffness
+                # )
+                #
+                # self.target_stiffness = self.filtered_stiffness
         except Exception as e:
             self.get_logger().warning(f"stiffness 콜백 오류: {e}")
 
@@ -500,6 +599,14 @@ class TorqueImpedanceControllerNode(Node):
             self.has_eccentricity_smoothed = True
         except Exception as e:
             self.get_logger().warning(f"eccentricity_smoothed 콜백 오류: {e}")
+
+    def subscribe_pwm(self, msg: Int32MultiArray) -> None:
+        """Subscribe to PWM values from robot_controller_node"""
+        try:
+            if len(msg.data) >= 9:
+                self.current_pwm = np.array(msg.data[:9], dtype=np.int32)
+        except Exception as e:
+            self.get_logger().warning(f"PWM 콜백 오류: {e}")
 
     def subscribe_joint_state(self, msg: JointState) -> None:
         try:
@@ -889,7 +996,8 @@ class TorqueImpedanceControllerNode(Node):
             tuple: (clipped_units, raw_units_before_clipping) - both as List[int]
         """
         # 1) 토크 → 전류(mA)
-        #    CURRENT_TO_TORQUE: N·m / mA
+        #    CURRENT_TO_TORQUE: N·m / mA (약 1.78e-3)
+        #    torque [Nm] / CURRENT_TO_TORQUE [Nm/mA] = current [mA]
         currents_mA = np.where(
             CURRENT_TO_TORQUE > 0.0,
             torques / CURRENT_TO_TORQUE,
@@ -898,8 +1006,9 @@ class TorqueImpedanceControllerNode(Node):
 
         # 2) 전류(mA) → current unit (1 unit ≈ 2.69 mA)
         units = currents_mA / CURRENT_UNIT
-        # 3) per-joint 튜닝 스케일 (처음엔 1.0으로 두고 시작)
-        units = torques * self.current_units_scale
+        
+        # 3) per-joint 튜닝 스케일 적용
+        units = units * self.current_units_scale
         
         # Store raw units before clipping (as int list)
         units_raw = [int(round(u)) for u in units]
@@ -938,6 +1047,7 @@ class TorqueImpedanceControllerNode(Node):
         self.torque_log_data = []
         self.current_units_log_data = []
         self.current_units_raw_log_data = []
+        self.pwm_log_data = []  # Clear PWM log data
         self.stiffness_log_active = True
         self.stiffness_log_start_time = self.get_clock().now().nanoseconds / 1e9
         self._stiffness_log_session_id += 1
@@ -954,18 +1064,36 @@ class TorqueImpedanceControllerNode(Node):
         force_count = len(self.force_log_data)
         ee_pos_count = len(self.ee_pos_log_data)
         torque_count = len(self.torque_log_data)
+        pwm_count = len(self.pwm_log_data)
         if sample_count == 0 and ecc_count == 0 and force_count == 0 and ee_pos_count == 0 and torque_count == 0:
             self.get_logger().info(
                 f"[STIFFNESS_LOG] Recording stopped ({reason}) but no samples captured"
             )
             return
         self.get_logger().info(
-            f"[STIFFNESS_LOG] Recording stopped ({reason}), stiffness={sample_count}, ecc={ecc_count}, force={force_count}, ee_pos={ee_pos_count}, torque={torque_count}"
+            f"[STIFFNESS_LOG] Recording stopped ({reason}), stiffness={sample_count}, ecc={ecc_count}, force={force_count}, ee_pos={ee_pos_count}, torque={torque_count}, pwm={pwm_count}"
         )
-        self._save_stiffness_eccentricity_plot()
-        self._save_force_plot()
-        self._save_ee_position_plot()
-        self._save_torque_current_plot()
+        
+        # Create session folder with timestamp
+        import os as _os_module
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pid = _os_module.getpid()
+        session_folder = os.path.join(
+            self.stiffness_log_dir,
+            f"session_{timestamp}_pid{pid}_{self._stiffness_log_session_id:02d}"
+        )
+        os.makedirs(session_folder, exist_ok=True)
+        self.get_logger().info(f"[STIFFNESS_LOG] Session folder created: {session_folder}")
+        
+        # Save all 5 plots and CSV data into session folder
+        self._save_stiffness_eccentricity_plot(session_folder)
+        self._save_force_plot(session_folder)
+        self._save_ee_position_plot(session_folder)
+        self._save_torque_current_plot(session_folder)
+        self._save_pwm_plot(session_folder)
+        self._save_all_csv_data(session_folder)
+        
+        # Clear log data
         self.stiffness_log_data = []
         self.eccentricity_log_data = []
         self.eccentricity_smoothed_log_data = []
@@ -975,8 +1103,9 @@ class TorqueImpedanceControllerNode(Node):
         self.torque_log_data = []
         self.current_units_log_data = []
         self.current_units_raw_log_data = []
+        self.pwm_log_data = []
 
-    def _save_stiffness_eccentricity_plot(self) -> None:
+    def _save_stiffness_eccentricity_plot(self, session_folder: str) -> None:
         """Save stiffness + eccentricity plot (2 subplots)"""
         if not self.stiffness_log_data:
             return
@@ -1019,24 +1148,17 @@ class TorqueImpedanceControllerNode(Node):
             ax2.set_xlabel("Time (s)")
             ax2.grid(True, alpha=0.3)
             ax2.legend(loc="upper right")
-            ax2.legend(loc="upper right")
         else:
             ax2.text(0.5, 0.5, "No eccentricity data", ha='center', va='center', transform=ax2.transAxes)
             ax2.set_ylabel("Eccentricity")
             ax2.set_xlabel("Time (s)")
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        import os as _os_module
-        pid = _os_module.getpid()
-        filename = os.path.join(
-            self.stiffness_log_dir,
-            f"stiffness_ecc_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
-        )
+        filename = os.path.join(session_folder, "01_stiffness_eccentricity.png")
         try:
             plt.tight_layout()
             plt.savefig(filename, dpi=200)
             self.get_logger().warning(
-                f"[STIFFNESS_LOG] *** SAVED PLOT 1/2 *** Stiffness+Eccentricity ({len(times_stiff)} samples) -> {filename}"
+                f"[STIFFNESS_LOG] *** SAVED PLOT 1/5 *** Stiffness+Eccentricity ({len(times_stiff)} samples) -> {filename}"
             )
         except Exception as exc:
             self.get_logger().error(f"[STIFFNESS_LOG] Failed to save stiffness plot: {exc}")
@@ -1045,7 +1167,7 @@ class TorqueImpedanceControllerNode(Node):
         finally:
             plt.close()
 
-    def _save_force_plot(self) -> None:
+    def _save_force_plot(self, session_folder: str) -> None:
         """Save force sensor plot (3 fingers x 3 axes = 9 subplots in 3x3 grid)"""
         if not self.force_log_data:
             self.get_logger().info("[FORCE_LOG] No force data to plot")
@@ -1106,15 +1228,12 @@ class TorqueImpedanceControllerNode(Node):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         import os as _os_module
         pid = _os_module.getpid()
-        filename = os.path.join(
-            self.stiffness_log_dir,
-            f"force_sensors_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
-        )
+        filename = os.path.join(session_folder, "02_force_sensors.png")
         try:
             plt.tight_layout()
             plt.savefig(filename, dpi=200)
             self.get_logger().warning(
-                f"[FORCE_LOG] *** SAVED PLOT 2/2 *** Force sensors ({len(times_force)} samples) -> {filename}"
+                f"[FORCE_LOG] *** SAVED PLOT 2/5 *** Force sensors ({len(times_force)} samples) -> {filename}"
             )
         except Exception as exc:
             self.get_logger().error(f"[FORCE_LOG] Failed to save force plot: {exc}")
@@ -1123,7 +1242,7 @@ class TorqueImpedanceControllerNode(Node):
         finally:
             plt.close()
 
-    def _save_ee_position_plot(self) -> None:
+    def _save_ee_position_plot(self, session_folder: str) -> None:
         """Save EE position tracking plot: desired vs actual (3 fingers x 3 axes = 9 subplots)"""
         if not self.ee_pos_log_data or not self.desired_pos_log_data:
             self.get_logger().info("[EE_POS_LOG] No EE position data to plot")
@@ -1208,18 +1327,12 @@ class TorqueImpedanceControllerNode(Node):
                 if row == 0 and col == 2:
                     ax.legend(loc='upper right', fontsize=8)
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        import os as _os_module
-        pid = _os_module.getpid()
-        filename = os.path.join(
-            self.stiffness_log_dir,
-            f"ee_position_tracking_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
-        )
+        filename = os.path.join(session_folder, "03_ee_position_tracking.png")
         try:
             plt.tight_layout()
             plt.savefig(filename, dpi=200)
             self.get_logger().warning(
-                f"[EE_POS_LOG] *** SAVED PLOT 3/4 *** EE Position Tracking ({len(times_ee)} samples) -> {filename}"
+                f"[EE_POS_LOG] *** SAVED PLOT 3/5 *** EE Position Tracking ({len(times_ee)} samples) -> {filename}"
             )
         except Exception as exc:
             self.get_logger().error(f"[EE_POS_LOG] Failed to save EE position plot: {exc}")
@@ -1228,8 +1341,9 @@ class TorqueImpedanceControllerNode(Node):
         finally:
             plt.close()
 
-    def _save_torque_current_plot(self) -> None:
-        """Save torque and current units plot (9 joints x 2 metrics = 9 subplots with 3 lines each: torque, clipped current, raw current)"""
+    def _save_torque_current_plot(self, session_folder: str) -> None:
+        """Save current units plot (PRIMARY) with torque as secondary reference.
+        Current units are the actual motor commands - int values that matter for robot control."""
         if not self.torque_log_data or not self.current_units_log_data:
             self.get_logger().info("[TORQUE_LOG] No torque/current data to plot")
             return
@@ -1243,14 +1357,20 @@ class TorqueImpedanceControllerNode(Node):
         times_current = np.array([entry[0] for entry in self.current_units_log_data], dtype=float)
         times_current_raw = np.array([entry[0] for entry in self.current_units_raw_log_data], dtype=float) if self.current_units_raw_log_data else times_current
         
-        # Extract torque and current data (9 joints each)
+        # Extract torque and current data (9 joints each) - CURRENT AS INT!
         torques_array = np.stack([entry[1] for entry in self.torque_log_data], axis=0)  # shape: (N, 9)
-        currents_array = np.stack([entry[1] for entry in self.current_units_log_data], axis=0).astype(int)  # shape: (N, 9), force int
-        currents_raw_array = np.stack([entry[1] for entry in self.current_units_raw_log_data], axis=0).astype(int) if self.current_units_raw_log_data else currents_array  # shape: (N, 9), force int
+        currents_array = np.stack([entry[1] for entry in self.current_units_log_data], axis=0).astype(int)  # shape: (N, 9), int!
+        currents_raw_array = np.stack([entry[1] for entry in self.current_units_raw_log_data], axis=0).astype(int) if self.current_units_raw_log_data else currents_array
         
-        # Create 3x3 grid for 9 joints
-        fig, axes = plt.subplots(3, 3, figsize=(15, 10), sharex=True)
-        fig.suptitle("Torque Inputs vs Current Units (9 joints)\nBlue: Torque | Red: Clipped Current | Orange: Raw Current (before clipping)", fontsize=14)
+        # Log current stats
+        self.get_logger().info(f"[CURRENT_STATS] Clipped: min={currents_array.min()}, max={currents_array.max()}, mean={currents_array.mean():.1f}")
+        self.get_logger().info(f"[CURRENT_STATS] Raw: min={currents_raw_array.min()}, max={currents_raw_array.max()}, mean={currents_raw_array.mean():.1f}")
+        
+        # Create 3x3 grid for 9 joints - CURRENT UNITS AS PRIMARY AXIS
+        fig, axes = plt.subplots(3, 3, figsize=(16, 11), sharex=True)
+        fig.suptitle("Current Units (Motor Commands) - Integer Values\n"
+                     "Red: Clipped Current (sent to motor) | Orange: Raw Current (before clipping) | Blue dashed: Torque (Nm)", 
+                     fontsize=14, fontweight='bold')
         
         joint_labels = [
             'TH_J0', 'TH_J1', 'TH_J2',
@@ -1263,47 +1383,50 @@ class TorqueImpedanceControllerNode(Node):
             col = joint_idx % 3
             ax = axes[row, col]
             
-            # Plot torque on primary y-axis
-            ax.plot(times_torque, torques_array[:, joint_idx], 
-                   color='blue', linewidth=1.2, label='Torque (Nm)')
-            ax.set_ylabel("Torque (Nm)", color='blue')
-            ax.tick_params(axis='y', labelcolor='blue')
+            # PRIMARY Y-AXIS: Current Units (int) - what actually goes to the motor!
+            # Plot raw current (before clipping) - orange
+            if self.current_units_raw_log_data:
+                ax.plot(times_current_raw, currents_raw_array[:, joint_idx], 
+                        color='orange', linewidth=1.5, label=f'Raw ({currents_raw_array[:, joint_idx].min()} ~ {currents_raw_array[:, joint_idx].max()})', alpha=0.7)
+            # Plot clipped current - red solid (thicker, more prominent)
+            ax.plot(times_current, currents_array[:, joint_idx], 
+                   color='red', linewidth=2.0, label=f'Clipped ({currents_array[:, joint_idx].min()} ~ {currents_array[:, joint_idx].max()})')
+            ax.set_ylabel("Current Units (int)", color='red', fontweight='bold')
+            ax.tick_params(axis='y', labelcolor='red')
+            from matplotlib.ticker import MaxNLocator
+            ax.yaxis.set_major_locator(MaxNLocator(integer=True))  # Force integer ticks
             ax.grid(True, alpha=0.3)
             
-            # Plot current units on secondary y-axis
-            ax2 = ax.twinx()
-            # Plot raw current (before clipping) - orange dashed
-            if self.current_units_raw_log_data:
-                ax2.plot(times_current_raw, currents_raw_array[:, joint_idx], 
-                        color='orange', linewidth=1.0, linestyle='--', label='Raw Current (pre-clip)', alpha=0.5)
-            # Plot clipped current - red solid
-            ax2.plot(times_current, currents_array[:, joint_idx], 
-                    color='red', linewidth=1.2, label='Clipped Current', alpha=0.8)
-            ax2.set_ylabel("Current Units", color='red')
-            ax2.tick_params(axis='y', labelcolor='red')
+            # Add horizontal line at 0
+            ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
             
-            ax.set_title(joint_labels[joint_idx], fontsize=10)
+            # SECONDARY Y-AXIS: Torque (for reference only)
+            ax2 = ax.twinx()
+            ax2.plot(times_torque, torques_array[:, joint_idx], 
+                    color='blue', linewidth=1.0, linestyle='--', label='Torque', alpha=0.5)
+            ax2.set_ylabel("Torque (Nm)", color='blue', alpha=0.6)
+            ax2.tick_params(axis='y', labelcolor='blue', labelsize=8)
+            
+            # Title with current stats
+            curr_mean = currents_array[:, joint_idx].mean()
+            curr_std = currents_array[:, joint_idx].std()
+            ax.set_title(f"{joint_labels[joint_idx]} | μ={curr_mean:.0f}, σ={curr_std:.0f}", fontsize=10, fontweight='bold')
+            
             if row == 2:
                 ax.set_xlabel("Time (s)")
             
-            # Add legend only to first subplot
+            # Add legend to first subplot
             if joint_idx == 0:
                 lines1, labels1 = ax.get_legend_handles_labels()
                 lines2, labels2 = ax2.get_legend_handles_labels()
                 ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=7)
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        import os as _os_module
-        pid = _os_module.getpid()
-        filename = os.path.join(
-            self.stiffness_log_dir,
-            f"torque_current_{timestamp}_pid{pid}_session{self._stiffness_log_session_id:02d}.png",
-        )
+        filename = os.path.join(session_folder, "04_torque_current.png")
         try:
             plt.tight_layout()
             plt.savefig(filename, dpi=200)
             self.get_logger().warning(
-                f"[TORQUE_LOG] *** SAVED PLOT 4/4 *** Torque vs Current ({len(times_torque)} samples) -> {filename}"
+                f"[TORQUE_LOG] *** SAVED PLOT 4/5 *** Torque vs Current ({len(times_torque)} samples) -> {filename}"
             )
         except Exception as exc:
             self.get_logger().error(f"[TORQUE_LOG] Failed to save torque/current plot: {exc}")
@@ -1311,6 +1434,187 @@ class TorqueImpedanceControllerNode(Node):
             self.get_logger().error(f"[TORQUE_LOG] Traceback:\n{traceback.format_exc()}")
         finally:
             plt.close()
+
+    def _save_pwm_plot(self, session_folder: str) -> None:
+        """Save PWM monitoring plot (9 joints in 3x3 grid)"""
+        if not self.pwm_log_data:
+            self.get_logger().info("[PWM_LOG] No PWM data to plot")
+            return
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            self.get_logger().warning("[PWM_LOG] Matplotlib not available - skip plot")
+            return
+        
+        times_pwm = np.array([entry[0] for entry in self.pwm_log_data], dtype=float)
+        pwm_array = np.stack([entry[1] for entry in self.pwm_log_data], axis=0)  # shape: (N, 9)
+        
+        # Create 3x3 grid for 9 joints
+        fig, axes = plt.subplots(3, 3, figsize=(15, 10), sharex=True)
+        pwm_limit = self.max_pwm_limit  # Use actual limit from parameter
+        fig.suptitle(f"PWM Monitoring (9 joints) | Limit=±{pwm_limit} | Max HW=±885", fontsize=14)
+        
+        joint_labels = [
+            'TH_J0', 'TH_J1', 'TH_J2',
+            'IF_J0', 'IF_J1', 'IF_J2',
+            'MF_J0', 'MF_J1', 'MF_J2'
+        ]
+        
+        # Dynamic y-axis limit based on pwm_limit
+        y_max = max(pwm_limit * 1.5, 100)  # At least 100, or 1.5x the limit
+        
+        for joint_idx in range(9):
+            row = joint_idx // 3
+            col = joint_idx % 3
+            ax = axes[row, col]
+            
+            # Plot PWM values
+            ax.plot(times_pwm, pwm_array[:, joint_idx], color='purple', linewidth=1.2)
+            ax.axhline(y=pwm_limit, color='orange', linestyle='--', alpha=0.7, label=f'Limit (±{pwm_limit})')
+            ax.axhline(y=-pwm_limit, color='orange', linestyle='--', alpha=0.7)
+            ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+            ax.set_ylabel("PWM Units")
+            ax.set_ylim(-y_max, y_max)
+            ax.grid(True, alpha=0.3)
+            ax.set_title(joint_labels[joint_idx], fontsize=10)
+            
+            if row == 2:
+                ax.set_xlabel("Time (s)")
+            if joint_idx == 0:
+                ax.legend(loc='upper right', fontsize=7)
+        
+        filename = os.path.join(session_folder, "05_pwm_monitoring.png")
+        try:
+            plt.tight_layout()
+            plt.savefig(filename, dpi=200)
+            self.get_logger().warning(
+                f"[PWM_LOG] *** SAVED PLOT 5/5 *** PWM Monitoring ({len(times_pwm)} samples) -> {filename}"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"[PWM_LOG] Failed to save PWM plot: {exc}")
+            import traceback
+            self.get_logger().error(f"[PWM_LOG] Traceback:\n{traceback.format_exc()}")
+        finally:
+            plt.close()
+
+    def _save_all_csv_data(self, session_folder: str) -> None:
+        """Save all logged data as CSV files"""
+        import csv
+        
+        # 1. Stiffness data
+        if self.stiffness_log_data:
+            filename = os.path.join(session_folder, "stiffness.csv")
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['time', 'th_x', 'th_y', 'th_z', 'if_x', 'if_y', 'if_z', 'mf_x', 'mf_y', 'mf_z'])
+                    for t, vals in self.stiffness_log_data:
+                        writer.writerow([f'{t:.4f}'] + [f'{v:.4f}' for v in vals])
+                self.get_logger().info(f"[CSV] Saved stiffness.csv ({len(self.stiffness_log_data)} rows)")
+            except Exception as e:
+                self.get_logger().error(f"[CSV] Failed to save stiffness.csv: {e}")
+        
+        # 2. Eccentricity data
+        if self.eccentricity_log_data:
+            filename = os.path.join(session_folder, "eccentricity.csv")
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['time', 'ecc_raw', 'ecc_smoothed'])
+                    ecc_smoothed_dict = {t: v for t, v in self.eccentricity_smoothed_log_data}
+                    for t, raw in self.eccentricity_log_data:
+                        smoothed = ecc_smoothed_dict.get(t, '')
+                        writer.writerow([f'{t:.4f}', f'{raw:.6f}', f'{smoothed:.6f}' if smoothed else ''])
+                self.get_logger().info(f"[CSV] Saved eccentricity.csv ({len(self.eccentricity_log_data)} rows)")
+            except Exception as e:
+                self.get_logger().error(f"[CSV] Failed to save eccentricity.csv: {e}")
+        
+        # 3. Force data
+        if self.force_log_data:
+            filename = os.path.join(session_folder, "force.csv")
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['time', 'th_fx', 'th_fy', 'th_fz', 'if_fx', 'if_fy', 'if_fz', 'mf_fx', 'mf_fy', 'mf_fz'])
+                    for t, force_dict in self.force_log_data:
+                        row = [f'{t:.4f}']
+                        for finger in ['th', 'if', 'mf']:
+                            vec = force_dict.get(finger, np.zeros(3))
+                            row.extend([f'{vec[0]:.4f}', f'{vec[1]:.4f}', f'{vec[2]:.4f}'])
+                        writer.writerow(row)
+                self.get_logger().info(f"[CSV] Saved force.csv ({len(self.force_log_data)} rows)")
+            except Exception as e:
+                self.get_logger().error(f"[CSV] Failed to save force.csv: {e}")
+        
+        # 4. EE position data
+        if self.ee_pos_log_data:
+            filename = os.path.join(session_folder, "ee_position.csv")
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['time', 
+                                   'th_actual_x', 'th_actual_y', 'th_actual_z',
+                                   'if_actual_x', 'if_actual_y', 'if_actual_z',
+                                   'mf_actual_x', 'mf_actual_y', 'mf_actual_z',
+                                   'th_desired_x', 'th_desired_y', 'th_desired_z',
+                                   'if_desired_x', 'if_desired_y', 'if_desired_z',
+                                   'mf_desired_x', 'mf_desired_y', 'mf_desired_z'])
+                    desired_dict = {t: d for t, d in self.desired_pos_log_data}
+                    for t, ee_dict in self.ee_pos_log_data:
+                        row = [f'{t:.4f}']
+                        for finger in ['th', 'if', 'mf']:
+                            vec = ee_dict.get(finger, np.zeros(3))
+                            row.extend([f'{vec[0]:.6f}', f'{vec[1]:.6f}', f'{vec[2]:.6f}'])
+                        desired = desired_dict.get(t, {})
+                        for finger in ['th', 'if', 'mf']:
+                            vec = desired.get(finger, np.zeros(3))
+                            row.extend([f'{vec[0]:.6f}', f'{vec[1]:.6f}', f'{vec[2]:.6f}'])
+                        writer.writerow(row)
+                self.get_logger().info(f"[CSV] Saved ee_position.csv ({len(self.ee_pos_log_data)} rows)")
+            except Exception as e:
+                self.get_logger().error(f"[CSV] Failed to save ee_position.csv: {e}")
+        
+        # 5. Torque and current data (index-based matching since they're logged together)
+        if self.torque_log_data and self.current_units_log_data:
+            filename = os.path.join(session_folder, "torque_current.csv")
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    header = ['time']
+                    for j in range(9):
+                        header.extend([f'tau_{j}', f'curr_{j}', f'curr_raw_{j}'])
+                    writer.writerow(header)
+                    
+                    # Use index-based matching (torque, curr, curr_raw logged at same time)
+                    n_samples = min(len(self.torque_log_data), len(self.current_units_log_data), 
+                                    len(self.current_units_raw_log_data) if self.current_units_raw_log_data else len(self.current_units_log_data))
+                    
+                    for i in range(n_samples):
+                        t, tau = self.torque_log_data[i]
+                        _, curr = self.current_units_log_data[i]
+                        _, curr_raw = self.current_units_raw_log_data[i] if i < len(self.current_units_raw_log_data) else (0, np.zeros(9))
+                        row = [f'{t:.4f}']
+                        for j in range(9):
+                            row.extend([f'{tau[j]:.6f}', f'{int(curr[j])}', f'{int(curr_raw[j])}'])
+                        writer.writerow(row)
+                self.get_logger().info(f"[CSV] Saved torque_current.csv ({n_samples} rows)")
+            except Exception as e:
+                self.get_logger().error(f"[CSV] Failed to save torque_current.csv: {e}")
+        
+        # 6. PWM data
+        if self.pwm_log_data:
+            filename = os.path.join(session_folder, "pwm.csv")
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['time'] + [f'pwm_{j}' for j in range(9)])
+                    for t, pwm in self.pwm_log_data:
+                        writer.writerow([f'{t:.4f}'] + [f'{int(p)}' for p in pwm])
+                self.get_logger().info(f"[CSV] Saved pwm.csv ({len(self.pwm_log_data)} rows)")
+            except Exception as e:
+                self.get_logger().error(f"[CSV] Failed to save pwm.csv: {e}")
+        
+        self.get_logger().warning(f"[CSV] *** ALL CSV DATA SAVED *** to {session_folder}")
 
     def _control_loop(self) -> None:
         try:
@@ -1344,8 +1648,9 @@ class TorqueImpedanceControllerNode(Node):
                     'mf': self.desired_pos['mf'].copy()
                 }
                 self.desired_pos_log_data.append((rel_t, desired_pos_snapshot))
-                # Log torques (will be populated after filtering)
-                self.torque_log_data.append((rel_t, raw_tau.copy()))
+                # Log PWM values (torque and current logged after filtering below)
+                if self.current_pwm is not None:
+                    self.pwm_log_data.append((rel_t, self.current_pwm.copy()))
                 # Debug: log every 100 samples
                 # if len(self.stiffness_log_data) % 100 == 1:
                 #     self.get_logger().info(
@@ -1398,20 +1703,23 @@ class TorqueImpedanceControllerNode(Node):
             
             raw_tau = np.clip(raw_tau, -self.max_torque, self.max_torque)
             
-            # filt_tau = self._filter_torques(raw_tau)
-            current_units, current_units_raw = self._torques_to_current_units(raw_tau)
+            # Apply torque filter for smoothing
+            filt_tau = self._filter_torques(raw_tau)
+            current_units, current_units_raw = self._torques_to_current_units(filt_tau)
             
-            # Log current units if logging active
+            # Log torque AND current units together (same timestamp) if logging active
             if self.stiffness_log_active:
                 now_s = self.get_clock().now().nanoseconds / 1e9
                 rel_t = now_s - self.stiffness_log_start_time
+                # Log all three together with same timestamp
+                self.torque_log_data.append((rel_t, filt_tau.copy()))  # filtered torque
                 self.current_units_log_data.append((rel_t, np.array(current_units, dtype=int)))
                 self.current_units_raw_log_data.append((rel_t, np.array(current_units_raw, dtype=int)))
             
             # Debug: log filtered torque and current units
             if self._log_counter % int(self.rate_hz) == 0:
                 self.get_logger().info(
-                    f"[TORQUE_DEBUG] filt_tau={self.max_torque}, "
+                    f"[TORQUE_DEBUG] max_torque={self.max_torque}, "
                     f"th=[{filt_tau[0]:.3f},{filt_tau[1]:.3f},{filt_tau[2]:.3f}] "
                     f"if=[{filt_tau[3]:.3f},{filt_tau[4]:.3f},{filt_tau[5]:.3f}] "
                     f"mf=[{filt_tau[6]:.3f},{filt_tau[7]:.3f},{filt_tau[8]:.3f}]"
@@ -1434,7 +1742,9 @@ class TorqueImpedanceControllerNode(Node):
             self.current_pub.publish(cur_msg)
             # tau_msg = Float32MultiArray(); tau_msg.data = filt_tau.tolist(); self.torque_pub.publish(tau_msg)
             self._log_counter += 1
-            if self._log_counter % int(self.rate_hz) == 0:
+            # Log K_rcv every ~30ms (like PWM monitor) instead of 1 second
+            log_interval = max(2, int(self.rate_hz / 30))  # ~30Hz logging
+            if self._log_counter % log_interval == 0:
                 # Skip repetitive warnings during initialization
                 if not self.has_qpos and self._log_counter == int(self.rate_hz):
                     self.get_logger().warning(f"[INIT] Waiting for joint state data...")

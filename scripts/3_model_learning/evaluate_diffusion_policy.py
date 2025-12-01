@@ -910,6 +910,281 @@ def _create_comparison_plots(
             print(f"[info] Individual plot saved: {individual_path}")
 
 
+def evaluate_realtime_simulation(args: argparse.Namespace) -> None:
+    """Evaluate diffusion policy as if running in real-time (one observation at a time).
+    
+    This simulates what happens in run_policy_node.py:
+    - Observations come one at a time
+    - History buffer accumulates observations
+    - Initial padding when history < sequence_window
+    - Low-pass filter applied in real-time (IIR)
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch is required for diffusion policy evaluation.")
+    
+    from collections import deque
+    from scipy.signal import butter, lfilter, lfilter_zi
+    
+    # Setup
+    artifact_dir = Path(args.artifact_dir) if args.artifact_dir else _latest_artifact_dir(DEFAULT_ARTIFACT_ROOT)
+    print(f"[REALTIME SIM] Using artifact directory: {artifact_dir}")
+    
+    evaluator = DiffusionEvaluator(artifact_dir, device=args.device)
+    manifest = evaluator.manifest
+    sequence_window = int(manifest.get("sequence_window", 16))
+    
+    # Load test data
+    trajectories = load_dataset(args.stiffness_dir, args.stride, include_aug=False)
+    manifest_tests = manifest.get("test_trajectories", [])
+    desired_demo = args.eval_demo or (manifest_tests[0] if manifest_tests else None)
+    
+    if desired_demo:
+        eval_name = Path(desired_demo).stem
+    else:
+        eval_name = next((t.name for t in trajectories if t.name.endswith("_synced")), None)
+    
+    if eval_name is None:
+        raise RuntimeError("No suitable evaluation demo found.")
+    
+    test_traj = next((t for t in trajectories if t.name == eval_name), None)
+    if test_traj is None:
+        eval_name_alt = eval_name.replace("_synced", "_synced_signaligned")
+        test_traj = next((t for t in trajectories if t.name == eval_name_alt), None)
+        if test_traj:
+            eval_name = eval_name_alt
+    
+    if test_traj is None:
+        raise RuntimeError(f"Demo '{eval_name}' not found.")
+    
+    print(f"[REALTIME SIM] Demo: {eval_name}, length: {test_traj.observations.shape[0]} timesteps")
+    print(f"[REALTIME SIM] Sequence window: {sequence_window}")
+    
+    test_obs = test_traj.observations
+    test_act = test_traj.actions
+    test_obs_s = evaluator.obs_scaler.transform(test_obs)
+    
+    # Find diffusion_t model
+    model_name = "diffusion_t"
+    if model_name not in manifest.get("models", {}):
+        model_name = next((n for n in manifest["models"] if "diffusion" in n.lower()), None)
+    
+    if model_name is None:
+        raise RuntimeError("No diffusion model found.")
+    
+    print(f"[REALTIME SIM] Loading model: {model_name}")
+    model, config, temporal, action_horizon = evaluator._load_diffusion_model(model_name)
+    model.model.eval()
+    
+    # Initialize real-time simulation state (mimics run_policy_node.py)
+    obs_history: deque = deque(maxlen=sequence_window)
+    
+    # Low-pass filter setup (IIR for real-time)
+    rate_hz = 50.0  # Same as launch file
+    nyquist = rate_hz / 2.0
+    lowpass_cutoff = args.lowpass_cutoff
+    normalized_cutoff = min(lowpass_cutoff / nyquist, 0.99)
+    lp_b, lp_a = butter(2, normalized_cutoff, btype='low')
+    lp_zi = lfilter_zi(lp_b, lp_a)
+    lp_state = np.tile(lp_zi[:, np.newaxis], (1, 9))  # (order, 9)
+    
+    # Simulation parameters
+    n_inference_steps = args.n_inference_steps  # DDIM steps
+    sampler = args.sampler
+    
+    print(f"[REALTIME SIM] Sampler: {sampler}, n_inference_steps: {n_inference_steps}")
+    print(f"[REALTIME SIM] Low-pass filter: {lowpass_cutoff}Hz cutoff")
+    print("=" * 80)
+    
+    # Run real-time simulation
+    predictions_raw = []
+    predictions_filtered = []
+    inference_times = []
+    
+    n_steps = test_obs_s.shape[0]
+    
+    for t in range(n_steps):
+        # 1. Add new observation to history (like run_policy_node)
+        obs_history.append(test_obs_s[t].copy())
+        
+        # 2. Build sequence input with padding if needed
+        if len(obs_history) < sequence_window:
+            # Pad with first observation
+            pad_count = sequence_window - len(obs_history)
+            padded_hist = [obs_history[0]] * pad_count + list(obs_history)
+            obs_seq = np.array(padded_hist)[np.newaxis, :, :]  # (1, seq_len, obs_dim)
+        else:
+            obs_seq = np.array(list(obs_history))[np.newaxis, :, :]
+        
+        # 3. Run inference
+        start_time = time.perf_counter()
+        with torch.no_grad():
+            pred_scaled = model.predict(
+                obs_seq, 
+                n_samples=1, 
+                sampler=sampler, 
+                eta=0.0,
+                n_inference_steps=n_inference_steps
+            )
+        elapsed = time.perf_counter() - start_time
+        inference_times.append(elapsed * 1000)  # ms
+        
+        # Handle temporal model output
+        if len(pred_scaled.shape) == 3:
+            act_scaled = pred_scaled[0, 0, :]  # Take first action of sequence
+        else:
+            act_scaled = pred_scaled.reshape(-1)
+        
+        # 4. Inverse scale
+        act_raw = evaluator.act_scaler.inverse_transform(act_scaled.reshape(1, -1))[0]
+        predictions_raw.append(act_raw)
+        
+        # 5. Apply IIR low-pass filter (real-time, sample by sample)
+        act_filtered = np.zeros(9)
+        for dim in range(9):
+            filtered_val, lp_state[:, dim] = lfilter(
+                lp_b, lp_a, [act_raw[dim]], zi=lp_state[:, dim]
+            )
+            act_filtered[dim] = filtered_val[0]
+        predictions_filtered.append(act_filtered)
+        
+        # Progress
+        if (t + 1) % 100 == 0:
+            avg_time = np.mean(inference_times[-100:])
+            print(f"  Step {t+1}/{n_steps}, avg inference: {avg_time:.1f}ms")
+    
+    predictions_raw = np.array(predictions_raw)
+    predictions_filtered = np.array(predictions_filtered)
+    
+    # Compute metrics
+    metrics_raw = compute_metrics(test_act, predictions_raw)
+    metrics_filtered = compute_metrics(test_act, predictions_filtered)
+    
+    print("\n" + "=" * 80)
+    print("REALTIME SIMULATION RESULTS")
+    print("=" * 80)
+    print(f"{'Config':<30} {'RMSE':>10} {'MAE':>10} {'R²':>10}")
+    print("-" * 80)
+    print(f"{'Raw (no filter)':<30} {metrics_raw['rmse']:>10.4f} {metrics_raw['mae']:>10.4f} {metrics_raw['r2']:>10.4f}")
+    print(f"{'IIR Low-pass ({:.1f}Hz)'.format(lowpass_cutoff):<30} {metrics_filtered['rmse']:>10.4f} {metrics_filtered['mae']:>10.4f} {metrics_filtered['r2']:>10.4f}")
+    print("-" * 80)
+    print(f"Avg inference time: {np.mean(inference_times):.1f}ms (min: {np.min(inference_times):.1f}, max: {np.max(inference_times):.1f})")
+    
+    # Create comparison plot
+    plot_dir = artifact_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12), sharex=True)
+    
+    action_labels = ["k_th_x", "k_th_y", "k_th_z", "k_if_x", "k_if_y", "k_if_z", "k_mf_x", "k_mf_y", "k_mf_z"]
+    time_idx = np.arange(n_steps)
+    
+    for idx in range(9):
+        row, col = idx // 3, idx % 3
+        ax = axes[row, col]
+        
+        # Ground truth
+        ax.plot(time_idx, test_act[:, idx], 'k-', linewidth=2, label='Ground Truth', alpha=0.9)
+        
+        # Raw prediction (real-time sim)
+        ax.plot(time_idx, predictions_raw[:, idx], 'r--', linewidth=1.2, 
+                label=f'Raw (R²={metrics_raw["r2"]:.3f})', alpha=0.7)
+        
+        # Filtered prediction (real-time sim)
+        ax.plot(time_idx, predictions_filtered[:, idx], 'b-', linewidth=1.5, 
+                label=f'LP {lowpass_cutoff}Hz (R²={metrics_filtered["r2"]:.3f})', alpha=0.8)
+        
+        ax.set_title(action_labels[idx], fontsize=10)
+        ax.grid(True, linestyle=':', alpha=0.4)
+        if idx == 2:
+            ax.legend(loc='upper right', fontsize=8)
+        if row == 2:
+            ax.set_xlabel("Time step")
+        if col == 0:
+            ax.set_ylabel("Stiffness")
+    
+    plt.suptitle(f"Real-time Simulation: {model_name} (DDIM {n_inference_steps} steps)", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    plot_path = plot_dir / f"{eval_name}_realtime_simulation.png"
+    plt.savefig(plot_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"\n[info] Real-time simulation plot saved: {plot_path}")
+    
+    # Also create comparison: batch vs realtime
+    # Load batch prediction for comparison
+    print("\n[COMPARISON] Running batch prediction for comparison...")
+    
+    # Build proper sequence dataset for batch
+    test_scaled = scale_trajectories([test_traj], evaluator.obs_scaler, evaluator.act_scaler)
+    test_offsets = compute_offsets([test_traj])
+    seq_obs_batch, _, _, seq_indices = build_sequence_dataset(
+        test_scaled, [test_traj], sequence_window, test_offsets
+    )
+    
+    # Batch prediction
+    start_time = time.perf_counter()
+    with torch.no_grad():
+        batch_pred_scaled = model.predict(seq_obs_batch, n_samples=1, sampler=sampler, eta=0.0)
+    batch_elapsed = time.perf_counter() - start_time
+    
+    if len(batch_pred_scaled.shape) == 3:
+        batch_pred_scaled = batch_pred_scaled[:, 0, :]
+    batch_pred = evaluator.act_scaler.inverse_transform(batch_pred_scaled)
+    
+    # Apply batch low-pass (offline, zero-phase)
+    batch_pred_lp = apply_lowpass_filter(batch_pred, cutoff_hz=lowpass_cutoff)
+    
+    # Align lengths for comparison
+    target_batch = test_act[seq_indices]
+    metrics_batch_raw = compute_metrics(target_batch, batch_pred)
+    metrics_batch_lp = compute_metrics(target_batch, batch_pred_lp)
+    
+    print("\n" + "=" * 80)
+    print("BATCH vs REALTIME COMPARISON")
+    print("=" * 80)
+    print(f"{'Config':<40} {'RMSE':>10} {'MAE':>10} {'R²':>10}")
+    print("-" * 80)
+    print(f"{'Batch (offline, no filter)':<40} {metrics_batch_raw['rmse']:>10.4f} {metrics_batch_raw['mae']:>10.4f} {metrics_batch_raw['r2']:>10.4f}")
+    print(f"{'Batch (offline, LP {:.1f}Hz zero-phase)'.format(lowpass_cutoff):<40} {metrics_batch_lp['rmse']:>10.4f} {metrics_batch_lp['mae']:>10.4f} {metrics_batch_lp['r2']:>10.4f}")
+    print("-" * 40)
+    print(f"{'Realtime (padded history, no filter)':<40} {metrics_raw['rmse']:>10.4f} {metrics_raw['mae']:>10.4f} {metrics_raw['r2']:>10.4f}")
+    print(f"{'Realtime (padded history, IIR LP)':<40} {metrics_filtered['rmse']:>10.4f} {metrics_filtered['mae']:>10.4f} {metrics_filtered['r2']:>10.4f}")
+    print("=" * 80)
+    print(f"Batch total time: {batch_elapsed*1000:.1f}ms for {len(seq_obs_batch)} samples ({batch_elapsed*1000/len(seq_obs_batch):.2f}ms/sample)")
+    
+    # Create batch vs realtime comparison plot
+    fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
+    
+    # Plot first 3 dimensions (thumb)
+    for dim in range(3):
+        ax = axes[dim]
+        
+        # Ground truth (full length)
+        ax.plot(time_idx, test_act[:, dim], 'k-', linewidth=2.5, label='Ground Truth', alpha=0.9)
+        
+        # Batch prediction (aligned to seq_indices)
+        batch_time = seq_indices
+        ax.plot(batch_time, batch_pred_lp[:, dim], 'g--', linewidth=1.5, 
+                label=f'Batch LP (R²={metrics_batch_lp["r2"]:.3f})', alpha=0.8)
+        
+        # Realtime prediction (full length)
+        ax.plot(time_idx, predictions_filtered[:, dim], 'b-', linewidth=1.5, 
+                label=f'Realtime LP (R²={metrics_filtered["r2"]:.3f})', alpha=0.8)
+        
+        ax.set_ylabel(action_labels[dim], fontsize=11)
+        ax.grid(True, linestyle=':', alpha=0.5)
+        ax.legend(loc='upper right', fontsize=9)
+    
+    axes[-1].set_xlabel("Time step", fontsize=11)
+    plt.suptitle(f"Batch vs Real-time Simulation: {model_name}", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    compare_path = plot_dir / f"{eval_name}_batch_vs_realtime.png"
+    plt.savefig(compare_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"[info] Batch vs Realtime plot saved: {compare_path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate Diffusion Policy: Single Action vs Action Chunking comparison"
@@ -917,25 +1192,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifact-dir",
         type=str,
-        default=None,
+        # default=None, # Select latest by default
+        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_unified/artifacts/20251130_063538",
         help="Artifact directory containing trained models. Defaults to latest.",
     )
     parser.add_argument(
         "--stiffness-dir",
         type=Path,
         default=DEFAULT_STIFFNESS_DIR,
+        # default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/stiffness_profiles_signaligned/20251122_023936_synced_signaligned.csv",
         help="Directory containing stiffness profile CSVs.",
     )
     parser.add_argument(
         "--eval-demo",
         type=str,
-        default=None,
+        # default=None,
+        default="20251122_023936_synced_signaligned",
         help="Specific demonstration to evaluate on.",
     )
     parser.add_argument(
         "--stride",
         type=int,
-        default=20,
+        default=4,
         help="Stride for subsampling.",
     )
     parser.add_argument(
@@ -978,8 +1256,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lowpass-cutoff",
         type=float,
-        default=3.0,
-        help="Cutoff frequency for low-pass filter (Hz). Default: 3.0Hz",
+        default=1.0,
+        help="Cutoff frequency for low-pass filter (Hz). Default: 1.0Hz (very smooth)",
+    )
+    parser.add_argument(
+        "--n-inference-steps",
+        type=int,
+        default=10,
+        help="Number of DDIM inference steps (default: 10 for fast inference).",
+    )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        default=False,
+        help="Run real-time simulation mode (one obs at a time with padding).",
     )
     parser.add_argument(
         "--plot",
@@ -997,4 +1287,8 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    evaluate_diffusion_policies(parse_args())
+    args = parse_args()
+    if args.realtime:
+        evaluate_realtime_simulation(args)
+    else:
+        evaluate_diffusion_policies(args)

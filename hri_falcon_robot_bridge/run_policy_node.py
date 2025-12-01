@@ -116,13 +116,13 @@ class RunPolicyNode(Node):
         self.declare_parameter("stiffness_min", 0.0)
         self.declare_parameter("stiffness_max", 1000.0)
         self.declare_parameter("smooth_window", 5)
-        # Low-pass filter parameters (Butterworth) - recommended: 3Hz cutoff for smooth stiffness
+        # Low-pass filter parameters (Butterworth) - 2Hz cutoff for faster response while still smooth
         self.declare_parameter("lowpass_enabled", True)  # Enable LP filter by default
-        self.declare_parameter("lowpass_cutoff_hz", 3.0)  # Cutoff frequency in Hz (best: 3.0Hz)
-        self.declare_parameter("lowpass_order", 2)  # Filter order
+        self.declare_parameter("lowpass_cutoff_hz", 2.0)  # Cutoff frequency in Hz (2Hz = faster response, ~0.5s settling time)
+        self.declare_parameter("lowpass_order", 2)  # Filter order (2 = good balance)
         # Time-based stiffness scaling parameters
-        self.declare_parameter("time_ramp_duration", 5.0)  # seconds to ramp up
-        self.declare_parameter("initial_stiffness_scale", 0.3)  # initial 30%
+        self.declare_parameter("time_ramp_duration", 8.0)  # seconds to ramp up (increased for gentler start)
+        self.declare_parameter("initial_stiffness_scale", 0.1)  # initial 10% (reduced from 30%)
         self.declare_parameter("final_stiffness_scale", 1.0)  # final 100%
         # (NEW) Sensor topic parameters for flexibility
         self.declare_parameter("force_topics", [
@@ -158,7 +158,7 @@ class RunPolicyNode(Node):
         
         # Low-pass filter parameters
         self.lowpass_enabled: bool = bool(_p("lowpass_enabled") if _p("lowpass_enabled") is not None else True)
-        self.lowpass_cutoff_hz: float = float(_p("lowpass_cutoff_hz") or 3.0)
+        self.lowpass_cutoff_hz: float = float(_p("lowpass_cutoff_hz") or 1.0)
         self.lowpass_order: int = int(_p("lowpass_order") or 2)
         
         ft = _p("force_topics") or []
@@ -195,9 +195,9 @@ class RunPolicyNode(Node):
         self.deform_ecc_smoothed = None  # Smoothed eccentricity for plotting only
         self.ee_positions = {"if": None, "mf": None, "th": None}
         
-        # Deformity smoothing buffer (for plotting only, NOT for observation!)
+        # Deformity smoothing buffer (moving average for obs input)
         self.deform_buffer: List[float] = []
-        self.deform_buffer_size = 10
+        self.deform_buffer_size = 10  # Increased to 10 for stronger smoothing (~200ms @ 50Hz)
 
         # Stiffness prediction buffer for smoothing
         self.stiffness_buffer: List[np.ndarray] = []
@@ -215,11 +215,21 @@ class RunPolicyNode(Node):
         self.debug_log_enabled = True  # Enable/disable logging
         self.debug_log_max_samples = 10000  # Max samples to keep in memory
 
-        # Temporal ensembling for diffusion policy (action chunking)
-        self.action_horizon = 16  # prediction horizon from manifest
-        self.action_buffer: List[np.ndarray] = []  # stores (horizon, 9) predictions
+        # [NOTE] Model architecture: Seq2One (16 obs → 1 action)
+        # - Input: sequence of 16 past observations (temporal context via GRU encoder)
+        # - Output: single action for current timestep (NOT action chunking!)
+        # The temporal ensembling code below is ONLY for backward compatibility with
+        # action-chunking models (action_horizon > 1). Current diffusion_t outputs (1, 9).
+        self.action_horizon = 1  # Seq2One: single action output (NOT 16!)
+        self.action_buffer: List[np.ndarray] = []  # Not used for Seq2One
         self.exec_horizon = 1  # how many steps to execute per prediction
-        self.action_step_counter = 0  # tracks current step in action sequence
+        self.action_step_counter = 0  # tracks current step
+        self.max_action_buffer = 1  # Not used for Seq2One
+        
+        # [CRITICAL] Observation history buffer for temporal models (diffusion_t)
+        # diffusion_t uses GRU encoder that needs sequence of past observations
+        self.sequence_window = 16  # Must match training config! (DO NOT CHANGE)
+        self.obs_history: List[np.ndarray] = []  # Ring buffer of past scaled observations
         
         # [DEBUG] Sensor callback counters
         self._force_callback_count = [0, 0, 0]
@@ -495,7 +505,12 @@ class RunPolicyNode(Node):
             "diffusion_t_ddim": "diffusion_t.pt",
         }
         model_path = artifact_path / model_map[self.model_type]
-        checkpoint = torch.load(model_path, map_location="cpu")
+        
+        # [PERFORMANCE] Use GPU if available for faster inference
+        self.inference_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.get_logger().info(f"[DEVICE] Using {self.inference_device.upper()} for model inference")
+        
+        checkpoint = torch.load(model_path, map_location=self.inference_device)
 
         if self.model_type == "bc":
             # Reconstruct BC model from config
@@ -533,6 +548,7 @@ class RunPolicyNode(Node):
                     time_dim=config.get("time_dim", 16),
                     timesteps=config.get("timesteps", 100),
                     temporal=is_temporal,
+                    device=self.inference_device,  # [PERFORMANCE] Use GPU
                 )
                 # Try different possible keys for state dict
                 state_dict_key = "model_state_dict" if "model_state_dict" in checkpoint else "state_dict"
@@ -588,7 +604,8 @@ class RunPolicyNode(Node):
                 # Should not happen since we gate on forces_ready
                 obs.extend([0.0, 0.0, 0.0])
 
-        # Eccentricity (1D) - USE SMOOTHED VALUE for stable policy!
+        # Eccentricity (1D) - USE SMOOTHED VALUE to reduce noise/jitter
+        # deform_ecc_smoothed is moving-average filtered in _on_deform_ecc callback
         obs.append(self.deform_ecc_smoothed if self.deform_ecc_smoothed is not None else 0.0)
 
         # End-effector positions (9D: if/mf/th px/py/pz)
@@ -642,43 +659,61 @@ class RunPolicyNode(Node):
                 if manifest_sampler == "ddim":
                     sampler = manifest_sampler
                 else:
-                    self.get_logger().warn(
-                        f"[PERFORMANCE] Overriding sampler '{manifest_sampler}' → 'ddim' for real-time performance"
-                    )
+                    # self.get_logger().warn(
+                    #     f"[PERFORMANCE] Overriding sampler '{manifest_sampler}' → 'ddim' for real-time performance"
+                    # )
+                    pass
             
-            # Predict action sequence (shape: (1, horizon, 9) or (1, 9))
-            action_seq = self.model.predict(obs_scaled, n_samples=1, sampler=sampler, eta=0.0)
+            # [CRITICAL] Build observation sequence for temporal model (diffusion_t)
+            # Add current observation to history buffer
+            self.obs_history.append(obs_scaled[0].copy())  # (obs_dim,)
+            if len(self.obs_history) > self.sequence_window:
+                self.obs_history.pop(0)  # Keep only last sequence_window observations
             
-            # Check if temporal model (returns sequence)
-            if len(action_seq.shape) == 3 and action_seq.shape[1] == self.action_horizon:
-                # Temporal ensembling: store prediction and average overlapping actions
-                self.action_buffer.append(action_seq[0])  # (horizon, 9)
-                
-                # Keep only recent predictions (sliding window)
-                max_buffer = self.action_horizon
-                if len(self.action_buffer) > max_buffer:
-                    self.action_buffer.pop(0)
-                
-                # Temporal ensembling: average all predictions for current timestep
-                current_step = self.action_step_counter
-                valid_actions = []
-                for i, pred_seq in enumerate(self.action_buffer):
-                    # pred_seq[j] corresponds to timestep (buffer_start + i + j)
-                    # We want actions for current_step
-                    offset = current_step - (len(self.action_buffer) - 1 - i)
-                    if 0 <= offset < len(pred_seq):
-                        valid_actions.append(pred_seq[offset])
-                
-                if valid_actions:
-                    act_scaled = np.mean(valid_actions, axis=0, keepdims=True)  # (1, 9)
-                else:
-                    act_scaled = action_seq[0:1, 0, :]  # fallback to first action
-                
-                self.action_step_counter += 1
+            # Create sequence input: (1, seq_len, obs_dim)
+            if len(self.obs_history) < self.sequence_window:
+                # Pad with first observation if not enough history
+                pad_count = self.sequence_window - len(self.obs_history)
+                padded_hist = [self.obs_history[0]] * pad_count + list(self.obs_history)
+                obs_seq = np.array(padded_hist)[np.newaxis, :, :]  # (1, seq_len, obs_dim)
             else:
-                # Non-temporal or single action
+                obs_seq = np.array(list(self.obs_history))[np.newaxis, :, :]  # (1, seq_len, obs_dim)
+            
+            # Debug log observation sequence shape (every 0.5 seconds instead of 2)
+            if self._log_counter % int(self.rate_hz * 0.5) == 0:
+                self.get_logger().info(
+                    f"[POLICY] obs_seq shape: {obs_seq.shape}, history_len: {len(self.obs_history)}"
+                )
+            
+            # [CRITICAL] Use fewer inference steps for real-time performance
+            # DDIM with 10-15 steps is ~5-7x faster than 75 steps with minimal quality loss
+            n_inference_steps = 10  # 75 -> 10 steps = ~7x speedup
+            
+            # Predict action (shape: (1, 9) for Seq2One model)
+            action_seq = self.model.predict(
+                obs_seq, 
+                n_samples=1, 
+                sampler=sampler, 
+                eta=0.0,
+                n_inference_steps=n_inference_steps  # [NEW] Fast inference
+            )
+            
+            # [Seq2One] Model outputs single action: (1, 9) or (1, 1, 9)
+            # No temporal ensembling needed - just use the output directly
+            if len(action_seq.shape) == 3:
+                # Squeeze if model returns (1, 1, 9)
+                act_scaled = action_seq[0, 0:1, :]  # (1, 9)
+            else:
+                # Already (1, 9)
                 act_scaled = action_seq.reshape(1, -1)
-                self.action_step_counter += 1
+            
+            self.action_step_counter += 1
+            
+            # [DEBUG] Log action output (every 0.5 seconds)
+            if self._log_counter % int(self.rate_hz * 0.5) == 0:
+                self.get_logger().info(
+                    f"[POLICY] Seq2One output shape: {action_seq.shape}, act_scaled[:3]={act_scaled[0, :3]}"
+                )
 
         elif self.model_type == "gmm":
             # GMM sampling
@@ -727,11 +762,10 @@ class RunPolicyNode(Node):
             normalized_cutoff = min(normalized_cutoff, 0.99)  # Ensure valid range
             
             self._lp_b, self._lp_a = butter(self.lowpass_order, normalized_cutoff, btype='low')
-            # Initialize filter state for 9D stiffness
-            from scipy.signal import lfilter_zi
-            zi = lfilter_zi(self._lp_b, self._lp_a)
-            self._lp_zi = np.tile(zi[:, np.newaxis], (1, 9))  # (order, 9)
+            # [FIX] Initialize filter state to None - will be set on first sample
+            self._lp_zi = None  # Will be initialized with first sample value
             self._lp_initialized = True
+            self._lp_first_sample = True  # Flag to initialize with first sample
             
             self.get_logger().info(
                 f"Low-pass filter initialized: cutoff={self.lowpass_cutoff_hz}Hz, "
@@ -747,6 +781,17 @@ class RunPolicyNode(Node):
             return stiffness
         
         try:
+            # [FIX] Initialize filter state on first sample to avoid transient
+            if self._lp_first_sample:
+                from scipy.signal import lfilter_zi
+                zi = lfilter_zi(self._lp_b, self._lp_a)
+                # Initialize state so that first output equals first input (no transient)
+                self._lp_zi = np.zeros((len(zi), len(stiffness)))
+                for dim in range(len(stiffness)):
+                    self._lp_zi[:, dim] = zi * stiffness[dim]
+                self._lp_first_sample = False
+                return stiffness  # Return first sample unchanged
+            
             # Apply IIR filter with state preservation for real-time processing
             filtered = np.zeros_like(stiffness)
             for dim in range(len(stiffness)):
@@ -763,12 +808,15 @@ class RunPolicyNode(Node):
             return stiffness
 
     def _smooth_stiffness(self, stiffness: np.ndarray) -> np.ndarray:
-        """Apply low-pass filter and moving average smoothing to stiffness predictions."""
-        # First apply low-pass filter (if enabled)
+        """Apply low-pass filter OR moving average smoothing (not both to avoid over-smoothing)."""
+        # [FIX] Use ONLY LP filter if enabled, skip moving average (avoid double smoothing)
         if self.lowpass_enabled:
             stiffness = self._apply_lowpass_filter(stiffness)
+            # Skip moving average when LP is enabled to avoid over-smoothing
+            smoothed = np.clip(stiffness, self.stiffness_min, self.stiffness_max)
+            return smoothed
         
-        # Then apply moving average smoothing
+        # Fallback: use moving average smoothing if LP disabled
         self.stiffness_buffer.append(stiffness)
 
         if len(self.stiffness_buffer) > self.smooth_window:
@@ -787,7 +835,7 @@ class RunPolicyNode(Node):
             # Ready check without ambiguous NumPy truth-values
             forces_ready = all(f is not None for f in self.forces)
             ee_ready = all(v is not None for v in self.ee_positions.values())
-            if forces_ready and self.deform_ecc is not None and ee_ready:
+            if forces_ready and self.deform_ecc_smoothed is not None and ee_ready:
                 # All ready; stop scanning
                 if self._scan_timer is not None:
                     self._scan_timer.cancel()
@@ -854,8 +902,11 @@ class RunPolicyNode(Node):
             # Apply time-based scaling BEFORE smoothing
             stiffness_before_scale = stiffness.copy()
             stiffness = stiffness * time_scale
+            
+            # [DEBUG] Save pre-LP filter value for comparison
+            stiffness_before_lp = stiffness.copy()
 
-            # Smooth and scale
+            # Smooth and scale (LP filter applied here)
             stiffness = self._smooth_stiffness(stiffness)
 
             # === DEBUG: Collect data for analysis ===
@@ -877,13 +928,18 @@ class RunPolicyNode(Node):
                     # Scaled observation (for model input comparison)
                     's1_fz_scaled': obs_scaled[2], 's2_fz_scaled': obs_scaled[5], 's3_fz_scaled': obs_scaled[8],
                     'deform_ecc_scaled': obs_scaled[9],
-                    # Policy output (before time scale, after time scale, after smoothing)
+                    # Policy output stages: raw -> time_scaled -> LP_filtered
                     'th_k1_raw': stiffness_before_scale[0], 'th_k2_raw': stiffness_before_scale[1], 'th_k3_raw': stiffness_before_scale[2],
                     'mf_k1_raw': stiffness_before_scale[6], 'mf_k2_raw': stiffness_before_scale[7], 'mf_k3_raw': stiffness_before_scale[8],
+                    # Before LP filter (after time_scale)
+                    'th_k1_pre_lp': stiffness_before_lp[0], 'th_k2_pre_lp': stiffness_before_lp[1], 'th_k3_pre_lp': stiffness_before_lp[2],
+                    'mf_k1_pre_lp': stiffness_before_lp[6], 'mf_k2_pre_lp': stiffness_before_lp[7], 'mf_k3_pre_lp': stiffness_before_lp[8],
+                    # After LP filter (final published value)
                     'th_k1': stiffness[0], 'th_k2': stiffness[1], 'th_k3': stiffness[2],
                     'if_k1': stiffness[3], 'if_k2': stiffness[4], 'if_k3': stiffness[5],
                     'mf_k1': stiffness[6], 'mf_k2': stiffness[7], 'mf_k3': stiffness[8],
                     'time_scale': time_scale,
+                    'lp_enabled': self.lowpass_enabled,  # Track if LP was actually enabled
                 }
                 self.debug_log_data.append(log_entry)
 

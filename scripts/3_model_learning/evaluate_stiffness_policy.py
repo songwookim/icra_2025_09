@@ -1376,7 +1376,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-sampler",
         type=str,
-        default="ddim",
+        default="ddpm",
         choices=["ddpm", "ddim"],
         help="Sampler to use when generating diffusion policy rollouts.",
     )

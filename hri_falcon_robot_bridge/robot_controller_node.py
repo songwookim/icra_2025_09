@@ -99,6 +99,7 @@ class RobotControllerNode(Node):
         self.declare_parameter('current_unit_mA', 2.69)  # mA per raw current unit
         self.declare_parameter('max_current_units_pos', 500)  # test_torqueinputs 양수 리미트
         self.declare_parameter('max_current_units_neg', 500)  # test_torqueinputs 음수 리미트
+        self.declare_parameter('max_pwm_limit', 500)  # [SAFETY] PWM limit - stop if exceeded (XM430: 885=100%)
         # 정책 준비 전까지 force control 입력을 지연할지 여부
         self.declare_parameter('defer_force_control_until_policy', True)
         # hand enable/disable parameters removed (always enabled)
@@ -170,6 +171,8 @@ class RobotControllerNode(Node):
         self.current_unit_mA = float(self.get_parameter('current_unit_mA').value or 2.69)
         self.max_current_units_pos = int(self.get_parameter('max_current_units_pos').value or 500)
         self.max_current_units_neg = int(self.get_parameter('max_current_units_neg').value or 500)
+        self.max_pwm_limit = int(self.get_parameter('max_pwm_limit').value or 500)  # [SAFETY] PWM limit
+        self._pwm_safety_triggered = False  # Flag to track if PWM limit was hit
         self.hand_enabled = True
         self.defer_force_control_until_policy = bool(self.get_parameter('defer_force_control_until_policy').value)
         self.publish_joint_state = bool(self.get_parameter('publish_joint_state').value)
@@ -254,6 +257,15 @@ class RobotControllerNode(Node):
             self.get_logger().info(f"[INIT] JointState publisher CREATED: topic={self.joint_state_topic}")
         else:
             self.get_logger().warn("[INIT] JointState publishing is DISABLED")
+
+        # PWM publisher for monitoring and logging
+        self.pwm_pub = self.create_publisher(Int32MultiArray, '/dynamixel/present_pwm', 10)
+        self.get_logger().info("[INIT] PWM publisher CREATED: topic=/dynamixel/present_pwm")
+
+        # Goal position subscriber for external position commands (e.g., 'i' key for initial pose)
+        self.sub_goal_position = self.create_subscription(
+            Int32MultiArray, '/dynamixel/goal_position', self.subscribe_goal_position, 10)
+        self.get_logger().info("[INIT] Goal position subscriber CREATED: topic=/dynamixel/goal_position")
 
         # 시작 시 초기 포즈로 세팅 (항상 position mode에서 수행)
         # Controller 없어도 _send_targets 호출 (dry-run 로깅 위해)
@@ -414,6 +426,36 @@ class RobotControllerNode(Node):
             if self.publish_joint_state:
                 self.publish_joint_state_message(targets)
 
+    def subscribe_goal_position(self, msg: Int32MultiArray) -> None:
+        """Handle external goal position commands (e.g., from 'i' key initial pose)."""
+        if len(msg.data) < len(self.ids):
+            self.get_logger().warn(f"[Goal Position] Invalid data length: {len(msg.data)} < {len(self.ids)}")
+            return
+        
+        targets = list(msg.data[:len(self.ids)])
+        self.get_logger().info(f"[Goal Position] Received: {targets[:3]}... -> switching to position mode")
+        
+        # Temporarily switch to position mode to move robot
+        if self.controller is not None and self._force_mode_active:
+            try:
+                import time
+                self.controller.disable_torque()
+                time.sleep(0.05)
+                position_mode = 3  # Extended Position Control Mode
+                self.controller.set_operating_mode_all(position_mode)
+                time.sleep(0.05)
+                self.controller.enable_torque()
+                self.mode = position_mode
+                self._force_mode_active = False
+                self.get_logger().info("[Goal Position] Switched to position mode")
+            except Exception as e:
+                self.get_logger().error(f"[Goal Position] Mode switch failed: {e}")
+                return
+        
+        # Send position command
+        self._send_targets(targets)
+        self.get_logger().info("[Goal Position] Initial pose command sent")
+
     # ============================== Demo Playback Stage (Position ↔ Force) ==============================
     def _switch_to_force_mode(self) -> None:
         if not self.use_force_control:
@@ -512,6 +554,43 @@ class RobotControllerNode(Node):
         if self.controller is None:
             # self.get_logger().info(f"[Dry-run Current] currents={currents[:3]}...")
             return
+        
+        # [PWM SAFETY CHECK] Read PWM every call and check limit
+        try:
+            present_pwm = self.controller.get_present_pwm()
+            max_pwm = max(abs(p) for p in present_pwm)
+            pwm_percent = max_pwm / 885.0 * 100
+            
+            # Publish PWM values for logging/monitoring
+            pwm_msg = Int32MultiArray()
+            pwm_msg.data = [int(p) for p in present_pwm]
+            self.pwm_pub.publish(pwm_msg)
+            
+            # Log every 50 calls (~1 second at 50Hz)
+            if self._torque_log_counter % 50 == 0:
+                self.get_logger().info(
+                    f"[PWM_MONITOR] PWM: th={present_pwm[:3]}, if={present_pwm[3:6]}, mf={present_pwm[6:9]} "
+                    f"| MAX={max_pwm} ({pwm_percent:.1f}%) | Goal_current={currents[:3]}"
+                )
+            
+            # [SAFETY] If PWM exceeds limit, scale down currents proportionally (don't stop!)
+            if max_pwm > self.max_pwm_limit:
+                # Calculate scale factor to bring PWM back under limit
+                scale_factor = self.max_pwm_limit / max_pwm * 0.9  # 90% of limit for safety margin
+                currents = [int(c * scale_factor) for c in currents]
+                if self._torque_log_counter % 10 == 0:  # Log more frequently when limiting
+                    self.get_logger().warn(
+                        f"[PWM LIMIT] PWM {max_pwm} > limit {self.max_pwm_limit}! "
+                        f"Scaling currents by {scale_factor:.2f} -> {currents[:3]}"
+                    )
+            
+            # Warning if approaching limit (80%)
+            elif max_pwm > self.max_pwm_limit * 0.8:
+                if self._torque_log_counter % 50 == 0:
+                    self.get_logger().warn(f"[PWM WARNING] High PWM: {max_pwm} ({pwm_percent:.1f}%) - approaching limit {self.max_pwm_limit}")
+                
+        except Exception as e:
+            pass  # Ignore PWM read errors
         
         if self.safe_mode:
         #     # 주기적 로깅 (너무 noisy 방지)

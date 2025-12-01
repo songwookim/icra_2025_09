@@ -142,6 +142,40 @@ class DynamixelControl:
         return np.array(pos) * 0.001533981
 
     
+    def get_present_pwm(self) -> list:
+        """Read present PWM from all Dynamixels. XM430 range: -885 ~ +885"""
+        ADDR_PRESENT_PWM = getattr(self.cfg.control_table, 'ADDR_PRESENT_PWM', 124)
+        pwm_values = []
+        for id in self.cfg.ids:
+            pwm, dxl_comm_result, dxl_error = self.packetHandler.read2ByteTxRx(
+                self.portHandler, id, ADDR_PRESENT_PWM)
+            if dxl_comm_result != COMM_SUCCESS:
+                print(f"Failed to read PWM for ID {id}: {self.packetHandler.getTxRxResult(dxl_comm_result)}")
+                pwm_values.append(0)
+                continue
+            # Convert unsigned to signed (PWM can be negative)
+            if pwm > 0x7FFF:
+                pwm = pwm - 0x10000
+            pwm_values.append(pwm)
+        return pwm_values
+    
+    def get_present_current(self) -> list:
+        """Read present current from all Dynamixels. XM430: ~2.69mA per unit"""
+        ADDR_PRESENT_CURRENT = getattr(self.cfg.control_table, 'ADDR_PRESENT_CURRENT', 126)
+        current_values = []
+        for id in self.cfg.ids:
+            current, dxl_comm_result, dxl_error = self.packetHandler.read2ByteTxRx(
+                self.portHandler, id, ADDR_PRESENT_CURRENT)
+            if dxl_comm_result != COMM_SUCCESS:
+                print(f"Failed to read current for ID {id}: {self.packetHandler.getTxRxResult(dxl_comm_result)}")
+                current_values.append(0)
+                continue
+            # Convert unsigned to signed
+            if current > 0x7FFF:
+                current = current - 0x10000
+            current_values.append(current)
+        return current_values
+
     def get_joint_velocities(self) :
         ADDR_PRESENT_VELOCITY = self.cfg.control_table.ADDR_PRESENT_VELOCITY
         dxl_present_velocities = []

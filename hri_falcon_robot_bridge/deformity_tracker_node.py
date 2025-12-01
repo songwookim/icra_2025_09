@@ -63,9 +63,9 @@ COLOR_RANGES = {
 }
 ACTIVE_COLORS = {
     'red',
-    'green',
-    'blue',
-    'yellow',
+    # 'green',
+    # 'blue',
+    # 'yellow',
 }
 
 class DeformityTrackerNode(Node):
@@ -414,10 +414,10 @@ class DeformityTrackerNode(Node):
                 frame = np.asanyarray(color.get_data())
                 vis = frame.copy()
                 # Fixed reference point overlay at (370,230)
-                try:
-                    cv2.circle(vis, (370, 230), 6, (0, 255, 255), -1)  # yellow dot
-                except Exception:
-                    pass
+                # try:
+                #     cv2.circle(vis, (370, 230), 6, (0, 255, 255), -1)  # yellow dot
+                # except Exception:
+                #     pass
 
                 mask, masks_by_color, cnts = self._extract_mask_and_contours(frame)
                 best = None
