@@ -53,6 +53,10 @@ compute_offsets = benchmarks.compute_offsets
 load_dataset = benchmarks.load_dataset
 scale_trajectories = benchmarks.scale_trajectories
 
+# Additional metrics for comprehensive evaluation
+from scipy.stats import pearsonr, spearmanr
+from sklearn.cross_decomposition import CCA
+
 DiffusionPolicyBaseline = getattr(benchmarks, "DiffusionPolicyBaseline", None)
 
 _PKG_ROOT = Path(__file__).resolve().parents[2]
@@ -140,7 +144,8 @@ class DiffusionEvaluator:
         self.device = device
         self.manifest = _load_manifest(artifact_dir)
         self.obs_scaler, self.act_scaler = _load_scalers(artifact_dir, self.manifest)
-        self.window = int(self.manifest.get("sequence_window", 16))
+        # seq_len (preferred) or sequence_window (legacy)
+        self.window = int(self.manifest.get("seq_len", self.manifest.get("sequence_window", 16)))
         
     def _load_diffusion_model(
         self,
@@ -704,54 +709,116 @@ def _create_finger_comparison_plots(
         plt.close()
         print(f"[info] Finger comparison plot saved: {plot_path}")
     
-    # Create a combined 3x3 grid plot (all fingers, all dimensions)
-    fig, axes = plt.subplots(3, 3, figsize=(20, 12), sharex=True)
-    
-    finger_names = ["Thumb (TH)", "Index (IF)", "Middle (MF)"]
+    # Create 1x3 grid: each subplot shows one finger with X/Y/Z in red/green/blue
+    xyz_colors = ["#e74c3c", "#2ecc71", "#3498db"]  # Red, Green, Blue for X, Y, Z
     xyz_labels = ["X", "Y", "Z"]
+    finger_names_short = ["Thumb", "Index", "Middle"]
+    
+    # Calculate global y-axis limits for all dimensions
+    all_values = [target]
+    for model_name, cfg_name in models_to_compare:
+        if model_name in predictions and cfg_name in predictions[model_name]:
+            all_values.append(predictions[model_name][cfg_name])
+    all_data = np.concatenate([v.flatten() for v in all_values])
+    all_data = all_data[~np.isnan(all_data)]
+    global_y_min = np.min(all_data)
+    global_y_max = np.max(all_data)
+    margin = (global_y_max - global_y_min) * 0.05
+    y_lim = (max(0, global_y_min - margin), global_y_max + margin)
+    
+    # --- Ground Truth only plot (1x3) ---
+    fig_gt, axes_gt = plt.subplots(1, 3, figsize=(18, 5), sharex=True, sharey=True)
     
     for finger_idx, (finger_name, dims) in enumerate(fingers.items()):
+        ax = axes_gt[finger_idx]
+        
+        # Plot X, Y, Z with different colors
         for xyz_idx, dim in enumerate(dims):
-            ax = axes[finger_idx, xyz_idx]
+            ax.plot(time_idx, target[:, dim], '-', linewidth=2, 
+                   color=xyz_colors[xyz_idx], label=f'{xyz_labels[xyz_idx]}', alpha=0.9)
+        
+        ax.set_title(f"{finger_names_short[finger_idx]}", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Time step", fontsize=11)
+        ax.grid(True, linestyle=':', alpha=0.4)
+        ax.set_ylim(y_lim)
+        if finger_idx == 0:
+            ax.set_ylabel("Stiffness", fontsize=11)
+        if finger_idx == 2:
+            ax.legend(loc='upper right', fontsize=10)
+    
+    plt.suptitle("Ground Truth Stiffness (X=Red, Y=Green, Z=Blue)", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    gt_path = plot_dir / f"{eval_name}_GT_fingers_xyz.png"
+    plt.savefig(gt_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"[info] GT finger comparison saved: {gt_path}")
+    
+    # --- GT vs Prediction comparison (1x3 horizontal layout) ---
+    # Each subplot: one finger with GT (solid) and Prediction (dashed)
+    fig_cmp, axes_cmp = plt.subplots(1, 3, figsize=(20, 5), sharex=True, sharey=True)
+    
+    # Get first model for comparison
+    if models_to_compare:
+        model_name, cfg_name = models_to_compare[0]
+        pred = predictions.get(model_name, {}).get(cfg_name, None)
+        model_label = model_name.replace("diffusion_", "diff_")
+        if "LP" in cfg_name:
+            model_label += "+LP"
+    else:
+        pred = None
+        model_label = "No Model"
+    
+    for finger_idx, (finger_name, dims) in enumerate(fingers.items()):
+        ax = axes_cmp[finger_idx]
+        
+        # Plot X, Y, Z for both GT and Prediction
+        for xyz_idx, dim in enumerate(dims):
+            # Ground Truth (solid line)
+            ax.plot(time_idx, target[:, dim], '-', linewidth=2.5, 
+                   color=xyz_colors[xyz_idx], label=f'GT {xyz_labels[xyz_idx]}', alpha=0.9)
             
-            # Ground truth
-            ax.plot(time_idx, target[:, dim], 'k-', linewidth=2, label='GT', alpha=0.9)
-            
-            # Plot each model
-            for model_name, cfg_name in models_to_compare:
-                if model_name not in predictions or cfg_name not in predictions[model_name]:
-                    continue
-                
-                pred = predictions[model_name][cfg_name]
-                color = model_colors.get(model_name, "#7f7f7f")
-                short_name = model_name.replace("diffusion_", "diff_")
-                if "LP" in cfg_name:
-                    short_name += "+LP"
-                
+            # Prediction (dashed line)
+            if pred is not None:
                 if pred.shape[0] < target.shape[0] and temporal_indices is not None:
                     full_pred = np.full(target.shape[0], np.nan)
                     full_pred[temporal_indices[:pred.shape[0]]] = pred[:, dim]
-                    ax.plot(time_idx, full_pred, '--', linewidth=1.5, color=color, label=short_name, alpha=0.8)
+                    ax.plot(time_idx, full_pred, '--', linewidth=2, 
+                           color=xyz_colors[xyz_idx], label=f'Pred {xyz_labels[xyz_idx]}', alpha=0.7)
                 else:
-                    ax.plot(time_idx[:pred.shape[0]], pred[:, dim], '--', linewidth=1.5, color=color, 
-                           label=short_name, alpha=0.8)
-            
-            ax.set_title(f"{finger_name.split()[0]} - {xyz_labels[xyz_idx]}", fontsize=10)
-            ax.grid(True, linestyle=':', alpha=0.4)
-            if finger_idx == 0 and xyz_idx == 2:
-                ax.legend(loc='upper right', fontsize=8)
-            if finger_idx == 2:
-                ax.set_xlabel("Time step")
-            if xyz_idx == 0:
-                ax.set_ylabel("Stiffness")
+                    ax.plot(time_idx[:pred.shape[0]], pred[:, dim], '--', linewidth=2, 
+                           color=xyz_colors[xyz_idx], label=f'Pred {xyz_labels[xyz_idx]}', alpha=0.7)
+        
+        ax.set_title(f"{finger_names_short[finger_idx]}", fontsize=13, fontweight='bold')
+        ax.set_xlabel("Time step", fontsize=11)
+        ax.grid(True, linestyle=':', alpha=0.4)
+        ax.set_ylim(y_lim)
+        if finger_idx == 0:
+            ax.set_ylabel("Stiffness", fontsize=11)
+        if finger_idx == 2:
+            # Create custom legend: solid=GT, dashed=Pred, colors=X/Y/Z
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], color=xyz_colors[0], linewidth=2, linestyle='-', label='X (GT)'),
+                Line2D([0], [0], color=xyz_colors[0], linewidth=2, linestyle='--', label='X (Pred)'),
+                Line2D([0], [0], color=xyz_colors[1], linewidth=2, linestyle='-', label='Y (GT)'),
+                Line2D([0], [0], color=xyz_colors[1], linewidth=2, linestyle='--', label='Y (Pred)'),
+                Line2D([0], [0], color=xyz_colors[2], linewidth=2, linestyle='-', label='Z (GT)'),
+                Line2D([0], [0], color=xyz_colors[2], linewidth=2, linestyle='--', label='Z (Pred)'),
+            ]
+            ax.legend(handles=legend_elements, loc='upper right', fontsize=8, ncol=2)
     
-    plt.suptitle("All Fingers Stiffness Comparison: Ground Truth vs Models (+LP)", fontsize=14, fontweight='bold')
+    # Get metrics for title
+    metrics = results.get(model_name, {}).get(cfg_name, {}) if models_to_compare else {}
+    r2 = metrics.get("r2", 0)
+    rmse = metrics.get("rmse", 0)
+    
+    plt.suptitle(f"GT (solid) vs {model_label} (dashed) | R²={r2:.3f}, RMSE={rmse:.4f} | X=Red, Y=Green, Z=Blue", 
+                fontsize=14, fontweight='bold')
     plt.tight_layout()
-    
-    combined_path = plot_dir / f"{eval_name}_all_fingers_grid.png"
-    plt.savefig(combined_path, dpi=200, bbox_inches='tight')
+    cmp_path = plot_dir / f"{eval_name}_GT_vs_pred_fingers_xyz.png"
+    plt.savefig(cmp_path, dpi=200, bbox_inches='tight')
     plt.close()
-    print(f"[info] Combined finger grid plot saved: {combined_path}")
+    print(f"[info] GT vs Prediction comparison saved: {cmp_path}")
 
 
 def _create_comparison_plots(
@@ -931,7 +998,8 @@ def evaluate_realtime_simulation(args: argparse.Namespace) -> None:
     
     evaluator = DiffusionEvaluator(artifact_dir, device=args.device)
     manifest = evaluator.manifest
-    sequence_window = int(manifest.get("sequence_window", 16))
+    # seq_len (preferred) or sequence_window (legacy)
+    sequence_window = int(manifest.get("seq_len", manifest.get("sequence_window", 16)))
     
     # Load test data
     trajectories = load_dataset(args.stiffness_dir, args.stride, include_aug=False)
@@ -1193,14 +1261,14 @@ def parse_args() -> argparse.Namespace:
         "--artifact-dir",
         type=str,
         # default=None, # Select latest by default
-        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_unified/artifacts/20251130_063538",
+        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_unified/artifacts/20251201_175451",
         help="Artifact directory containing trained models. Defaults to latest.",
     )
     parser.add_argument(
         "--stiffness-dir",
         type=Path,
-        default=DEFAULT_STIFFNESS_DIR,
-        # default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/stiffness_profiles_signaligned/20251122_023936_synced_signaligned.csv",
+        # default=DEFAULT_STIFFNESS_DIR,
+        default="/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/stiffness_profiles_signaligned",
         help="Directory containing stiffness profile CSVs.",
     )
     parser.add_argument(
@@ -1272,6 +1340,12 @@ def parse_args() -> argparse.Namespace:
         help="Run real-time simulation mode (one obs at a time with padding).",
     )
     parser.add_argument(
+        "--full-testset",
+        action="store_true",
+        default=False,
+        help="Evaluate on full test set with comprehensive metrics (recommended for paper).",
+    )
+    parser.add_argument(
         "--plot",
         action="store_true",
         default=True,
@@ -1286,9 +1360,434 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def compute_comprehensive_metrics(gt: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
+    """Compute comprehensive metrics for stiffness prediction evaluation.
+    
+    Metrics include:
+    1. Value Metrics (magnitude error):
+       - RMSE: Root Mean Square Error
+       - MAE: Mean Absolute Error
+       - NRMSE: Normalized RMSE (by range)
+       
+    2. Pattern Metrics (shape similarity):
+       - Pearson ρ: Zero-order cross-correlation (per-dim mean)
+       - Spearman ρ: Rank correlation (robust to outliers)
+       - R²: Coefficient of determination
+       
+    3. Multi-dimensional Metrics:
+       - CCA: Canonical Correlation (9D GT vs 9D Pred)
+       
+    4. Smoothness Metrics:
+       - Jerk ratio: pred_jerk / gt_jerk (lower = smoother)
+       
+    5. Functional Connectivity Metrics (Zhou et al., 2022):
+       - Lagged cross-correlation (peak lag analysis)
+       - Coherence (frequency domain correlation)
+       - Mutual Information (nonlinear relationship)
+       
+    Args:
+        gt: Ground truth (T, D)
+        pred: Prediction (T, D)
+        
+    Returns:
+        Dictionary of metrics
+    """
+    from scipy.signal import coherence
+    from scipy.stats import entropy
+    
+    if gt.shape != pred.shape:
+        min_len = min(gt.shape[0], pred.shape[0])
+        gt = gt[:min_len]
+        pred = pred[:min_len]
+    
+    T, D = gt.shape
+    metrics = {}
+    
+    # 1. Value Metrics
+    mse = np.mean((gt - pred) ** 2)
+    metrics['rmse'] = np.sqrt(mse)
+    metrics['mae'] = np.mean(np.abs(gt - pred))
+    
+    gt_range = np.max(gt) - np.min(gt)
+    metrics['nrmse'] = metrics['rmse'] / gt_range if gt_range > 1e-6 else 0.0
+    
+    # 2. Pattern Metrics (per-dimension, then average)
+    pearson_list = []
+    spearman_list = []
+    r2_list = []
+    lagged_corr_list = []  # Peak lagged correlation
+    peak_lag_list = []     # Lag at peak correlation
+    coherence_list = []    # Mean coherence
+    mi_list = []           # Mutual information
+    
+    for d in range(D):
+        gt_d = gt[:, d]
+        pred_d = pred[:, d]
+        
+        # Skip if constant
+        if np.std(gt_d) < 1e-6 or np.std(pred_d) < 1e-6:
+            continue
+        
+        # Pearson correlation (zero-lag)
+        rho, _ = pearsonr(gt_d, pred_d)
+        if not np.isnan(rho):
+            pearson_list.append(rho)
+        
+        # Spearman correlation (rank-based, robust)
+        rho_s, _ = spearmanr(gt_d, pred_d)
+        if not np.isnan(rho_s):
+            spearman_list.append(rho_s)
+        
+        # R² per dimension
+        ss_res = np.sum((gt_d - pred_d) ** 2)
+        ss_tot = np.sum((gt_d - np.mean(gt_d)) ** 2)
+        r2_d = 1 - ss_res / ss_tot if ss_tot > 1e-6 else 0.0
+        r2_list.append(r2_d)
+        
+        # === Functional Connectivity Metrics (Zhou et al.) ===
+        
+        # 2a. Lagged Cross-Correlation (find peak and its lag)
+        try:
+            max_lag = min(50, T // 4)  # Max lag to check
+            xcorr = np.correlate(
+                (gt_d - np.mean(gt_d)) / (np.std(gt_d) * len(gt_d)),
+                (pred_d - np.mean(pred_d)) / np.std(pred_d),
+                mode='full'
+            )
+            mid = len(xcorr) // 2
+            lags = np.arange(-mid, mid + 1)
+            
+            # Focus on reasonable lag range
+            valid_idx = np.where(np.abs(lags) <= max_lag)[0]
+            xcorr_valid = xcorr[valid_idx]
+            lags_valid = lags[valid_idx]
+            
+            peak_idx = np.argmax(np.abs(xcorr_valid))
+            peak_corr = xcorr_valid[peak_idx]
+            peak_lag = lags_valid[peak_idx]
+            
+            lagged_corr_list.append(peak_corr)
+            peak_lag_list.append(abs(peak_lag))
+        except Exception:
+            pass
+        
+        # 2b. Coherence (frequency domain correlation)
+        try:
+            fs = 30.0  # Assume 30Hz sampling rate
+            freqs, coh = coherence(gt_d, pred_d, fs=fs, nperseg=min(64, T//2))
+            # Mean coherence in relevant frequency band (0.5-5Hz for stiffness)
+            freq_mask = (freqs >= 0.5) & (freqs <= 5.0)
+            if np.any(freq_mask):
+                mean_coh = np.mean(coh[freq_mask])
+                coherence_list.append(mean_coh)
+        except Exception:
+            pass
+        
+        # 2c. Mutual Information (nonlinear relationship)
+        try:
+            # Discretize into bins for MI calculation
+            n_bins = 10
+            gt_bins = np.digitize(gt_d, np.linspace(gt_d.min(), gt_d.max(), n_bins))
+            pred_bins = np.digitize(pred_d, np.linspace(pred_d.min(), pred_d.max(), n_bins))
+            
+            # Joint histogram
+            joint_hist = np.histogram2d(gt_bins, pred_bins, bins=n_bins)[0]
+            joint_prob = joint_hist / joint_hist.sum()
+            
+            # Marginal probabilities
+            p_gt = joint_prob.sum(axis=1)
+            p_pred = joint_prob.sum(axis=0)
+            
+            # MI = H(gt) + H(pred) - H(gt, pred)
+            h_gt = entropy(p_gt + 1e-10)
+            h_pred = entropy(p_pred + 1e-10)
+            h_joint = entropy(joint_prob.flatten() + 1e-10)
+            mi = h_gt + h_pred - h_joint
+            
+            # Normalized MI (0-1 range)
+            nmi = mi / max(h_gt, h_pred) if max(h_gt, h_pred) > 0 else 0
+            mi_list.append(nmi)
+        except Exception:
+            pass
+    
+    metrics['pearson_rho'] = np.mean(pearson_list) if pearson_list else 0.0
+    metrics['spearman_rho'] = np.mean(spearman_list) if spearman_list else 0.0
+    metrics['r2'] = np.mean(r2_list) if r2_list else 0.0
+    
+    # Functional connectivity metrics
+    metrics['lagged_corr'] = np.mean(lagged_corr_list) if lagged_corr_list else 0.0
+    metrics['peak_lag'] = np.mean(peak_lag_list) if peak_lag_list else 0.0
+    metrics['coherence'] = np.mean(coherence_list) if coherence_list else 0.0
+    metrics['mutual_info'] = np.mean(mi_list) if mi_list else 0.0
+    
+    # Per-finger correlations
+    finger_dims = {'th': [0, 1, 2], 'if': [3, 4, 5], 'mf': [6, 7, 8]}
+    for finger, dims in finger_dims.items():
+        finger_pearson = []
+        for d in dims:
+            if d < D and np.std(gt[:, d]) > 1e-6 and np.std(pred[:, d]) > 1e-6:
+                rho, _ = pearsonr(gt[:, d], pred[:, d])
+                if not np.isnan(rho):
+                    finger_pearson.append(rho)
+        metrics[f'pearson_{finger}'] = np.mean(finger_pearson) if finger_pearson else 0.0
+    
+    # 3. Canonical Correlation (9D -> 1D projection with max correlation)
+    try:
+        cca = CCA(n_components=1)
+        gt_c, pred_c = cca.fit_transform(gt, pred)
+        cca_corr, _ = pearsonr(gt_c.flatten(), pred_c.flatten())
+        metrics['cca'] = cca_corr if not np.isnan(cca_corr) else 0.0
+    except Exception:
+        metrics['cca'] = 0.0
+    
+    # 4. Smoothness Metrics (jerk = 3rd derivative)
+    if T > 4:
+        # Compute jerk (3rd derivative)
+        gt_jerk = np.diff(gt, n=3, axis=0)
+        pred_jerk = np.diff(pred, n=3, axis=0)
+        
+        gt_jerk_mag = np.mean(np.abs(gt_jerk))
+        pred_jerk_mag = np.mean(np.abs(pred_jerk))
+        
+        metrics['jerk_ratio'] = pred_jerk_mag / gt_jerk_mag if gt_jerk_mag > 1e-6 else 1.0
+    else:
+        metrics['jerk_ratio'] = 1.0
+    
+    return metrics
+
+
+def evaluate_full_testset(args: argparse.Namespace) -> None:
+    """Evaluate all models on full test set with comprehensive metrics.
+    
+    This is the recommended evaluation for paper submission:
+    - Uses all test trajectories (not just one demo)
+    - Computes both value metrics (RMSE, MAE) and pattern metrics (correlation)
+    - Reports per-finger and overall metrics
+    - Avoids cherry-picking by aggregating across all test demos
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch is required for diffusion policy evaluation.")
+    
+    # Setup
+    artifact_dir = Path(args.artifact_dir) if args.artifact_dir else _latest_artifact_dir(DEFAULT_ARTIFACT_ROOT)
+    print(f"[FULL TESTSET EVAL] Using artifact directory: {artifact_dir}")
+    
+    evaluator = DiffusionEvaluator(artifact_dir, device=args.device)
+    manifest = evaluator.manifest
+    
+    # Load all trajectories
+    trajectories = load_dataset(args.stiffness_dir, args.stride, include_aug=True)
+    traj_dict = {t.name: t for t in trajectories}
+    
+    # Get test trajectories from manifest
+    test_names = manifest.get("test_trajectories", [])
+    if not test_names:
+        print("[warn] No test_trajectories in manifest, using 20% random split")
+        np.random.seed(42)
+        n_test = max(1, len(trajectories) // 5)
+        test_names = [t.name for t in np.random.choice(trajectories, n_test, replace=False)]
+    
+    test_trajectories = [traj_dict[n] for n in test_names if n in traj_dict]
+    print(f"[FULL TESTSET EVAL] Test set size: {len(test_trajectories)} trajectories")
+    
+    # Get all models
+    all_models = list(manifest.get("models", {}).keys())
+    if args.model_filter:
+        filter_list = [m.strip().lower() for m in args.model_filter.split(",")]
+        all_models = [m for m in all_models if m.lower() in filter_list]
+    
+    print(f"[FULL TESTSET EVAL] Models to evaluate: {all_models}")
+    print("=" * 100)
+    
+    # Configuration variations
+    configs = [
+        {"name": "Raw", "lowpass": False},
+        {"name": f"LP_{args.lowpass_cutoff}Hz", "lowpass": True},
+    ]
+    
+    # Results storage: model -> config -> list of per-demo metrics
+    all_results: Dict[str, Dict[str, List[Dict[str, float]]]] = {}
+    
+    sampler = args.sampler
+    eta = args.eta
+    n_samples = args.n_samples
+    
+    for model_name in all_models:
+        print(f"\n{'='*80}")
+        print(f"[{model_name}] Loading model...")
+        
+        try:
+            model, config, temporal, trained_horizon = evaluator._load_diffusion_model(model_name)
+        except Exception as e:
+            print(f"[warn] Failed to load {model_name}: {e}")
+            continue
+        
+        model.model.eval()
+        all_results[model_name] = {cfg["name"]: [] for cfg in configs}
+        
+        # Evaluate on each test trajectory
+        for traj in test_trajectories:
+            test_obs = traj.observations
+            test_act = traj.actions
+            test_obs_s = evaluator.obs_scaler.transform(test_obs)
+            
+            # Build sequence if temporal
+            if temporal:
+                test_scaled = scale_trajectories([traj], evaluator.obs_scaler, evaluator.act_scaler)
+                test_offsets = compute_offsets([traj])
+                seq_obs, _, _, seq_indices = build_sequence_dataset(
+                    test_scaled, [traj], evaluator.window, test_offsets
+                )
+                if seq_obs.shape[0] == 0:
+                    continue
+                eval_obs = seq_obs
+                target = test_act[seq_indices]
+            else:
+                eval_obs = test_obs_s
+                target = test_act
+            
+            # Run inference
+            try:
+                with torch.no_grad():
+                    pred_scaled = model.predict(
+                        eval_obs, n_samples=n_samples, sampler=sampler, eta=eta
+                    )
+                
+                if len(pred_scaled.shape) == 3:
+                    pred_scaled = pred_scaled[:, 0, :]
+                pred_raw = evaluator.act_scaler.inverse_transform(pred_scaled)
+                
+                # Compute metrics for each config
+                for cfg in configs:
+                    if cfg["lowpass"]:
+                        pred = apply_lowpass_filter(pred_raw, cutoff_hz=args.lowpass_cutoff)
+                    else:
+                        pred = pred_raw
+                    
+                    metrics = compute_comprehensive_metrics(target, pred)
+                    all_results[model_name][cfg["name"]].append(metrics)
+                    
+            except Exception as e:
+                print(f"  [warn] Error on {traj.name}: {e}")
+                continue
+        
+        # Print progress
+        n_demos = len(all_results[model_name][configs[0]["name"]])
+        print(f"[{model_name}] Evaluated on {n_demos} demos")
+    
+    # Aggregate results
+    print("\n" + "=" * 140)
+    print("FULL TEST SET EVALUATION RESULTS (Zhou et al. Functional Connectivity Metrics)")
+    print("=" * 140)
+    
+    # Create summary table - now includes FC metrics
+    metric_keys = ['rmse', 'mae', 'nrmse', 'pearson_rho', 'spearman_rho', 'r2', 'cca', 
+                   'lagged_corr', 'peak_lag', 'coherence', 'mutual_info', 'jerk_ratio',
+                   'pearson_th', 'pearson_if', 'pearson_mf']
+    
+    # First table: Value + Pattern metrics
+    header1 = f"{'Model':<20} {'Config':<12} {'RMSE':>8} {'MAE':>8} {'NRMSE':>8} {'ρ_pear':>8} {'ρ_spear':>8} {'R²':>8} {'CCA':>8}"
+    print(header1)
+    print("-" * 100)
+    
+    summary_rows = []
+    
+    for model_name, model_results in all_results.items():
+        for cfg_name, metrics_list in model_results.items():
+            if not metrics_list:
+                continue
+            
+            # Aggregate (mean ± std)
+            agg = {}
+            for mk in metric_keys:
+                vals = [m[mk] for m in metrics_list if mk in m]
+                agg[f"{mk}_mean"] = np.mean(vals) if vals else 0.0
+                agg[f"{mk}_std"] = np.std(vals) if vals else 0.0
+            
+            # Print first table row (value + pattern)
+            row1 = f"{model_name:<20} {cfg_name:<12} {agg['rmse_mean']:>8.2f} {agg['mae_mean']:>8.2f} {agg['nrmse_mean']:>8.4f} {agg['pearson_rho_mean']:>8.4f} {agg['spearman_rho_mean']:>8.4f} {agg['r2_mean']:>8.4f} {agg['cca_mean']:>8.4f}"
+            print(row1)
+            
+            summary_rows.append({
+                'model': model_name,
+                'config': cfg_name,
+                **agg,
+                'n_demos': len(metrics_list)
+            })
+        print("-" * 100)
+    
+    # Second table: Functional Connectivity Metrics (Zhou et al.)
+    print("\n" + "=" * 100)
+    print("FUNCTIONAL CONNECTIVITY METRICS (Zhou et al., 2022)")
+    print("=" * 100)
+    header2 = f"{'Model':<20} {'Config':<12} {'Lag_Corr':>10} {'Peak_Lag':>10} {'Coherence':>10} {'Mut_Info':>10} {'Jerk':>10}"
+    print(header2)
+    print("-" * 100)
+    
+    for row in summary_rows:
+        line = f"{row['model']:<20} {row['config']:<12} {row['lagged_corr_mean']:>10.4f} {row['peak_lag_mean']:>10.2f} {row['coherence_mean']:>10.4f} {row['mutual_info_mean']:>10.4f} {row['jerk_ratio_mean']:>10.2f}"
+        print(line)
+    print("-" * 100)
+    
+    # Best model summary
+    print("\n" + "=" * 100)
+    print("BEST MODELS (by metric)")
+    print("=" * 100)
+    
+    if summary_rows:
+        import pandas as pd
+        df = pd.DataFrame(summary_rows)
+        
+        # Best by Pearson correlation (pattern metric)
+        best_pearson = df.loc[df['pearson_rho_mean'].idxmax()]
+        print(f"Best Pattern (Pearson ρ):     {best_pearson['model']} + {best_pearson['config']} = {best_pearson['pearson_rho_mean']:.4f}")
+        
+        # Best by RMSE (value metric)
+        best_rmse = df.loc[df['rmse_mean'].idxmin()]
+        print(f"Best Value (RMSE):            {best_rmse['model']} + {best_rmse['config']} = {best_rmse['rmse_mean']:.4f}")
+        
+        # Best by CCA (multi-dim correlation)
+        best_cca = df.loc[df['cca_mean'].idxmax()]
+        print(f"Best Multi-D (CCA):           {best_cca['model']} + {best_cca['config']} = {best_cca['cca_mean']:.4f}")
+        
+        # Best by R²
+        best_r2 = df.loc[df['r2_mean'].idxmax()]
+        print(f"Best R²:                      {best_r2['model']} + {best_r2['config']} = {best_r2['r2_mean']:.4f}")
+        
+        # Best by Coherence (FC metric)
+        best_coh = df.loc[df['coherence_mean'].idxmax()]
+        print(f"Best Coherence (FC):          {best_coh['model']} + {best_coh['config']} = {best_coh['coherence_mean']:.4f}")
+        
+        # Best by Mutual Info (FC metric)
+        best_mi = df.loc[df['mutual_info_mean'].idxmax()]
+        print(f"Best Mutual Info (FC):        {best_mi['model']} + {best_mi['config']} = {best_mi['mutual_info_mean']:.4f}")
+        
+        # Lowest lag (best for real-time)
+        best_lag = df.loc[df['peak_lag_mean'].idxmin()]
+        print(f"Lowest Lag (real-time):       {best_lag['model']} + {best_lag['config']} = {best_lag['peak_lag_mean']:.2f} steps")
+        
+        # Save CSV
+        csv_path = artifact_dir / "full_testset_metrics.csv"
+        df.to_csv(csv_path, index=False)
+        print(f"\n[info] Metrics saved to: {csv_path}")
+    
+    
+    # Per-finger analysis
+    print("\n" + "=" * 80)
+    print("PER-FINGER CORRELATION (Pearson ρ)")
+    print("=" * 80)
+    print(f"{'Model + Config':<40} {'Thumb':>10} {'Index':>10} {'Middle':>10}")
+    print("-" * 80)
+    for row in summary_rows:
+        label = f"{row['model']} + {row['config']}"
+        print(f"{label:<40} {row['pearson_th_mean']:>10.4f} {row['pearson_if_mean']:>10.4f} {row['pearson_mf_mean']:>10.4f}")
+
+
 if __name__ == "__main__":
     args = parse_args()
-    if args.realtime:
+    if args.full_testset:
+        evaluate_full_testset(args)
+    elif args.realtime:
         evaluate_realtime_simulation(args)
     else:
         evaluate_diffusion_policies(args)

@@ -98,6 +98,30 @@ class DynamixelControl:
         else:
             print(f"Dynamixel ID {id} set to mode {mode}")
 
+    def set_pwm_limit(self, pwm_limit: int) -> None:
+        """Set PWM limit for all motors.
+        
+        Args:
+            pwm_limit: PWM limit value (0-885, where 885 = 100%)
+        
+        Note: PWM Limit can only be changed when Torque Enable is 0 (disabled).
+        """
+        # Clamp to valid range
+        pwm_limit = max(0, min(885, int(pwm_limit)))
+        
+        # Get PWM Limit address from config, default to 36 for XM430
+        addr_pwm_limit = getattr(self.cfg.control_table, 'ADDR_PWM_LIMIT', 36)
+        
+        for id in self.cfg.ids:
+            dxl_comm_result, dxl_error = self.packetHandler.write2ByteTxRx(
+                self.portHandler, id, addr_pwm_limit, pwm_limit)
+            if dxl_comm_result != COMM_SUCCESS:
+                print(f"[PWM Limit] ID {id}: Failed - {self.packetHandler.getTxRxResult(dxl_comm_result)}")
+            elif dxl_error != 0:
+                print(f"[PWM Limit] ID {id}: Error - {self.packetHandler.getRxPacketError(dxl_error)}")
+            else:
+                print(f"[PWM Limit] ID {id}: Set to {pwm_limit}")
+
     def get_operating_mode_all(self) -> int:
         addr_operating_mode = self.cfg.control_table.addr_operating_mode
         for id in self.cfg.ids:

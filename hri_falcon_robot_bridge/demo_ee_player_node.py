@@ -28,7 +28,7 @@ CSV 데모 궤적 또는 DMP PKL 파일을 읽어 모든 손가락(th, if, mf)�
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from std_msgs.msg import Bool, UInt8
+from std_msgs.msg import Bool, UInt8, Int32MultiArray
 
 import numpy as np
 import pandas as pd
@@ -45,6 +45,7 @@ class DemoEEPlayerNode(Node):
     def __init__(self):
         super().__init__('demo_ee_player_node')
         # Parameters
+        self.declare_parameter('gt_csv', '')  # GT CSV 파일 (최우선 - signaligned format)
         self.declare_parameter('pkl_pattern', '')  # DMP PKL 파일 패턴 (우선순위)
         self.declare_parameter('csv', '')
         self.declare_parameter('csv_pattern', '')
@@ -62,6 +63,9 @@ class DemoEEPlayerNode(Node):
         self.declare_parameter('manual_start', True)  # 키보드 트리거 대기 여부
         self.declare_parameter('start_key', 'p')  # 시작 키
         self.declare_parameter('stop_key', 'k')  # 긴급 정지 키
+        self.declare_parameter('init_key', 'i')  # 초기 자세 이동 키
+        # Motor initial positions (from config.yaml) for 'i' key
+        self.declare_parameter('motor_initial_positions', [1365, 1728, 1707, 1365, 1728, 1707, 1365, 1728, 1707])
 
         p = lambda name: self.get_parameter(name).value
         self.fingers = ['th', 'if', 'mf']
@@ -75,6 +79,8 @@ class DemoEEPlayerNode(Node):
         self.manual_start = bool(p('manual_start') if p('manual_start') is not None else True)
         self.start_key = str(p('start_key') or 'p')
         self.stop_key = str(p('stop_key') or 'k')
+        self.init_key = str(p('init_key') or 'i')
+        self.motor_initial_positions = list(p('motor_initial_positions') or [1365, 1728, 1707, 1365, 1728, 1707, 1365, 1728, 1707])
         self.tau_scale = float(p('tau_scale') or 1.0)  # DMP 속도 조절
         self.hold_time = float(p('hold_time') or 0.0)  # 끝 유지 시간
         self.speed_profile = str(p('speed_profile') or 'constant')  # 속도 프로파일
@@ -84,6 +90,7 @@ class DemoEEPlayerNode(Node):
         self.initial_pos_sent = not self.manual_start  # 초기 위치 전송 완료 여부
         self.prev_pos = {}  # velocity 계산용 이전 위치
 
+        gt_csv = str(p('gt_csv'))
         pkl_pattern = str(p('pkl_pattern'))
         csv = str(p('csv'))
         csv_pattern = str(p('csv_pattern'))
@@ -109,13 +116,20 @@ class DemoEEPlayerNode(Node):
         self._playback_stage = -1
         init_stage = 0 if self.manual_start else 2
         self._set_playback_stage(init_stage)
+        
+        # Goal position publisher for motor initial positions ('i' key)
+        self.goal_position_pub = self.create_publisher(Int32MultiArray, "/dynamixel/goal_position", 10)
+        self.get_logger().info(f"[INIT] Goal position publisher -> /dynamixel/goal_position (initial: {self.motor_initial_positions[:3]}...)")
 
         # Load trajectories (모든 손가락)
-        # 우선순위: PKL > CSV
+        # 우선순위: GT_CSV > PKL > CSV
         self.trajs = {}
         self.N = 0
         
-        if pkl_pattern:
+        if gt_csv and Path(gt_csv).exists():
+            self.get_logger().info(f"[GT_CSV MODE] Loading EE positions from: {gt_csv}")
+            self._load_gt_csv_trajectories(gt_csv)
+        elif pkl_pattern:
             self.get_logger().info(f"[PKL MODE] Loading DMP models from: {pkl_pattern}")
             for finger in self.fingers:
                 traj = self._load_dmp_trajectory(pkl_pattern, finger)
@@ -155,7 +169,7 @@ class DemoEEPlayerNode(Node):
         if self.manual_start:
             self.orig_settings = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin.fileno())
-            self.get_logger().info(f"[MANUAL START] Press '{self.start_key}' to begin playback")
+            self.get_logger().info(f"[MANUAL START] Keys: '{self.init_key}'=init pos, '{self.start_key}'=start, '{self.stop_key}'=stop")
         else:
             self.orig_settings = None
             self.get_logger().info("[AUTO START] Playback started immediately")
@@ -165,6 +179,80 @@ class DemoEEPlayerNode(Node):
         # Keyboard check timer (10Hz)
         if self.manual_start:
             self.key_timer = self.create_timer(0.1, self._check_keyboard)
+
+    def _load_gt_csv_trajectories(self, gt_csv_path: str) -> None:
+        """Load EE positions directly from GT signaligned CSV file
+        
+        GT CSV format columns: ee_th_px, ee_th_py, ee_th_pz, ee_if_px, ..., ee_mf_px, ...
+        
+        Args:
+            gt_csv_path: Path to the GT signaligned CSV file
+        """
+        import pandas as pd
+        
+        try:
+            df = pd.read_csv(gt_csv_path)
+            self.get_logger().info(f"  GT CSV loaded: {len(df)} rows, columns: {list(df.columns)[:10]}...")
+            
+            # Column mapping: GT uses ee_{finger}_p{axis}
+            finger_map = {'th': 'th', 'if': 'if', 'mf': 'mf'}
+            
+            for finger in self.fingers:
+                try:
+                    # Extract EE positions from GT CSV
+                    x_col = f'ee_{finger}_px'
+                    y_col = f'ee_{finger}_py'
+                    z_col = f'ee_{finger}_pz'
+                    
+                    if x_col not in df.columns:
+                        self.get_logger().error(f"Column {x_col} not found in GT CSV!")
+                        self.trajs[finger] = np.zeros((0, 3))
+                        continue
+                    
+                    x = df[x_col].values
+                    y = df[y_col].values
+                    z = df[z_col].values
+                    
+                    traj = np.column_stack([x, y, z])
+                    
+                    # Apply tau_scale (time stretching) if needed
+                    if self.tau_scale != 1.0:
+                        from scipy.interpolate import interp1d
+                        n_orig = len(traj)
+                        n_new = int(n_orig * self.tau_scale)
+                        t_orig = np.linspace(0, 1, n_orig)
+                        t_new = np.linspace(0, 1, n_new)
+                        interp_func = interp1d(t_orig, traj, axis=0, kind='cubic', fill_value='extrapolate')
+                        traj = interp_func(t_new)
+                        self.get_logger().info(f"  {finger}: tau_scale={self.tau_scale:.2f}, {n_orig} → {len(traj)} frames")
+                    
+                    # Add hold phase at end if specified
+                    if self.hold_time > 0:
+                        hold_steps = int(self.hold_time * self.rate_hz)
+                        hold_pos = traj[-1].reshape(1, 3)
+                        hold_traj = np.repeat(hold_pos, hold_steps, axis=0)
+                        traj = np.vstack([traj, hold_traj])
+                        self.get_logger().info(f"  {finger}: added {hold_steps} hold frames ({self.hold_time:.1f}s)")
+                    
+                    self.trajs[finger] = traj
+                    
+                    if len(traj) > 0:
+                        if self.N == 0:
+                            self.N = len(traj)
+                        elif self.N != len(traj):
+                            self.get_logger().warn(f"Trajectory length mismatch for {finger}: {len(traj)} vs {self.N}")
+                            self.N = min(self.N, len(traj))
+                    
+                    self.get_logger().info(f"  ✅ {finger}: {len(traj)} frames, range x=[{x.min():.4f},{x.max():.4f}], y=[{y.min():.4f},{y.max():.4f}], z=[{z.min():.4f},{z.max():.4f}]")
+                    
+                except Exception as e:
+                    self.get_logger().error(f"Failed to load {finger} from GT CSV: {e}")
+                    self.trajs[finger] = np.zeros((0, 3))
+                    
+        except Exception as e:
+            self.get_logger().error(f"Failed to load GT CSV {gt_csv_path}: {e}")
+            for finger in self.fingers:
+                self.trajs[finger] = np.zeros((0, 3))
 
     def _load_dmp_trajectory(self, pkl_pattern: str, finger: str) -> np.ndarray:
         """Load DMP model from PKL file and generate trajectory
@@ -378,14 +466,19 @@ class DemoEEPlayerNode(Node):
     def _check_keyboard(self):
         """Check for keyboard input to start/restart playback
         
-        Two-step activation:
-        1st 'p': Publish initial pose and hold (zero torque - playback_active=False)
-        2nd 'p': Start actual playback trajectory (torque active - playback_active=True)
+        Key controls:
+        - 'i': Move to initial position (zero torque)
+        - 'p' (1st): Publish initial pose and hold (zero torque)
+        - 'p' (2nd): Start actual playback trajectory (torque active)
+        - 'k': Emergency stop
         """
         if select.select([sys.stdin], [], [], 0)[0]:
             key = sys.stdin.read(1)
             if key.lower() == self.stop_key.lower():
                 self._handle_emergency_stop()
+                return
+            if key.lower() == self.init_key.lower():
+                self._move_to_initial_position()
                 return
             if key.lower() == self.start_key.lower():
                 if not self.initial_pos_sent:
@@ -488,6 +581,36 @@ class DemoEEPlayerNode(Node):
                 # CRITICAL: Stop playback and reset stage when finished
                 self.playback_status_pub.publish(Bool(data=False))
                 self._set_playback_stage(0)
+
+    def _move_to_initial_position(self) -> None:
+        """Move to motor initial position (from config.yaml) with position mode.
+        
+        Publishes motor_initial_positions to /dynamixel/goal_position topic,
+        which robot_controller_node uses to move motors to initial pose.
+        """
+        # Stop any ongoing playback
+        self.is_running = False
+        self.initial_pos_sent = False
+        self.idx = 0
+        
+        # Reset prev_pos for velocity calculation
+        for finger in self.fingers:
+            if len(self.trajs[finger]) > 0:
+                self.prev_pos[finger] = self.trajs[finger][0].copy()
+        
+        # Publish motor initial positions to /dynamixel/goal_position
+        goal_msg = Int32MultiArray()
+        goal_msg.data = [int(x) for x in self.motor_initial_positions]
+        self.goal_position_pub.publish(goal_msg)
+        
+        # Set stage to 0 (position mode, zero torque)
+        self.playback_status_pub.publish(Bool(data=False))
+        self._set_playback_stage(0)
+        
+        self.get_logger().info(
+            f"[INIT] '{self.init_key}' pressed -> sent motor positions {self.motor_initial_positions[:3]}... "
+            f"Press '{self.start_key}' to activate force control."
+        )
 
     def _handle_emergency_stop(self) -> None:
         """Immediate torque cut: publish inactive status and reset stage."""

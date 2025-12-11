@@ -11,6 +11,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
 import os
+import time
 import yaml  # type: ignore
 import math
 from datetime import datetime
@@ -19,13 +20,18 @@ import sys
 import select
 import termios
 import tty
+try:
+    import matplotlib  # type: ignore
+    matplotlib.use("Agg")
+except Exception:
+    matplotlib = None  # type: ignore
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, TwistStamped, WrenchStamped
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray, Int32MultiArray, Bool, UInt8, Float32
+from std_msgs.msg import Float32MultiArray, Int32MultiArray, Bool, UInt8, Float32, String
 
 try:
     import mujoco as mj  # type: ignore
@@ -80,6 +86,10 @@ class TorqueImpedanceControllerNode(Node):
         self.declare_parameter("ki_force", 0.0)
         self.declare_parameter("stiffness_filter_alpha", 0.01)
         self.declare_parameter("max_stiffness_change", 50.0)
+        # Time-based stiffness scaling (ramp up over time for gentle start)
+        self.declare_parameter("time_ramp_duration", 3.0)  # seconds to ramp up
+        self.declare_parameter("initial_stiffness_scale", 0.3)  # start at 30%
+        self.declare_parameter("final_stiffness_scale", 1.0)  # end at 100%
         # New parameters (robot controller joint source + initial baseline + EE pose publish)
         self.declare_parameter("joint_state_topic", "/robot_controller/joint_state")
         self.declare_parameter("initial_qpos", [0.0]*9)
@@ -116,6 +126,11 @@ class TorqueImpedanceControllerNode(Node):
         self.ki_force = float(_p("ki_force") or 0.0)
         self.stiffness_alpha = float(_p("stiffness_filter_alpha") or 0.1)
         self.max_k_change = float(_p("max_stiffness_change") or 1.0)
+        # Time-based stiffness scaling
+        self.time_ramp_duration = float(_p("time_ramp_duration") or 3.0)
+        self.initial_stiffness_scale = float(_p("initial_stiffness_scale") or 0.3)
+        self.final_stiffness_scale = float(_p("final_stiffness_scale") or 1.0)
+        self.stiffness_ramp_start_time: float = None  # Will be set on first stiffness message
         self.joint_state_topic = str(_p("joint_state_topic") or "/robot_controller/joint_state")
         self.pos_error_threshold = float(_p("position_error_threshold") or 0.05)
         self.stiffness_logging_enabled = bool(_p("stiffness_logging_enabled") if _p("stiffness_logging_enabled") is not None else True)
@@ -199,6 +214,7 @@ class TorqueImpedanceControllerNode(Node):
         self.demo_playback_stage = 0
         self.stiffness_log_active = False
         self.stiffness_log_data: List[Tuple[float, np.ndarray]] = []
+        self.stiffness_scaled_log_data: List[Tuple[float, np.ndarray]] = []
         self.eccentricity_log_data: List[Tuple[float, float]] = []
         self.eccentricity_smoothed_log_data: List[Tuple[float, float]] = []  # Smoothed eccentricity from run_policy_node
         self.force_log_data: List[Tuple[float, Dict[str, np.ndarray]]] = []  # Store fx,fy,fz for each finger
@@ -215,6 +231,7 @@ class TorqueImpedanceControllerNode(Node):
         self.has_eccentricity = False
         self.has_eccentricity_smoothed = False
         self.current_pwm: Optional[np.ndarray] = None  # Latest PWM values
+        self.current_model_name: str = "unknown"  # Model name from policy node
 
         self.mj_model = None
         self.mj_data = None
@@ -227,6 +244,7 @@ class TorqueImpedanceControllerNode(Node):
         self.create_subscription(Float32MultiArray, "/impedance_control/target_stiffness", self.subscribe_stiffness, 10)
         self.create_subscription(Float32, "/deformity_tracker/eccentricity", self.subscribe_eccentricity, 10)
         self.create_subscription(Float32, "/deformity_tracker/eccentricity_smoothed", self.subscribe_eccentricity_smoothed, 10)
+        self.create_subscription(String, "/policy/model_name", self.subscribe_model_name, 10)
         # Subscribe to external joint state (robot controller) instead of hardcoded hand tracker
         self.create_subscription(JointState, self.joint_state_topic, self.subscribe_joint_state, 10)
         self.get_logger().info(f"[INIT] JointState subscriber CREATED: topic={self.joint_state_topic}")
@@ -554,11 +572,28 @@ class TorqueImpedanceControllerNode(Node):
             if len(msg.data) >= 9:
                 raw_k = np.array(msg.data[:9], dtype=float)
 
-                # [DEBUG] Bypass all filtering - use raw value from policy node
-                # Policy node already applies LP filter, so no additional filtering needed here
-                # This helps debug whether step function comes from policy or controller
-                self.filtered_stiffness = raw_k
-                self.target_stiffness = raw_k
+                # [TIME RAMP] Apply time-based scaling here (not in policy node)
+                # This way stiffness.csv logs raw policy output for analysis
+                if self.stiffness_ramp_start_time is None:
+                    self.stiffness_ramp_start_time = time.time()
+                    self.get_logger().info(
+                        f"[TIME_RAMP] Started! {self.initial_stiffness_scale:.0%} → {self.final_stiffness_scale:.0%} over {self.time_ramp_duration:.1f}s"
+                    )
+                
+                elapsed = time.time() - self.stiffness_ramp_start_time
+                if self.time_ramp_duration > 0:
+                    ramp_progress = min(elapsed / self.time_ramp_duration, 1.0)
+                else:
+                    ramp_progress = 1.0
+                time_scale = self.initial_stiffness_scale + (self.final_stiffness_scale - self.initial_stiffness_scale) * ramp_progress
+                
+                # Apply time scaling to stiffness (for gentle start)
+                scaled_k = raw_k * time_scale
+
+                # Use scaled value for control, but log raw value
+                self.filtered_stiffness = scaled_k
+                self.target_stiffness = scaled_k
+                self.raw_stiffness_for_log = raw_k  # Store raw for logging
                 self.has_stiffness = True
                 
                 # [ORIGINAL CODE - DISABLED FOR DEBUGGING]
@@ -599,6 +634,13 @@ class TorqueImpedanceControllerNode(Node):
             self.has_eccentricity_smoothed = True
         except Exception as e:
             self.get_logger().warning(f"eccentricity_smoothed 콜백 오류: {e}")
+
+    def subscribe_model_name(self, msg: String) -> None:
+        """Subscribe to model name from policy node for logging/plotting."""
+        try:
+            self.current_model_name = msg.data
+        except Exception as e:
+            self.get_logger().warning(f"model_name 콜백 오류: {e}")
 
     def subscribe_pwm(self, msg: Int32MultiArray) -> None:
         """Subscribe to PWM values from robot_controller_node"""
@@ -1039,6 +1081,7 @@ class TorqueImpedanceControllerNode(Node):
         if not self.stiffness_logging_enabled:
             return
         self.stiffness_log_data = []
+        self.stiffness_scaled_log_data = []
         self.eccentricity_log_data = []
         self.eccentricity_smoothed_log_data = []
         self.force_log_data = []
@@ -1074,13 +1117,14 @@ class TorqueImpedanceControllerNode(Node):
             f"[STIFFNESS_LOG] Recording stopped ({reason}), stiffness={sample_count}, ecc={ecc_count}, force={force_count}, ee_pos={ee_pos_count}, torque={torque_count}, pwm={pwm_count}"
         )
         
-        # Create session folder with timestamp
+        # Create session folder with timestamp and model name
         import os as _os_module
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         pid = _os_module.getpid()
+        model_name = self.current_model_name.replace("/", "_").replace(" ", "_")  # Sanitize for filename
         session_folder = os.path.join(
             self.stiffness_log_dir,
-            f"session_{timestamp}_pid{pid}_{self._stiffness_log_session_id:02d}"
+            f"session_{timestamp}_{model_name}_pid{pid}_{self._stiffness_log_session_id:02d}"
         )
         os.makedirs(session_folder, exist_ok=True)
         self.get_logger().info(f"[STIFFNESS_LOG] Session folder created: {session_folder}")
@@ -1095,6 +1139,7 @@ class TorqueImpedanceControllerNode(Node):
         
         # Clear log data
         self.stiffness_log_data = []
+        self.stiffness_scaled_log_data = []
         self.eccentricity_log_data = []
         self.eccentricity_smoothed_log_data = []
         self.force_log_data = []
@@ -1122,15 +1167,30 @@ class TorqueImpedanceControllerNode(Node):
             "if_x", "if_y", "if_z",
             "mf_x", "mf_y", "mf_z",
         ]
+        # Custom colors: mf_y (idx=7) highlighted in bright magenta for visibility
+        base_colors = list(plt.cm.tab10.colors)
+        colors = base_colors.copy()
+        colors[7] = '#FF00FF'  # mf_y: bright magenta (dominant axis for MF)
+        
+        # Prepare scaled stiffness data if available
+        has_scaled = len(self.stiffness_scaled_log_data) > 0
+        if has_scaled:
+            times_scaled = np.array([entry[0] for entry in self.stiffness_scaled_log_data], dtype=float)
+            values_scaled = np.stack([entry[1] for entry in self.stiffness_scaled_log_data], axis=0)
         
         # Create figure with 2 subplots
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
         
-        # Subplot 1: Stiffness
+        # Subplot 1: Stiffness (RAW solid, SCALED dashed)
         for idx in range(values.shape[1]):
-            ax1.plot(times_stiff, values[:, idx], label=component_labels[idx])
+            ax1.plot(times_stiff, values[:, idx], label=f"{component_labels[idx]} (raw)", 
+                     color=colors[idx % len(colors)], linewidth=1.5)
+            if has_scaled and idx < values_scaled.shape[1]:
+                ax1.plot(times_scaled, values_scaled[:, idx], linestyle='--', 
+                         color=colors[idx % len(colors)], linewidth=1.0, alpha=0.7)
         ax1.set_ylabel("Stiffness (N/m)")
-        ax1.set_title("stiffness P(k|obs) + eccentricity")
+        model_str = f" [{self.current_model_name}]" if self.current_model_name != "unknown" else ""
+        ax1.set_title(f"stiffness P(k|obs){model_str} - solid=raw, dashed=scaled (time ramp applied)")
         ax1.grid(True, alpha=0.3)
         ax1.legend(loc="upper right", ncol=3, fontsize=8)
         
@@ -1501,7 +1561,7 @@ class TorqueImpedanceControllerNode(Node):
         """Save all logged data as CSV files"""
         import csv
         
-        # 1. Stiffness data
+        # 1. Stiffness data (RAW - before time scaling)
         if self.stiffness_log_data:
             filename = os.path.join(session_folder, "stiffness.csv")
             try:
@@ -1513,6 +1573,19 @@ class TorqueImpedanceControllerNode(Node):
                 self.get_logger().info(f"[CSV] Saved stiffness.csv ({len(self.stiffness_log_data)} rows)")
             except Exception as e:
                 self.get_logger().error(f"[CSV] Failed to save stiffness.csv: {e}")
+        
+        # 1b. Stiffness SCALED data (with time ramp applied - actually used for control)
+        if self.stiffness_scaled_log_data:
+            filename = os.path.join(session_folder, "stiffness_scaled.csv")
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['time', 'th_x', 'th_y', 'th_z', 'if_x', 'if_y', 'if_z', 'mf_x', 'mf_y', 'mf_z'])
+                    for t, vals in self.stiffness_scaled_log_data:
+                        writer.writerow([f'{t:.4f}'] + [f'{v:.4f}' for v in vals])
+                self.get_logger().info(f"[CSV] Saved stiffness_scaled.csv ({len(self.stiffness_scaled_log_data)} rows)")
+            except Exception as e:
+                self.get_logger().error(f"[CSV] Failed to save stiffness_scaled.csv: {e}")
         
         # 2. Eccentricity data
         if self.eccentricity_log_data:
@@ -1623,7 +1696,11 @@ class TorqueImpedanceControllerNode(Node):
                 now_s = self.get_clock().now().nanoseconds / 1e9
                 rel_t = now_s - self.stiffness_log_start_time
                 if self.has_stiffness:
-                    self.stiffness_log_data.append((rel_t, self.target_stiffness.copy()))
+                    # Log RAW stiffness (before time scaling) for analysis
+                    raw_k = getattr(self, 'raw_stiffness_for_log', self.target_stiffness)
+                    self.stiffness_log_data.append((rel_t, raw_k.copy()))
+                    # Log SCALED stiffness (actually applied to control)
+                    self.stiffness_scaled_log_data.append((rel_t, self.target_stiffness.copy()))
                 if self.has_eccentricity:
                     self.eccentricity_log_data.append((rel_t, self.current_eccentricity))
                 if self.has_eccentricity_smoothed:

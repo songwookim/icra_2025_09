@@ -45,7 +45,7 @@ from geometry_msgs.msg import PoseStamped, WrenchStamped
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Float32, Float32MultiArray
+from std_msgs.msg import Float32, Float32MultiArray, String
 
 # Try importing torch
 try:
@@ -60,6 +60,23 @@ except ImportError:
 _THIS_FILE = Path(__file__).resolve()
 _PKG_ROOT = _THIS_FILE.parents[1]  # hri_falcon_robot_bridge package root
 _MODELS_ROOT = _PKG_ROOT / "outputs" / "models"
+
+# Source scripts path (for importing benchmark classes like IBCBaseline, DiffusionPolicyBaseline)
+# Try multiple possible locations (installed vs source)
+# Path structure varies depending on how the node is invoked:
+#   - As executable: /install/hri_falcon_robot_bridge/lib/hri_falcon_robot_bridge/run_policy_node -> parents[4] = workspace root
+#   - As Python module: /install/hri_falcon_robot_bridge/lib/python3.10/site-packages/hri_falcon_robot_bridge/run_policy_node.py -> parents[6] = workspace root
+_SCRIPTS_PATH_CANDIDATES = [
+    _PKG_ROOT / "scripts" / "3_model_learning",  # From installed package (unlikely)
+    _THIS_FILE.parents[4] / "src" / "hri_falcon_robot_bridge" / "scripts" / "3_model_learning",  # Executable in lib/hri_falcon_robot_bridge/
+    _THIS_FILE.parents[6] / "src" / "hri_falcon_robot_bridge" / "scripts" / "3_model_learning",  # Python module in lib/python3.10/site-packages/
+    Path("/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/scripts/3_model_learning"),  # Fallback absolute
+]
+_SCRIPTS_PATH = None
+for candidate in _SCRIPTS_PATH_CANDIDATES:
+    if candidate.exists():
+        _SCRIPTS_PATH = candidate
+        break
 
 
 class BehaviorCloningModel(nn.Module):
@@ -108,17 +125,17 @@ class RunPolicyNode(Node):
         self.callback_group = ReentrantCallbackGroup()
 
         # Declare all parameters
-        self.declare_parameter("model_type", "diffusion_t")  # Default: diffusion_t (temporal, best performance)
+        self.declare_parameter("model_type", "lstm_gmm")  # Default: lstm_gmm (best R²=0.9961)
         self.declare_parameter("mode", "unified")
         self.declare_parameter("artifact_dir", "")
-        self.declare_parameter("rate_hz", 100.0)
+        self.declare_parameter("rate_hz", 30.0)  # Match camera FPS (30Hz) for sync
         self.declare_parameter("stiffness_scale", 1.0)
         self.declare_parameter("stiffness_min", 0.0)
         self.declare_parameter("stiffness_max", 1000.0)
         self.declare_parameter("smooth_window", 5)
         # Low-pass filter parameters (Butterworth) - 2Hz cutoff for faster response while still smooth
-        self.declare_parameter("lowpass_enabled", True)  # Enable LP filter by default
-        self.declare_parameter("lowpass_cutoff_hz", 2.0)  # Cutoff frequency in Hz (2Hz = faster response, ~0.5s settling time)
+        self.declare_parameter("lowpass_enabled", False)  # Disable LP filter for faster response
+        self.declare_parameter("lowpass_cutoff_hz", 5.0)  # Cutoff frequency in Hz (higher = faster response)
         self.declare_parameter("lowpass_order", 2)  # Filter order (2 = good balance)
         # Time-based stiffness scaling parameters
         self.declare_parameter("time_ramp_duration", 8.0)  # seconds to ramp up (increased for gentler start)
@@ -136,6 +153,9 @@ class RunPolicyNode(Node):
         self.declare_parameter("ee_pose_th_topic", "/ee_pose_th")
         self.declare_parameter("debug_inputs", True)
         self.declare_parameter("debug_topic_scan", True)
+        # Force influence: how much actual force affects observation (vs training mean)
+        # 1.0 = full actual force, 0.0 = training mean only (no force variation)
+        self.declare_parameter("force_influence", 1.0)
 
         # Get parameters (add explicit typing + None fallbacks for static analysis clarity)
         def _p(name: str):
@@ -195,9 +215,46 @@ class RunPolicyNode(Node):
         self.deform_ecc_smoothed = None  # Smoothed eccentricity for plotting only
         self.ee_positions = {"if": None, "mf": None, "th": None}
         
+        # === FORCE BASELINE CALIBRATION (matches training data preprocessing) ===
+        # Training data uses: Fc = F - F[:10%].mean() (baseline removal)
+        # We collect first N samples at startup to compute baseline, then subtract it.
+        self.force_calibration_samples = 50  # ~0.5s at 100Hz (first 10% equivalent)
+        self.force_baseline_buffer: List[List[Dict]] = [[], [], []]  # Per-sensor buffer
+        self.force_baselines: List[Optional[Dict]] = [None, None, None]  # Computed baselines
+        self.force_calibrated = False  # Flag: baseline computed?
+        
+        # === FORCE INFLUENCE CONTROL ===
+        # Force has 6x more influence than ecc on stiffness prediction.
+        # force_influence=1.0: use actual force (full influence)
+        # force_influence=0.0: use training mean (no influence, ecc-only behavior)
+        # force_influence=0.5: blend 50% actual + 50% training mean
+        self.force_influence = float(_p("force_influence") if _p("force_influence") is not None else 1.0)
+        
+        # === FORCE AMPLIFICATION ===
+        # Live force range is often smaller than training data (~20-50% of training std).
+        # force_amplify > 1.0: amplify force values to match training distribution
+        # force_amplify=2.0: double the force values (compensate for ~50% live/train ratio)
+        self.force_amplify = 2.  # Default 2x amplification
+        
+        # Training data force means (after baseline removal, these should be ~0)
+        # From scaler: baseline-removed force should center around 0
+        self.force_training_mean = {
+            's1': {'fx': 0.0, 'fy': 0.0, 'fz': 0.0},  # After baseline removal
+            's2': {'fx': 0.0, 'fy': 0.0, 'fz': 0.0},
+            's3': {'fx': 0.0, 'fy': 0.0, 'fz': 0.0},
+        }
+        
+        # === Z-SCORE AMPLIFICATION ===
+        # Model outputs z-scores in narrow range (~0.7σ: -1.84 to -1.13), but training data has ~4σ range.
+        # Amplify z-scores before inverse_transform to get fuller stiffness range.
+        # z_amp=1.0: no change, z_amp=2.0: amplify z-scores by 2.0x
+        # With z_amp=2.0: z-scores -1.84~-1.13 become -3.68~-2.26 → stiffness range 48~48 (still low!)
+        # Need to shift the center, not just amplify. Try z_amp=1.5 first.
+        self.stiffness_z_amp = 1.5  # Moderate amplification
+        
         # Deformity smoothing buffer (moving average for obs input)
         self.deform_buffer: List[float] = []
-        self.deform_buffer_size = 10  # Increased to 10 for stronger smoothing (~200ms @ 50Hz)
+        self.deform_buffer_size = 5  # Enable smoothing (5-sample moving average)
 
         # Stiffness prediction buffer for smoothing
         self.stiffness_buffer: List[np.ndarray] = []
@@ -228,7 +285,7 @@ class RunPolicyNode(Node):
         
         # [CRITICAL] Observation history buffer for temporal models (diffusion_t)
         # diffusion_t uses GRU encoder that needs sequence of past observations
-        self.sequence_window = 16  # Must match training config! (DO NOT CHANGE)
+        self.sequence_window = 4  # Default value, updated from manifest in _load_model()
         self.obs_history: List[np.ndarray] = []  # Ring buffer of past scaled observations
         
         # [DEBUG] Sensor callback counters
@@ -253,12 +310,22 @@ class RunPolicyNode(Node):
             Float32MultiArray, "/impedance_control/target_stiffness", 10
         )
         
+        # Publisher for raw eccentricity (re-publish for torque controller logging)
+        self.raw_ecc_pub = self.create_publisher(
+            Float32, "/deformity_tracker/eccentricity", 10
+        )
+        
         # Publisher for smoothed eccentricity (for comparison in plots)
         self.smoothed_ecc_pub = self.create_publisher(
             Float32, "/deformity_tracker/eccentricity_smoothed", 10
         )
-
-        # Attractor publisher (removed emg_bc support)
+        
+        # Publisher for model name (for logging/plotting)
+        self.model_name_pub = self.create_publisher(
+            String, "/policy/model_name", 10
+        )
+        # Publish model name immediately and periodically
+        self._publish_model_name()
 
         # Control timer (using reentrant callback group)
         period = 1.0 / self.rate_hz
@@ -333,10 +400,14 @@ class RunPolicyNode(Node):
             )
 
     def _on_force(self, idx: int, msg: WrenchStamped):
-        """Callback for force sensor data."""
+        """Callback for force sensor data.
+        
+        [BASELINE CALIBRATION] Collects first N samples to compute force baseline,
+        matching training data preprocessing: Fc = F - F[:10%].mean()
+        """
         try:
             w = msg.wrench
-            self.forces[idx] = {
+            force_dict = {
                 "fx": w.force.x,
                 "fy": w.force.y,
                 "fz": w.force.z,
@@ -344,6 +415,22 @@ class RunPolicyNode(Node):
                 "ty": w.torque.y,
                 "tz": w.torque.z,
             }
+            
+            # Store raw force values
+            self.forces[idx] = force_dict
+            
+            # === BASELINE CALIBRATION: collect samples for baseline computation ===
+            if not self.force_calibrated:
+                self.force_baseline_buffer[idx].append(force_dict.copy())
+                
+                # Check if all sensors have enough samples
+                all_ready = all(
+                    len(buf) >= self.force_calibration_samples 
+                    for buf in self.force_baseline_buffer
+                )
+                if all_ready:
+                    self._compute_force_baselines()
+            
             self._force_callback_count[idx] += 1
             if self.debug_inputs and not self._force_logged[idx]:
                 self.get_logger().info(
@@ -352,6 +439,40 @@ class RunPolicyNode(Node):
                 self._force_logged[idx] = True
         except Exception as e:
             self.get_logger().warning(f"Force callback error (s{idx+1}): {e}")
+    
+    def _compute_force_baselines(self):
+        """Compute force baseline from collected samples (first N samples mean).
+        
+        This matches training data preprocessing:
+        Fc = F - F[:rest].mean() where rest = int(len(F) * 0.1)
+        """
+        for idx in range(3):
+            buf = self.force_baseline_buffer[idx]
+            if len(buf) == 0:
+                continue
+            
+            # Compute mean of each force component
+            baseline = {}
+            for key in ["fx", "fy", "fz", "tx", "ty", "tz"]:
+                values = [sample[key] for sample in buf]
+                baseline[key] = sum(values) / len(values)
+            
+            self.force_baselines[idx] = baseline
+            self.get_logger().info(
+                f"[FORCE CALIBRATION] s{idx+1} baseline: "
+                f"fx={baseline['fx']:.3f} fy={baseline['fy']:.3f} fz={baseline['fz']:.3f}"
+            )
+        
+        self.force_calibrated = True
+        self.get_logger().info(
+            f"[FORCE CALIBRATION] Complete! Baseline computed from {self.force_calibration_samples} samples per sensor."
+        )
+
+    def _publish_model_name(self):
+        """Publish the current model name for logging/plotting purposes."""
+        msg = String()
+        msg.data = self.model_type
+        self.model_name_pub.publish(msg)
 
     def _on_deform_ecc(self, msg: Float32):
         """Callback for deformity eccentricity. Smoothed value goes to observation."""
@@ -359,6 +480,9 @@ class RunPolicyNode(Node):
         
         # Store RAW value for logging/comparison
         self.deform_ecc_raw = raw_value
+        
+        # Publish RAW eccentricity for torque controller logging
+        self.raw_ecc_pub.publish(Float32(data=raw_value))
         
         # Add to buffer for smoothing
         self.deform_buffer.append(raw_value)
@@ -413,7 +537,39 @@ class RunPolicyNode(Node):
             self.get_logger().warning(f"EE pose callback error (th): {e}")
 
     def _find_latest_artifact(self) -> Optional[str]:
-        """Auto-detect latest artifact directory for the specified mode."""
+        """Auto-detect latest artifact directory for the specified mode.
+        
+        Supports model_type formats:
+        - Simple: 'lstm_gmm', 'bc', 'diffusion_t'
+        - Benchmark sweep: 'lstm_gmm_seq4', 'diffusion_t_seq4_h1', etc.
+        """
+        # First, check if model_type matches a benchmark_sweep subfolder
+        benchmark_sweep_dir = _MODELS_ROOT / "benchmark_sweep"
+        if benchmark_sweep_dir.exists():
+            # Check for exact match (e.g., 'diffusion_t_seq4_h1')
+            sweep_model_dir = benchmark_sweep_dir / self.model_type
+            if sweep_model_dir.exists():
+                # Find artifacts inside
+                artifacts_dir = sweep_model_dir / "policy_learning_unified" / "artifacts"
+                if artifacts_dir.exists():
+                    dirs = sorted([d for d in artifacts_dir.iterdir() if d.is_dir()])
+                    if dirs:
+                        artifact_path = str(dirs[-1])  # Latest
+                        self.get_logger().info(f"[AUTO-DETECT] Found benchmark_sweep model: {artifact_path}")
+                        return artifact_path
+            
+            # Check for partial match (e.g., 'lstm_gmm' -> 'lstm_gmm_seq4')
+            for subdir in benchmark_sweep_dir.iterdir():
+                if subdir.is_dir() and subdir.name.startswith(self.model_type):
+                    artifacts_dir = subdir / "policy_learning_unified" / "artifacts"
+                    if artifacts_dir.exists():
+                        dirs = sorted([d for d in artifacts_dir.iterdir() if d.is_dir()])
+                        if dirs:
+                            artifact_path = str(dirs[-1])
+                            self.get_logger().info(f"[AUTO-DETECT] Found matching model: {subdir.name} -> {artifact_path}")
+                            return artifact_path
+        
+        # Fallback: check standard paths
         search_paths = [
             _MODELS_ROOT / f"policy_learning_{self.mode}" / "artifacts",
             _PKG_ROOT.parents[2] / "outputs" / "models" / f"policy_learning_{self.mode}" / "artifacts",
@@ -435,8 +591,9 @@ class RunPolicyNode(Node):
                     "bc": "bc.pt",
                     "diffusion_c": "diffusion_c.pt",
                     "diffusion_t": "diffusion_t.pt",
-                    "gmm": "gmm_model.pkl",
-                    "gmr": "gmm_model.pkl",
+                    "ibc": "ibc.pt",
+                    "gmm": "gmm.pkl",
+                    "gmr": "gmm.pkl",
                 }
 
                 model_file = artifact_dir / model_files.get(self.model_type, "")
@@ -447,6 +604,11 @@ class RunPolicyNode(Node):
 
     def _load_model(self):
         """Load trained model and scalers from artifact directory."""
+        # Parse model_type to determine base type and parameters
+        # e.g., 'diffusion_t_seq4_h1' -> base='diffusion_t', seq=4, horizon=1
+        #       'lstm_gmm_seq4' -> base='lstm_gmm', seq=4
+        self._parse_model_type()
+        
         # Auto-detect if not specified
         if not self.artifact_dir:
             self.artifact_dir = self._find_latest_artifact()
@@ -466,11 +628,16 @@ class RunPolicyNode(Node):
                 self.manifest = json.load(f)
                 self.get_logger().info(f"Loaded manifest: {self.manifest}")
                 
-                # Extract action horizon from manifest if available
-                model_config = self.manifest.get("models", {}).get(self.model_type, {})
+                # Extract action horizon and sequence window from manifest if available
+                model_config = self.manifest.get("models", {}).get(self._base_model_type, {})
                 if model_config.get("temporal", False):
-                    self.action_horizon = model_config.get("seq_len", 16)
-                    self.get_logger().info(f"[TEMPORAL] Action horizon set to {self.action_horizon}")
+                    seq_len = model_config.get("seq_len", 16)
+                    self.sequence_window = seq_len  # Update from manifest!
+                    # [FIX] action_horizon is separate from seq_len!
+                    # seq_len = input observation sequence length (e.g., 4 or 16)
+                    # action_horizon = output action sequence length (Seq2One = 1)
+                    self.action_horizon = model_config.get("action_horizon", 1)  # Default 1 for Seq2One
+                    self.get_logger().info(f"[TEMPORAL] sequence_window={self.sequence_window}, action_horizon={self.action_horizon}")
 
         # Load scalers
         scaler_path = artifact_path / "scalers.pkl"
@@ -481,30 +648,109 @@ class RunPolicyNode(Node):
                 self.obs_scaler = scalers.get("obs_scaler") or scalers.get("obs")
                 self.act_scaler = scalers.get("act_scaler") or scalers.get("act")
             self.get_logger().info("Loaded observation and action scalers")
+            
+            # === FIX: Clip scaler scale_ to prevent extreme z-scores ===
+            # Some features (e.g., ee_if_px) have near-zero std in training data,
+            # causing extreme z-scores (>10) for minor deviations in live data.
+            # Clip scale_ to minimum value to prevent OOD scaled values.
+            if self.obs_scaler is not None and hasattr(self.obs_scaler, 'scale_'):
+                min_scale = 0.01  # Minimum scale (1cm for position, 0.01N for force)
+                original_scales = self.obs_scaler.scale_.copy()
+                self.obs_scaler.scale_ = np.maximum(self.obs_scaler.scale_, min_scale)
+                clipped = np.where(original_scales < min_scale)[0]
+                if len(clipped) > 0:
+                    obs_names = [
+                        's1_fx', 's1_fy', 's1_fz', 's2_fx', 's2_fy', 's2_fz',
+                        's3_fx', 's3_fy', 's3_fz', 'deform_ecc',
+                        'ee_if_px', 'ee_if_py', 'ee_if_pz',
+                        'ee_mf_px', 'ee_mf_py', 'ee_mf_pz',
+                        'ee_th_px', 'ee_th_py', 'ee_th_pz',
+                    ]
+                    clipped_names = [obs_names[i] if i < len(obs_names) else f"idx{i}" for i in clipped]
+                    self.get_logger().warning(
+                        f"[SCALER FIX] Clipped scale_ for features with near-zero std: {clipped_names}"
+                    )
+                    for idx in clipped:
+                        name = obs_names[idx] if idx < len(obs_names) else f"idx{idx}"
+                        self.get_logger().info(
+                            f"  {name}: scale {original_scales[idx]:.6f} -> {min_scale:.4f}"
+                        )
         else:
             self.get_logger().warning("No scalers found - using raw values (may degrade performance)")
 
-        # Load model based on type
-        if self.model_type in ["bc", "diffusion_c", "diffusion_t", "diffusion_t_ddim"]:
+        # Load model based on BASE type (not full model_type)
+        base = self._base_model_type
+        if base in ["bc", "diffusion_c", "diffusion_t", "diffusion_t_ddim", "ibc"]:
             if not TORCH_AVAILABLE:
                 raise RuntimeError(f"PyTorch required for {self.model_type} model but not available")
             self._load_torch_model(artifact_path)
-        elif self.model_type in ["gmm", "gmr"]:
+        elif base.startswith("lstm_gmm"):
+            if not TORCH_AVAILABLE:
+                raise RuntimeError(f"PyTorch required for {self.model_type} model but not available")
+            self._load_lstm_gmm_model(artifact_path)
+        elif base in ["gmm", "gmr"]:
             self._load_gmm_model(artifact_path)
         else:
-            raise ValueError(f"Unsupported model type: {self.model_type}")
+            raise ValueError(f"Unsupported model type: {self.model_type} (base: {base})")
 
-        self.get_logger().info(f"Model loaded successfully: {self.model_type}")
+        self.get_logger().info(f"Model loaded successfully: {self.model_type} (base: {base})")
+
+    def _parse_model_type(self):
+        """Parse model_type to extract base type and parameters.
+        
+        Examples:
+        - 'diffusion_t_seq4_h1' -> base='diffusion_t', seq=4, horizon=1
+        - 'lstm_gmm_seq4' -> base='lstm_gmm', seq=4
+        - 'bc' -> base='bc'
+        """
+        import re
+        
+        self._base_model_type = self.model_type
+        self._parsed_seq_len = None
+        self._parsed_horizon = None
+        
+        # Pattern for diffusion_t_seq{N}_h{M}
+        diffusion_match = re.match(r'^(diffusion_[ct])_seq(\d+)_h(\d+)$', self.model_type)
+        if diffusion_match:
+            self._base_model_type = diffusion_match.group(1)
+            self._parsed_seq_len = int(diffusion_match.group(2))
+            self._parsed_horizon = int(diffusion_match.group(3))
+            self.sequence_window = self._parsed_seq_len
+            self.get_logger().info(
+                f"[PARSE] {self.model_type} -> base={self._base_model_type}, "
+                f"seq={self._parsed_seq_len}, horizon={self._parsed_horizon}"
+            )
+            return
+        
+        # Pattern for lstm_gmm_seq{N}
+        lstm_match = re.match(r'^(lstm_gmm)_seq(\d+)$', self.model_type)
+        if lstm_match:
+            self._base_model_type = lstm_match.group(1)
+            self._parsed_seq_len = int(lstm_match.group(2))
+            self.sequence_window = self._parsed_seq_len
+            self.get_logger().info(
+                f"[PARSE] {self.model_type} -> base={self._base_model_type}, seq={self._parsed_seq_len}"
+            )
+            return
+        
+        # No parsing needed for simple types
+        self.get_logger().info(f"[PARSE] {self.model_type} -> base={self._base_model_type} (no params)")
+
 
     def _load_torch_model(self, artifact_path: Path):
-        """Load PyTorch-based model (BC or Diffusion)."""
+        """Load PyTorch-based model (BC, Diffusion, or IBC)."""
         model_map = {
             "bc": "bc.pt",
             "diffusion_c": "diffusion_c.pt",
             "diffusion_t": "diffusion_t.pt",
             "diffusion_t_ddim": "diffusion_t.pt",
+            "ibc": "ibc.pt",
         }
-        model_path = artifact_path / model_map[self.model_type]
+        # Use base model type (parsed from model_type like diffusion_t_seq4_h1 -> diffusion_t)
+        base_type = self._base_model_type
+        if base_type not in model_map:
+            raise KeyError(f"Unknown base model type: {base_type} (from {self.model_type})")
+        model_path = artifact_path / model_map[base_type]
         
         # [PERFORMANCE] Use GPU if available for faster inference
         self.inference_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -512,7 +758,7 @@ class RunPolicyNode(Node):
         
         checkpoint = torch.load(model_path, map_location=self.inference_device)
 
-        if self.model_type == "bc":
+        if base_type == "bc":
             # Reconstruct BC model from config
             config = checkpoint.get("config", {})
             obs_dim = config.get("obs_dim", 19)
@@ -529,17 +775,22 @@ class RunPolicyNode(Node):
                 f"BC model: obs_dim={obs_dim}, act_dim={act_dim}, hidden={hidden_dim}, depth={depth}"
             )
 
-        elif "diffusion" in self.model_type:
+        elif "diffusion" in base_type:
             # Diffusion model requires DiffusionPolicyBaseline class
             # For simplicity, we'll attempt to import from the benchmark script
-            sys.path.insert(0, str(_PKG_ROOT / "scripts" / "3_model_learning"))
+            if _SCRIPTS_PATH and str(_SCRIPTS_PATH) not in sys.path:
+                sys.path.insert(0, str(_SCRIPTS_PATH))
             try:
                 from run_stiffness_policy_benchmarks import DiffusionPolicyBaseline
 
                 # Reconstruct diffusion model
                 config = checkpoint.get("config", {})
-                # Determine if temporal based on model_type suffix ('c' = False, 't' = True)
-                is_temporal = self.model_type.split("_")[1] == "t" if "_" in self.model_type else False
+                # Determine if temporal based on base_type suffix ('c' = False, 't' = True)
+                is_temporal = base_type.split("_")[1] == "t" if "_" in base_type else False
+                
+                # [FIX] Get action_horizon from config (for action chunking models)
+                action_horizon = config.get("action_horizon", 1)
+                self.action_horizon = action_horizon  # Store for inference
                 
                 self.model = DiffusionPolicyBaseline(
                     obs_dim=config.get("obs_dim", 19),
@@ -548,6 +799,7 @@ class RunPolicyNode(Node):
                     time_dim=config.get("time_dim", 16),
                     timesteps=config.get("timesteps", 100),
                     temporal=is_temporal,
+                    action_horizon=action_horizon,  # [FIX] Pass action_horizon!
                     device=self.inference_device,  # [PERFORMANCE] Use GPU
                 )
                 # Try different possible keys for state dict
@@ -565,48 +817,163 @@ class RunPolicyNode(Node):
                     "Diffusion model requires DiffusionPolicyBaseline from run_stiffness_policy_benchmarks.py"
                 )
 
+        elif base_type == "ibc":
+            # IBC (Implicit Behavior Cloning) - energy-based model with Langevin sampling
+            if _SCRIPTS_PATH and str(_SCRIPTS_PATH) not in sys.path:
+                sys.path.insert(0, str(_SCRIPTS_PATH))
+            try:
+                from run_stiffness_policy_benchmarks import IBCBaseline
+
+                config = checkpoint.get("config", {})
+                self.model = IBCBaseline(
+                    obs_dim=config.get("obs_dim", 19),
+                    act_dim=config.get("act_dim", 9),
+                    hidden_dim=config.get("hidden_dim", 256),
+                    depth=config.get("depth", 3),
+                    noise_std=config.get("noise_std", 0.5),
+                    langevin_steps=config.get("langevin_steps", 30),
+                    step_size=config.get("step_size", 1e-2),
+                    device=self.inference_device,
+                )
+                state_dict_key = "model_state_dict" if "model_state_dict" in checkpoint else "state_dict"
+                self.model.model.load_state_dict(checkpoint[state_dict_key])
+                self.model.model.eval()
+
+                self.get_logger().info(
+                    f"IBC model loaded: obs_dim={config.get('obs_dim', 19)}, "
+                    f"langevin_steps={config.get('langevin_steps', 30)}"
+                )
+
+            except ImportError as e:
+                self.get_logger().error(f"Failed to import IBCBaseline: {e}")
+                raise RuntimeError(
+                    "IBC model requires IBCBaseline from run_stiffness_policy_benchmarks.py"
+                )
+
+    def _load_lstm_gmm_model(self, artifact_path: Path):
+        """Load LSTM-GMM model."""
+        model_path = artifact_path / "lstm_gmm.pt"
+        if not model_path.exists():
+            # Try alternative naming
+            for alt in ["lstm_gmm_seq4.pt", "lstm_gmm_seq8.pt", "lstm_gmm_seq16.pt"]:
+                alt_path = artifact_path / alt
+                if alt_path.exists():
+                    model_path = alt_path
+                    break
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"LSTM-GMM model not found in {artifact_path}")
+        
+        # Import LSTMGMMHead from benchmark script
+        sys.path.insert(0, str(_PKG_ROOT / "scripts" / "3_model_learning"))
+        from run_stiffness_policy_benchmarks import LSTMGMMHead
+        
+        self.inference_device = "cuda" if torch.cuda.is_available() else "cpu"
+        checkpoint = torch.load(model_path, map_location=self.inference_device)
+        
+        config = checkpoint.get("config", {})
+        obs_dim = config.get("obs_dim", 19)
+        act_dim = config.get("act_dim", 9)
+        hidden_dim = config.get("hidden_dim", 256)
+        n_layers = config.get("n_layers", 1)
+        n_components = config.get("n_components", 5)
+        self.sequence_window = config.get("seq_len", 4)  # Update sequence window from config
+        
+        self.model = LSTMGMMHead(obs_dim, act_dim, hidden_dim, n_layers, n_components)
+        state_dict_key = "state_dict" if "state_dict" in checkpoint else "model_state_dict"
+        self.model.load_state_dict(checkpoint[state_dict_key])
+        self.model.to(self.inference_device)
+        self.model.eval()
+        
+        self.get_logger().info(
+            f"LSTM-GMM model loaded: obs_dim={obs_dim}, act_dim={act_dim}, "
+            f"hidden={hidden_dim}, layers={n_layers}, components={n_components}, seq_len={self.sequence_window}"
+        )
+
     def _load_gmm_model(self, artifact_path: Path):
-        """Load GMM/GMR model."""
-        model_path = artifact_path / "gmm_model.pkl"
-
-        with open(model_path, "rb") as f:
-            gmm_data = pickle.load(f)
-
-        if self.model_type == "gmm":
-            self.model = gmm_data.get("gmm")
-        else:  # gmr
-            self.model = gmm_data  # GMR uses the full dict with regression helpers
-
-        self.get_logger().info(f"GMM/GMR model loaded from {model_path}")
+        """Load GMM/GMR model (GMMConditional with built-in predict method)."""
+        model_path = artifact_path / "gmm.pkl"
+        
+        # GMMConditional class must be available for unpickling
+        if _SCRIPTS_PATH and str(_SCRIPTS_PATH) not in sys.path:
+            sys.path.insert(0, str(_SCRIPTS_PATH))
+        
+        try:
+            from run_stiffness_policy_benchmarks import GMMConditional
+            
+            # CRITICAL: Register GMMConditional in globals for pickle to find it
+            # pickle looks for classes in the module where the pickle was loaded,
+            # so we need to make it available in the current namespace
+            import __main__
+            __main__.GMMConditional = GMMConditional
+            
+            with open(model_path, "rb") as f:
+                self.model = pickle.load(f)  # This is a GMMConditional object
+            
+            self.get_logger().info(
+                f"GMM/GMR model loaded from {model_path}: "
+                f"obs_dim={getattr(self.model, 'obs_dim', 'N/A')}, "
+                f"act_dim={getattr(self.model, 'act_dim', 'N/A')}"
+            )
+        except ImportError as e:
+            self.get_logger().error(f"Failed to import GMMConditional: {e}")
+            raise RuntimeError(
+                "GMM/GMR model requires GMMConditional from run_stiffness_policy_benchmarks.py"
+            )
 
     def _get_observation(self) -> Optional[np.ndarray]:
         """Construct 19D observation vector from current sensor data.
         
-        Uses SMOOTHED eccentricity for stable policy predictions.
+        Uses RAW eccentricity (matches training data, no smoothing applied).
+        [BASELINE REMOVAL] Force values have baseline subtracted (matches training preprocessing).
         """
-        # ALL sensors are REQUIRED: forces, ee_positions, deform_ecc_smoothed
+        # ALL sensors are REQUIRED: forces, ee_positions, deform_ecc_raw
         forces_ready = all(f is not None for f in self.forces)
         ee_ready = all((p is not None and isinstance(p, np.ndarray) and p.size == 3 and np.all(np.isfinite(p)))
                        for p in self.ee_positions.values())
-        deform_ready = self.deform_ecc_smoothed is not None and isinstance(self.deform_ecc_smoothed, (int, float))
+        deform_ready = self.deform_ecc_raw is not None and isinstance(self.deform_ecc_raw, (int, float))
         
-        if not (forces_ready and ee_ready and deform_ready):
+        # Also require force calibration to be complete
+        calibration_ready = self.force_calibrated
+        
+        if not (forces_ready and ee_ready and deform_ready and calibration_ready):
             return None
 
         obs = []
 
-        # Force features (9D: s1/s2/s3 fx/fy/fz)
+        # Force features (9D: s1/s2/s3 fx/fy/fz) - WITH BASELINE REMOVAL + INFLUENCE CONTROL
+        sensor_keys = ['s1', 's2', 's3']
         for i in range(3):
             f = self.forces[i]
-            if f is not None:
-                obs.extend([f["fx"], f["fy"], f["fz"]])
+            baseline = self.force_baselines[i]
+            if f is not None and baseline is not None:
+                # Subtract baseline: Fc = F - baseline (matches training preprocessing)
+                fx_raw = f["fx"] - baseline["fx"]
+                fy_raw = f["fy"] - baseline["fy"]
+                fz_raw = f["fz"] - baseline["fz"]
+                
+                # Apply force amplification: scale up to match training data distribution
+                # Live force is typically ~20-50% of training std, so amplify to compensate
+                fx_amp = fx_raw * self.force_amplify
+                fy_amp = fy_raw * self.force_amplify
+                fz_amp = fz_raw * self.force_amplify
+                
+                # Apply force influence: blend actual force with training mean
+                # force_influence=1.0: full actual force
+                # force_influence=0.0: training mean (effectively removes force influence)
+                train_mean = self.force_training_mean[sensor_keys[i]]
+                alpha = self.force_influence
+                fx = alpha * fx_amp + (1 - alpha) * train_mean['fx']
+                fy = alpha * fy_amp + (1 - alpha) * train_mean['fy']
+                fz = alpha * fz_amp + (1 - alpha) * train_mean['fz']
+                
+                obs.extend([fx, fy, fz])
             else:
-                # Should not happen since we gate on forces_ready
+                # Should not happen since we gate on forces_ready and calibration_ready
                 obs.extend([0.0, 0.0, 0.0])
 
-        # Eccentricity (1D) - USE SMOOTHED VALUE to reduce noise/jitter
-        # deform_ecc_smoothed is moving-average filtered in _on_deform_ecc callback
-        obs.append(self.deform_ecc_smoothed if self.deform_ecc_smoothed is not None else 0.0)
+        # Eccentricity (1D) - USE RAW VALUE (matches training data, no smoothing)
+        obs.append(self.deform_ecc_raw if self.deform_ecc_raw is not None else 0.0)
 
         # End-effector positions (9D: if/mf/th px/py/pz)
         for finger in ["if", "mf", "th"]:
@@ -664,34 +1031,43 @@ class RunPolicyNode(Node):
                     # )
                     pass
             
-            # [CRITICAL] Build observation sequence for temporal model (diffusion_t)
-            # Add current observation to history buffer
-            self.obs_history.append(obs_scaled[0].copy())  # (obs_dim,)
-            if len(self.obs_history) > self.sequence_window:
-                self.obs_history.pop(0)  # Keep only last sequence_window observations
-            
-            # Create sequence input: (1, seq_len, obs_dim)
-            if len(self.obs_history) < self.sequence_window:
-                # Pad with first observation if not enough history
-                pad_count = self.sequence_window - len(self.obs_history)
-                padded_hist = [self.obs_history[0]] * pad_count + list(self.obs_history)
-                obs_seq = np.array(padded_hist)[np.newaxis, :, :]  # (1, seq_len, obs_dim)
-            else:
-                obs_seq = np.array(list(self.obs_history))[np.newaxis, :, :]  # (1, seq_len, obs_dim)
-            
-            # Debug log observation sequence shape (every 0.5 seconds instead of 2)
-            if self._log_counter % int(self.rate_hz * 0.5) == 0:
-                self.get_logger().info(
-                    f"[POLICY] obs_seq shape: {obs_seq.shape}, history_len: {len(self.obs_history)}"
-                )
-            
             # [CRITICAL] Use fewer inference steps for real-time performance
-            # DDIM with 10-15 steps is ~5-7x faster than 75 steps with minimal quality loss
             n_inference_steps = 10  # 75 -> 10 steps = ~7x speedup
             
-            # Predict action (shape: (1, 9) for Seq2One model)
+            # Check if model is temporal (diffusion_t) or non-temporal (diffusion_c)
+            is_temporal = getattr(self.model, 'temporal', False) or self.model_type.startswith("diffusion_t")
+            
+            if is_temporal:
+                # [TEMPORAL MODEL: diffusion_t] Build observation sequence
+                self.obs_history.append(obs_scaled[0].copy())  # (obs_dim,)
+                if len(self.obs_history) > self.sequence_window:
+                    self.obs_history.pop(0)  # Keep only last sequence_window observations
+                
+                # Create sequence input: (1, seq_len, obs_dim)
+                if len(self.obs_history) < self.sequence_window:
+                    # Pad with first observation if not enough history
+                    pad_count = self.sequence_window - len(self.obs_history)
+                    padded_hist = [self.obs_history[0]] * pad_count + list(self.obs_history)
+                    obs_input = np.array(padded_hist)[np.newaxis, :, :]  # (1, seq_len, obs_dim)
+                else:
+                    obs_input = np.array(list(self.obs_history))[np.newaxis, :, :]  # (1, seq_len, obs_dim)
+                
+                if self._log_counter % int(self.rate_hz * 0.5) == 0:
+                    self.get_logger().info(
+                        f"[POLICY] diffusion_t obs_seq shape: {obs_input.shape}, history_len: {len(self.obs_history)}"
+                    )
+            else:
+                # [NON-TEMPORAL MODEL: diffusion_c] Use 2D input directly
+                obs_input = obs_scaled  # (1, obs_dim)
+                
+                if self._log_counter % int(self.rate_hz * 0.5) == 0:
+                    self.get_logger().info(
+                        f"[POLICY] diffusion_c obs shape: {obs_input.shape}"
+                    )
+            
+            # Predict action
             action_seq = self.model.predict(
-                obs_seq, 
+                obs_input, 
                 n_samples=1, 
                 sampler=sampler, 
                 eta=0.0,
@@ -715,22 +1091,62 @@ class RunPolicyNode(Node):
                     f"[POLICY] Seq2One output shape: {action_seq.shape}, act_scaled[:3]={act_scaled[0, :3]}"
                 )
 
+        elif self.model_type.startswith("lstm_gmm"):
+            # LSTM-GMM: requires sequence of observations
+            self.obs_history.append(obs_scaled[0].copy())
+            if len(self.obs_history) > self.sequence_window:
+                self.obs_history.pop(0)
+            
+            # Pad if needed
+            if len(self.obs_history) < self.sequence_window:
+                pad_count = self.sequence_window - len(self.obs_history)
+                padded_hist = [self.obs_history[0]] * pad_count + list(self.obs_history)
+                obs_seq = np.array(padded_hist, dtype=np.float32)[np.newaxis, :, :]
+            else:
+                obs_seq = np.array(list(self.obs_history), dtype=np.float32)[np.newaxis, :, :]
+            
+            with torch.no_grad():
+                seq_tensor = torch.from_numpy(obs_seq).to(self.inference_device)
+                mean, logvar, logits = self.model(seq_tensor)
+                # Weighted mean prediction (most stable)
+                weights = torch.softmax(logits, dim=-1)
+                pred = torch.sum(weights.unsqueeze(-1) * mean, dim=1)
+                act_scaled = pred.cpu().numpy()
+            
+            if self._log_counter % int(self.rate_hz * 0.5) == 0:
+                self.get_logger().info(
+                    f"[LSTM-GMM] seq shape: {obs_seq.shape}, pred: {act_scaled[0, :3]}"
+                )
+
         elif self.model_type == "gmm":
-            # GMM sampling
-            act_scaled = self.model.sample(1)[0].reshape(1, -1)
+            # GMM: Conditional sampling from mixture (sample from predicted distribution)
+            # GMMConditional.predict with mode="sample" samples from conditional distribution
+            act_scaled = self.model.predict(obs_scaled, mode="sample", n_samples=1)
+            
+            if self._log_counter % int(self.rate_hz * 0.5) == 0:
+                self.get_logger().info(
+                    f"[GMM] obs shape: {obs_scaled.shape}, pred: {act_scaled[0, :3]}"
+                )
 
         elif self.model_type == "gmr":
-            # GMR regression (requires conditional expectation computation)
-            # Simplified: assuming the dict has a 'predict' method
-            if hasattr(self.model, "predict"):
-                act_scaled = self.model.predict(obs_scaled)
-            else:
-                # Fallback to GMM sampling if no predict method
-                gmm = self.model.get("gmm")
-                if gmm:
-                    act_scaled = gmm.sample(1)[0].reshape(1, -1)
-                else:
-                    act_scaled = np.zeros((1, 9))
+            # GMR: Gaussian Mixture Regression - conditional expectation (mean)
+            # GMMConditional.predict with mode="mean" computes weighted mean of conditional
+            act_scaled = self.model.predict(obs_scaled, mode="mean")
+            
+            if self._log_counter % int(self.rate_hz * 0.5) == 0:
+                self.get_logger().info(
+                    f"[GMR] obs shape: {obs_scaled.shape}, pred: {act_scaled[0, :3]}"
+                )
+
+        elif self.model_type == "ibc":
+            # IBC (Implicit Behavior Cloning) - energy-based model with Langevin sampling
+            # Uses 2D input: (B, obs_dim) -> (B, act_dim)
+            act_scaled = self.model.predict(obs_scaled, n_samples=1)
+            
+            if self._log_counter % int(self.rate_hz * 0.5) == 0:
+                self.get_logger().info(
+                    f"[IBC] obs shape: {obs_scaled.shape}, pred: {act_scaled[0, :3]}"
+                )
 
         else:
             act_scaled = np.zeros((1, 9))
@@ -738,6 +1154,14 @@ class RunPolicyNode(Node):
         # [DEBUG] Log scaled action (every 2 seconds)
         if self._log_counter % int(self.rate_hz * 2) == 0:
             self.get_logger().info(f"[POLICY] Scaled action (act_scaled): {act_scaled[0, :3]}")
+
+        # === Z-SCORE AMPLIFICATION ===
+        # Model outputs narrow z-score range. Amplify to get fuller stiffness range.
+        # act_scaled is already z-score (StandardScaler normalized), so we can directly amplify.
+        if self.stiffness_z_amp != 1.0:
+            act_scaled = act_scaled * self.stiffness_z_amp
+            if self._log_counter % int(self.rate_hz * 2) == 0:
+                self.get_logger().info(f"[POLICY] Amplified z-score (x{self.stiffness_z_amp}): {act_scaled[0, :3]}")
 
         # Inverse scale
         if self.act_scaler:
@@ -899,9 +1323,10 @@ class RunPolicyNode(Node):
             # Predict stiffness (9D)
             stiffness = self._predict_stiffness(obs)
 
-            # Apply time-based scaling BEFORE smoothing
+            # [CHANGED] time_scale is now applied in torque_impedance_controller, not here
+            # This ensures stiffness.csv logs the raw policy output for analysis
             stiffness_before_scale = stiffness.copy()
-            stiffness = stiffness * time_scale
+            # stiffness = stiffness * time_scale  # REMOVED - applied in controller
             
             # [DEBUG] Save pre-LP filter value for comparison
             stiffness_before_lp = stiffness.copy()
@@ -976,8 +1401,9 @@ class RunPolicyNode(Node):
             self._log_counter += 1
 
         except Exception as e:
-            # self.get_logger().error(f"Control callback error: {e}")
-            pass
+            self.get_logger().error(f"Control callback error: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
 
     def _save_debug_log(self):
         """Save collected debug data to CSV for analysis."""

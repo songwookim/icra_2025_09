@@ -100,6 +100,7 @@ class RobotControllerNode(Node):
         self.declare_parameter('max_current_units_pos', 500)  # test_torqueinputs 양수 리미트
         self.declare_parameter('max_current_units_neg', 500)  # test_torqueinputs 음수 리미트
         self.declare_parameter('max_pwm_limit', 500)  # [SAFETY] PWM limit - stop if exceeded (XM430: 885=100%)
+        self.declare_parameter('position_pwm_limit', 20)  # [SAFETY] PWM limit for position control mode (gentler movement)
         # 정책 준비 전까지 force control 입력을 지연할지 여부
         self.declare_parameter('defer_force_control_until_policy', True)
         # hand enable/disable parameters removed (always enabled)
@@ -435,6 +436,9 @@ class RobotControllerNode(Node):
         targets = list(msg.data[:len(self.ids)])
         self.get_logger().info(f"[Goal Position] Received: {targets[:3]}... -> switching to position mode")
         
+        # Get position PWM limit (gentler movement for safety)
+        position_pwm_limit = int(self.get_parameter('position_pwm_limit').value or 20)
+        
         # Temporarily switch to position mode to move robot
         if self.controller is not None and self._force_mode_active:
             try:
@@ -444,6 +448,14 @@ class RobotControllerNode(Node):
                 position_mode = 3  # Extended Position Control Mode
                 self.controller.set_operating_mode_all(position_mode)
                 time.sleep(0.05)
+                
+                # [SAFETY] Set PWM limit for position control (gentler movement)
+                try:
+                    self.controller.set_pwm_limit(position_pwm_limit)
+                    self.get_logger().info(f"[Goal Position] PWM limit set to {position_pwm_limit}")
+                except Exception as pwm_e:
+                    self.get_logger().warn(f"[Goal Position] Failed to set PWM limit: {pwm_e}")
+                
                 self.controller.enable_torque()
                 self.mode = position_mode
                 self._force_mode_active = False
@@ -567,11 +579,11 @@ class RobotControllerNode(Node):
             self.pwm_pub.publish(pwm_msg)
             
             # Log every 50 calls (~1 second at 50Hz)
-            if self._torque_log_counter % 50 == 0:
-                self.get_logger().info(
-                    f"[PWM_MONITOR] PWM: th={present_pwm[:3]}, if={present_pwm[3:6]}, mf={present_pwm[6:9]} "
-                    f"| MAX={max_pwm} ({pwm_percent:.1f}%) | Goal_current={currents[:3]}"
-                )
+            # if self._torque_log_counter % 50 == 0:
+            #     self.get_logger().info(
+            #         f"[PWM_MONITOR] PWM: th={present_pwm[:3]}, if={present_pwm[3:6]}, mf={present_pwm[6:9]} "
+            #         f"| MAX={max_pwm} ({pwm_percent:.1f}%) | Goal_current={currents[:3]}"
+            #     )
             
             # [SAFETY] If PWM exceeds limit, scale down currents proportionally (don't stop!)
             if max_pwm > self.max_pwm_limit:

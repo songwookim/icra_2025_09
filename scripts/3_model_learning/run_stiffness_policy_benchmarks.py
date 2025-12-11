@@ -8,16 +8,12 @@ cd /home/songwoo/ros2_ws/icra2025
 
 echo "[1/2] Unified 시작"
 python3 src/hri_falcon_robot_bridge/scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
-  --models all --mode unified
-
-echo "[2/2] Per-finger 시작"
-python3 src/hri_falcon_robot_bridge/scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
-  --models all --mode per-finger
+  --models all
 
 echo "✅ 완료"
 --------------------------
 This script pairs the raw demonstrations under ``outputs/logs/success`` with the
-low-pass stiffness reconstructions stored in ``outputs/stiffness_profiles``.
+low-pass stiffness reconstructions stored in ``outputs/stiffness_profiles_signaligned``.
 Observations ``O`` are built from force magnitudes, deformity descriptors, and end
 -effector positions, while actions ``a`` are the reconstructed stiffness profiles.
 
@@ -270,21 +266,6 @@ ACTION_COLUMNS = [
     "mf_k3",
 ]
 
-# Per-finger observation and action columns (for independent models)
-FINGER_CONFIG = {
-    "th": {
-        "obs": ["s1_fx", "s1_fy", "s1_fz", "ee_th_px", "ee_th_py", "ee_th_pz", "deform_ecc"],
-        "act": ["th_k1", "th_k2", "th_k3"],
-    },
-    "if": {
-        "obs": ["s2_fx", "s2_fy", "s2_fz", "ee_if_px", "ee_if_py", "ee_if_pz", "deform_ecc"],
-        "act": ["if_k1", "if_k2", "if_k3"],
-    },
-    "mf": {
-        "obs": ["s3_fx", "s3_fy", "s3_fz", "ee_mf_px", "ee_mf_py", "ee_mf_pz", "deform_ecc"],
-        "act": ["mf_k1", "mf_k2", "mf_k3"],
-    },
-}
 EPS = 1e-8
 
 
@@ -516,154 +497,6 @@ def load_dataset(stiffness_dir: Path, stride: int, include_aug: bool = False) ->
     
     if not trajectories:
         raise RuntimeError(f"No valid demonstrations found in {stiffness_dir}")
-    return trajectories
-
-
-def _load_single_demo_per_finger(
-    log_path: Path, stiffness_dir: Path, stride: int, finger: str
-) -> Optional[Trajectory]:
-    """Load a single demo for one finger (th/if/mf) with finger-specific obs/act columns."""
-    if finger not in FINGER_CONFIG:
-        raise ValueError(f"Invalid finger: {finger}. Must be one of {list(FINGER_CONFIG.keys())}")
-    
-    obs_cols = FINGER_CONFIG[finger]["obs"]
-    act_cols = FINGER_CONFIG[finger]["act"]
-    
-    try:
-        raw = pd.read_csv(log_path)
-    except Exception as exc:
-        print(f"[skip] {log_path.name} ({finger}): load failed ({exc})")
-        return None
-
-    try:
-        stiff = pd.read_csv(_resolve_stiffness_csv(stiffness_dir, log_path.stem))
-    except Exception as exc:
-        print(f"[skip] {log_path.name} ({finger}): stiffness load failed ({exc})")
-        return None
-
-    rows = min(len(raw), len(stiff))
-    if rows < 5:
-        print(f"[skip] {log_path.name} ({finger}): insufficient paired samples ({rows})")
-        return None
-
-    raw = raw.iloc[:rows].reset_index(drop=True)
-    stiff = stiff.iloc[:rows].reset_index(drop=True)
-
-    # Backward compatibility: if ee_if_px/py/pz is missing, use ee_px/py/pz
-    ee_finger_prefix = f"ee_{finger}_"
-    legacy_prefix = "ee_"
-    for axis in ["px", "py", "pz"]:
-        new_col = f"{ee_finger_prefix}{axis}"
-        old_col = f"{legacy_prefix}{axis}"
-        if new_col not in raw.columns and old_col in raw.columns:
-            raw[new_col] = raw[old_col]
-
-    # Check if all required columns exist
-    missing_obs = [col for col in obs_cols if col not in raw.columns and col not in stiff.columns]
-    if missing_obs:
-        print(f"[skip] {log_path.name} ({finger}): missing observation columns {missing_obs}")
-        return None
-
-    missing_act = [col for col in act_cols if col not in stiff.columns]
-    if missing_act:
-        print(f"[skip] {log_path.name} ({finger}): missing action columns {missing_act}")
-        return None
-
-    # Build observation array
-    obs_parts: List[np.ndarray] = []
-    for col in obs_cols:
-        if col in stiff.columns:
-            obs_parts.append(stiff[col].to_numpy(dtype=float).reshape(-1, 1))
-        else:
-            obs_parts.append(raw[col].to_numpy(dtype=float).reshape(-1, 1))
-    obs = np.hstack(obs_parts)
-
-    # Build action array
-    act = stiff[act_cols].to_numpy(dtype=float)
-
-    # Filter invalid values
-    mask = np.isfinite(obs).all(axis=1) & np.isfinite(act).all(axis=1)
-    obs = obs[mask]
-    act = act[mask]
-    
-    if stride > 1:
-        obs = obs[::stride]
-        act = act[::stride]
-        
-    if obs.shape[0] < 5:
-        print(f"[skip] {log_path.name} ({finger}): too few samples after filtering ({obs.shape[0]})")
-        return None
-
-    return Trajectory(name=f"{log_path.stem}_{finger}", observations=obs, actions=act)
-
-
-def load_dataset_per_finger(stiffness_dir: Path, stride: int, finger: str, include_aug: bool = False) -> List[Trajectory]:
-    """Load finger-specific demonstrations from stiffness_profiles directory."""
-    if finger not in FINGER_CONFIG:
-        raise ValueError(f"Invalid finger: {finger}. Must be one of {list(FINGER_CONFIG.keys())}")
-    
-    obs_cols = FINGER_CONFIG[finger]["obs"]
-    act_cols = FINGER_CONFIG[finger]["act"]
-    trajectories: List[Trajectory] = []
-    
-    all_csvs = sorted(stiffness_dir.glob("*.csv"))
-    from collections import defaultdict
-    stem_groups = defaultdict(list)
-    for csv_path in all_csvs:
-        stem = csv_path.stem
-        if "_aug" in stem:
-            base_stem = stem.split("_aug")[0]
-        else:
-            base_stem = stem
-        stem_groups[base_stem].append(csv_path)
-    
-    for base_stem, csv_list in stem_groups.items():
-        if include_aug:
-            paths_to_load = csv_list
-        else:
-            paths_to_load = [p for p in csv_list if "_aug" not in p.stem]
-        
-        for csv_path in paths_to_load:
-            try:
-                df = pd.read_csv(csv_path)
-            except Exception:
-                continue
-            
-            if len(df) < 5:
-                continue
-            
-            # Backward compatibility for ee finger pose columns
-            ee_prefix = f"ee_{finger}_"
-            for axis in ["px", "py", "pz"]:
-                new_col = f"{ee_prefix}{axis}"
-                legacy_col = "ee_" + axis
-                if new_col not in df.columns and legacy_col in df.columns:
-                    df[new_col] = df[legacy_col]
-            
-            missing_obs = [c for c in obs_cols if c not in df.columns]
-            missing_act = [c for c in act_cols if c not in df.columns]
-            if missing_obs or missing_act:
-                continue
-            
-            obs = df[obs_cols].to_numpy(dtype=float)
-            act = df[act_cols].to_numpy(dtype=float)
-            
-            mask = np.isfinite(obs).all(axis=1) & np.isfinite(act).all(axis=1)
-            obs = obs[mask]
-            act = act[mask]
-            
-            if stride > 1:
-                obs = obs[::stride]
-                act = act[::stride]
-            
-            if obs.shape[0] < 5:
-                continue
-            
-            traj_name = f"{csv_path.stem}_{finger}"
-            trajectories.append(Trajectory(name=traj_name, observations=obs, actions=act))
-    
-    if not trajectories:
-        raise RuntimeError(f"No valid demonstrations found for finger '{finger}' in {stiffness_dir}")
     return trajectories
 
 
@@ -1843,11 +1676,11 @@ def parse_args() -> argparse.Namespace:
     seed_default = int(training_defaults.get("seed", 0))
     stride_default = int(training_defaults.get("stride", 1))
     test_size_default = float(training_defaults.get("test_size", 0.25))
-    sequence_window_default = _first_available_int(
+    seq_len_default = _first_available_int(
         (
-            training_defaults.get("sequence_window"),
-            DIFF_TEMP_CONFIG.get("sequence_window"),
-            LSTM_GMM_CONFIG.get("sequence_window"),
+            training_defaults.get("seq_len", training_defaults.get("sequence_window")),
+            DIFF_TEMP_CONFIG.get("seq_len", DIFF_TEMP_CONFIG.get("sequence_window")),
+            LSTM_GMM_CONFIG.get("seq_len", LSTM_GMM_CONFIG.get("sequence_window")),
         ),
         1,
     )
@@ -1896,13 +1729,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory with stiffness profile CSVs (contains both obs and actions)",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for benchmark artifacts")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="unified",
-        choices=["unified", "per-finger"],
-        help="Training mode: 'unified' (all obs->all act, 20D->9D) or 'per-finger' (3 independent models, 8D->3D each)",
-    )
+    # NOTE: per-finger mode has been removed. Only unified mode is supported.
     parser.add_argument(
         "--use-emg",
         action="store_true",
@@ -1922,7 +1749,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional CSV stem to reserve as the only evaluation trajectory (overrides --test-size)",
     )
     parser.add_argument("--stride", type=int, default=stride_default, help="Subsample demonstrations by stride")
-    parser.add_argument("--sequence-window", type=int, default=sequence_window_default, help="Temporal window length for sequence models")
+    parser.add_argument("--seq-len", type=int, default=seq_len_default, help="Temporal window length for sequence models (observation history)")
+    parser.add_argument("--action-horizon", type=int, default=1, help="Action chunking horizon (predict N future actions)")
     parser.add_argument("--seed", type=int, default=seed_default, help="Random seed")
     parser.add_argument("--gmm-components", type=int, default=gmm_components_default, help="Number of mixture components")
     parser.add_argument(
@@ -2071,20 +1899,10 @@ def main() -> None:
         removed = sorted(exclude_requested)
         print(f"[info] Excluding models: {', '.join(removed)} (remaining: {', '.join(after)})")
 
-    # Branch based on mode
+    # Run unified mode
     obs_dim = len(OBS_COLUMNS)
-    if args.mode == "per-finger":
-        print(f"[info] Running in per-finger mode (3 independent models: th, if, mf)")
-        if args.use_emg:
-            print(f"[warn] Per-finger mode with EMG not implemented yet. Using unified mode.")
-            args.mode = "unified"
-        else:
-            run_per_finger_benchmarks(args, models_requested)
-            return
-    
-    if args.mode == "unified":
-        print(f"[info] Running in unified mode (single model: {obs_dim}D obs -> 9D act)")
-        run_unified_benchmarks(args, models_requested)
+    print(f"[info] Running in unified mode (single model: {obs_dim}D obs -> 9D act)")
+    run_unified_benchmarks(args, models_requested)
 
 
 def _is_global_stiffness_dir(stiffness_dir: Path) -> bool:
@@ -2102,12 +1920,9 @@ def _resolve_artifact_and_tb_dirs(
 ) -> Tuple[Path, Optional[Path]]:
     """Return artifact root and tensorboard run dir.
     
-    Simple 2-way directory separation (unified vs per-finger):
-        policy_learning_unified/
-        policy_learning_per_finger/
+    Store results under policy_learning_unified/.
     """
-    mode_suffix = "per_finger" if mode == "per-finger" else "unified"
-    full_dir_name = f"policy_learning_{mode_suffix}"
+    full_dir_name = "policy_learning_unified"
 
     # Store mode-specific results directly under `outputs/models/<policy_learning_mode>`
     policy_learning_dir = base_output / full_dir_name
@@ -2165,7 +1980,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
     train_traj_scaled = scale_trajectories(train_traj, obs_scaler, act_scaler)
     test_traj_scaled = scale_trajectories(test_traj, obs_scaler, act_scaler)
 
-    window = max(1, args.sequence_window)
+    window = max(1, args.seq_len)
     train_offsets = compute_offsets(train_traj)
     test_offsets = compute_offsets(test_traj)
     train_seq_obs, train_seq_act_s, train_seq_act_raw, _ = build_sequence_dataset(
@@ -2217,7 +2032,8 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             manifest = {
                 "timestamp": timestamp,
                 "scalers": "scalers.pkl",
-                "sequence_window": window,
+                "seq_len": window,
+                "action_horizon": args.action_horizon,
                 "models": {},
                 "train_trajectories": [t.name for t in train_traj],
                 "test_trajectories": [t.name for t in test_traj],
@@ -2243,7 +2059,8 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
         manifest: Dict[str, Any] = {
             "timestamp": timestamp,
             "scalers": scalers_path.name,
-            "sequence_window": window,
+            "seq_len": window,
+            "action_horizon": args.action_horizon,
             "models": {},
             "train_trajectories": [t.name for t in train_traj],
             "test_trajectories": [t.name for t in test_traj],
@@ -2796,7 +2613,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             )
             diffusion_t.model.load_state_dict(checkpoint["state_dict"])  # type: ignore
         else:
-            print("[info] training diffusion policy (temporal) ...")
+            print(f"[info] training diffusion policy (temporal, action_horizon={args.action_horizon}) ...")
             diffusion_t = DiffusionPolicyBaseline(
                 obs_dim=train_seq_obs.shape[-1],
                 act_dim=train_seq_act_s.shape[1] if train_seq_act_s.size else train_act_s.shape[1],
@@ -2808,6 +2625,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
                 seed=args.seed,
                 log_name="diffusion_t",
                 temporal=True,
+                action_horizon=args.action_horizon,
             )
             diff_t_writer = make_writer(run_tensorboard_dir, "diffusion_t")
             diffusion_t.fit(train_seq_obs, train_seq_act_s, writer=diff_t_writer)
@@ -2825,6 +2643,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             "seed": args.seed,
             "temporal": True,
             "seq_len": window,
+            "action_horizon": args.action_horizon,
         }
         torch.save(
             {
@@ -2838,6 +2657,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             "path": diffusion_t_artifact.name,
             "temporal": True,
             "seq_len": window,
+            "action_horizon": args.action_horizon,
             "sampler": "ddpm",
             "eta": 0.0,
         }
@@ -2872,6 +2692,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             "path": diffusion_t_artifact.name,
             "temporal": True,
             "seq_len": window,
+            "action_horizon": args.action_horizon,
             "sampler": "ddim",
             "eta": diffusion_eta,
         }
@@ -3138,7 +2959,7 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
             "lstm_gmm_components": args.lstm_gmm_components,
             "lstm_gmm_hidden": args.lstm_gmm_hidden,
             "lstm_gmm_layers": args.lstm_gmm_layers,
-            "sequence_window": window,
+            "seq_len": window,
             "ibc_noise_std": args.ibc_noise_std,
             "ibc_langevin_steps": args.ibc_langevin_steps,
             "ibc_step_size": args.ibc_step_size,
@@ -3151,570 +2972,5 @@ def run_unified_benchmarks(args, models_requested: set) -> None:
     print(f"[done] artifacts stored in {artifacts_root}")
 
 
-def run_per_finger_benchmarks(args, models_requested: set) -> None:
-    """Per-finger training: 3 independent models (th: 8D->3D, if: 8D->3D, mf: 8D->3D)."""
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    
-    # Resolve artifact/tensorboard directories
-    artifacts_root, run_tensorboard_dir = _resolve_artifact_and_tb_dirs(
-        base_output=args.output_dir,
-        base_tb=args.tensorboard_dir,
-        stiffness_dir=args.stiffness_dir,
-        timestamp=timestamp,
-        mode="per-finger",
-    )
-    ensure_dir(artifacts_root)
-    
-    all_results = {}
-    all_manifests = {}
-    
-    for finger in ["th", "if", "mf"]:
-        print(f"\n{'='*80}")
-        print(f"[info] Training models for finger: {finger.upper()}")
-        print(f"{'='*80}")
-        
-        # Load finger-specific data
-        trajectories = load_dataset_per_finger(
-            args.stiffness_dir,
-            stride=max(1, args.stride),
-            finger=finger,
-            include_aug=args.augment,
-        )
-        
-        # Train/test split
-        if args.eval_demo:
-            eval_name = args.eval_demo
-            if eval_name.endswith(".csv"):
-                eval_name = Path(eval_name).stem
-            eval_name_finger = f"{eval_name}_{finger}"
-            candidate = next((t for t in trajectories if t.name == eval_name_finger), None)
-            if candidate is None:
-                print(f"[skip] {finger}: eval demo '{args.eval_demo}' not found")
-                continue
-            train_traj = [t for t in trajectories if t.name != candidate.name]
-            if not train_traj:
-                print(f"[skip] {finger}: need at least one trajectory for training")
-                continue
-            test_traj = [candidate]
-        else:
-            train_traj, test_traj = split_train_test(trajectories, args.test_size, args.seed)
-        
-        train_obs, train_act = flatten_trajectories(train_traj)
-        test_obs, test_act = flatten_trajectories(test_traj)
-        
-        print(f"[{finger}] Train: {train_obs.shape[0]} samples ({len(train_traj)} demos), Test: {test_obs.shape[0]} samples ({len(test_traj)} demos)")
-        print(f"[{finger}] Obs dim: {train_obs.shape[1]}D, Act dim: {train_act.shape[1]}D")
-        
-        # Scaling
-        obs_scaler = StandardScaler()
-        act_scaler = StandardScaler()
-        train_obs_s = obs_scaler.fit_transform(train_obs)
-        test_obs_s = obs_scaler.transform(test_obs)
-        train_act_s = act_scaler.fit_transform(train_act)
-        test_act_s = act_scaler.transform(test_act)
-        
-        # Save scalers for this finger
-        finger_artifact_dir = ensure_dir(artifacts_root / finger)
-        scalers_path = finger_artifact_dir / "scalers.pkl"
-        with scalers_path.open("wb") as fh:
-            pickle.dump({"obs_scaler": obs_scaler, "act_scaler": act_scaler}, fh)
-        
-        finger_results = {}
-        finger_manifest = {
-            "timestamp": timestamp,
-            "finger": finger,
-            "scalers": scalers_path.name,
-            "models": {},
-            "train_trajectories": [t.name for t in train_traj],
-            "test_trajectories": [t.name for t in test_traj],
-        }
-        
-        # Prepare sequence data for LSTM-GMM and temporal models
-        window = int(LSTM_GMM_CONFIG.get("sequence_window", 10))
-        
-        # Build scaled trajectories for sequence dataset
-        train_traj_scaled = [
-            Trajectory(
-                name=t.name,
-                observations=obs_scaler.transform(t.observations),
-                actions=act_scaler.transform(t.actions),
-            )
-            for t in train_traj
-        ]
-        test_traj_scaled = [
-            Trajectory(
-                name=t.name,
-                observations=obs_scaler.transform(t.observations),
-                actions=act_scaler.transform(t.actions),
-            )
-            for t in test_traj
-        ]
-        
-        train_offsets = compute_offsets(train_traj)
-        test_offsets = compute_offsets(test_traj)
-        train_seq_obs, train_seq_act_s, train_seq_act_raw, _ = build_sequence_dataset(
-            train_traj_scaled,
-            train_traj,
-            window,
-            train_offsets,
-        )
-        test_seq_obs, test_seq_act_s, test_seq_act_raw, test_seq_indices = build_sequence_dataset(
-            test_traj_scaled,
-            test_traj,
-            window,
-            test_offsets,
-        )
-        
-        # Train GMM/GMR models
-        if {"gmm", "gmr"} & models_requested:
-            print(f"[{finger}] training Gaussian Mixture Models ...")
-            try:
-                gmm_policy = GMMConditional(
-                    obs_dim=train_obs_s.shape[1],
-                    act_dim=train_act_s.shape[1],
-                    n_components=args.gmm_components,
-                    covariance_type=args.gmm_covariance,
-                    reg_covar=args.gmm_reg_covar,
-                )
-                gmm_policy.fit(train_obs_s, train_act_s)
-                
-                # Save GMM artifact
-                gmm_artifact = finger_artifact_dir / "gmm.pkl"
-                gmm_config = {
-                    "obs_dim": train_obs_s.shape[1],
-                    "act_dim": train_act_s.shape[1],
-                    "n_components": args.gmm_components,
-                    "covariance_type": args.gmm_covariance,
-                    "reg_covar": args.gmm_reg_covar,
-                }
-                with gmm_artifact.open("wb") as fh:
-                    pickle.dump({"config": gmm_config, "model": gmm_policy}, fh)
-                finger_manifest["models"]["gmm"] = {
-                    "kind": "gmm",
-                    "path": gmm_artifact.name,
-                }
-                
-                # Evaluate GMM (stochastic sampling)
-                if "gmm" in models_requested:
-                    gmm_metrics = evaluate_gmm(
-                        gmm_policy,
-                        test_obs_s,
-                        test_act_s,
-                        mode="sample",
-                        n_samples=args.gmm_samples,
-                        act_scaler=act_scaler,
-                        act_test_raw=test_act,
-                    )
-                    print(f"[{finger}] gmm rmse={gmm_metrics['rmse']:.4f} mae={gmm_metrics['mae']:.4f} r2={gmm_metrics['r2']:.4f}")
-                    finger_results["gmm"] = gmm_metrics
-                
-                # Evaluate GMR (deterministic regression)
-                if "gmr" in models_requested:
-                    gmr_metrics = evaluate_gmm(
-                        gmm_policy,
-                        test_obs_s,
-                        test_act_s,
-                        mode="regression",
-                        n_samples=1,
-                        act_scaler=act_scaler,
-                        act_test_raw=test_act,
-                    )
-                    print(f"[{finger}] gmr rmse={gmr_metrics['rmse']:.4f} mae={gmr_metrics['mae']:.4f} r2={gmr_metrics['r2']:.4f}")
-                    finger_results["gmr"] = gmr_metrics
-            except Exception as exc:
-                print(f"[{finger}] gmm/gmr training failed: {exc}")
-        
-        # Train BC model
-        if "bc" in models_requested:
-            print(f"[{finger}] training behavior cloning baseline ...")
-            try:
-                bc_policy = BehaviorCloningBaseline(
-                    obs_dim=train_obs_s.shape[1],
-                    act_dim=train_act_s.shape[1],
-                    hidden_dim=args.bc_hidden,
-                    depth=args.bc_depth,
-                    lr=args.bc_lr,
-                    batch_size=args.bc_batch,
-                    epochs=args.bc_epochs,
-                    weight_decay=args.bc_weight_decay,
-                    log_name=f"bc_{finger}",
-                )
-                bc_writer = make_writer(run_tensorboard_dir, f"bc_{finger}")
-                bc_policy.fit(train_obs_s, train_act_s, writer=bc_writer, verbose=False)
-                
-                # Save BC model
-                bc_artifact = finger_artifact_dir / "bc.pt"
-                bc_config = {
-                    "obs_dim": train_obs_s.shape[1],
-                    "act_dim": train_act_s.shape[1],
-                    "hidden_dim": args.bc_hidden,
-                    "depth": args.bc_depth,
-                    "lr": args.bc_lr,
-                    "batch_size": args.bc_batch,
-                    "epochs": args.bc_epochs,
-                    "weight_decay": args.bc_weight_decay,
-                    "seed": args.seed,
-                }
-                torch.save(
-                    {
-                        "config": bc_config,
-                        "state_dict": {k: v.cpu() for k, v in bc_policy.model.state_dict().items()},
-                    },
-                    bc_artifact,
-                )
-                finger_manifest["models"]["bc"] = {
-                    "kind": "bc",
-                    "path": bc_artifact.name,
-                }
-                
-                # Evaluate
-                pred_act_s = bc_policy.predict(test_obs_s)
-                pred_act = act_scaler.inverse_transform(pred_act_s)
-                
-                metrics = compute_metrics(test_act, pred_act)
-                print(f"[{finger}] bc rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
-                finger_results["bc"] = metrics
-                
-                if bc_writer is not None:
-                    bc_writer.flush()
-                    bc_writer.close()
-            except Exception as exc:
-                print(f"[{finger}] bc training failed: {exc}")
-        
-        # Train LSTM-GMM model
-        if "lstm_gmm" in models_requested:
-            if train_seq_obs.shape[0] == 0 or test_seq_obs.shape[0] == 0:
-                print(f"[{finger}] lstm_gmm skipped (insufficient sequence data)")
-            else:
-                print(f"[{finger}] training LSTM-GMM baseline ...")
-                try:
-                    lstm_gmm = LSTMGMMBaseline(
-                        obs_dim=train_seq_obs.shape[-1],
-                        act_dim=train_seq_act_s.shape[1],
-                        seq_len=window,
-                        n_components=args.lstm_gmm_components,
-                        hidden_dim=args.lstm_gmm_hidden,
-                        n_layers=args.lstm_gmm_layers,
-                        lr=args.lstm_gmm_lr,
-                        batch_size=args.bc_batch,
-                        epochs=args.lstm_gmm_epochs,
-                        seed=args.seed,
-                        log_name=f"lstm_gmm_{finger}",
-                    )
-                    lstm_writer = make_writer(run_tensorboard_dir, f"lstm_gmm_{finger}")
-                    lstm_gmm.fit(train_seq_obs, train_seq_act_s, writer=lstm_writer, verbose=False)
-                    
-                    # Save model
-                    lstm_artifact = finger_artifact_dir / "lstm_gmm.pt"
-                    lstm_config = {
-                        "obs_dim": train_seq_obs.shape[-1],
-                        "act_dim": train_seq_act_s.shape[1],
-                        "seq_len": window,
-                        "n_components": args.lstm_gmm_components,
-                        "hidden_dim": args.lstm_gmm_hidden,
-                        "n_layers": args.lstm_gmm_layers,
-                        "lr": args.lstm_gmm_lr,
-                        "batch_size": args.bc_batch,
-                        "epochs": args.lstm_gmm_epochs,
-                        "seed": args.seed,
-                    }
-                    torch.save(
-                        {
-                            "config": lstm_config,
-                            "state_dict": {k: v.cpu() for k, v in lstm_gmm.model.state_dict().items()},
-                        },
-                        lstm_artifact,
-                    )
-                    finger_manifest["models"]["lstm_gmm"] = {
-                        "kind": "lstm_gmm",
-                        "path": lstm_artifact.name,
-                        "seq_len": window,
-                    }
-                    
-                    # Evaluate
-                    pred_seq_scaled = lstm_gmm.predict(test_seq_obs, mode="mean", n_samples=args.gmm_samples)
-                    pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
-                    metrics = compute_metrics(test_seq_act_raw, pred_seq)
-                    metrics["nll"] = float("nan")
-                    print(f"[{finger}] lstm_gmm rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
-                    finger_results["lstm_gmm"] = metrics
-                    
-                    if lstm_writer is not None:
-                        lstm_writer.flush()
-                        lstm_writer.close()
-                except Exception as exc:
-                    print(f"[{finger}] lstm_gmm training failed: {exc}")
-        
-        # Train Diffusion model
-        if "diffusion_c" in models_requested:
-            print(f"[{finger}] training diffusion policy (conditional) ...")
-            try:
-                diffusion_c = DiffusionPolicyBaseline(
-                    obs_dim=train_obs_s.shape[1],
-                    act_dim=train_act_s.shape[1],
-                    timesteps=args.diffusion_steps,
-                    hidden_dim=args.diffusion_hidden,
-                    lr=args.diffusion_lr,
-                    batch_size=args.diffusion_batch,
-                    epochs=args.diffusion_epochs,
-                    seed=args.seed,
-                    log_name=f"diffusion_c_{finger}",
-                    temporal=False,
-                )
-                diff_c_writer = make_writer(run_tensorboard_dir, f"diffusion_c_{finger}")
-                diffusion_c.fit(train_obs_s, train_act_s, writer=diff_c_writer, verbose=False)
-                
-                # Save model
-                diffusion_c_artifact = finger_artifact_dir / "diffusion_c.pt"
-                diffusion_c_config = {
-                    "obs_dim": train_obs_s.shape[1],
-                    "act_dim": train_act_s.shape[1],
-                    "timesteps": args.diffusion_steps,
-                    "hidden_dim": args.diffusion_hidden,
-                    "time_dim": diffusion_c.model.time_embed.dim if hasattr(diffusion_c.model.time_embed, "dim") else 64,
-                    "lr": args.diffusion_lr,
-                    "batch_size": args.diffusion_batch,
-                    "epochs": args.diffusion_epochs,
-                    "seed": args.seed,
-                    "temporal": False,
-                }
-                torch.save(
-                    {
-                        "config": diffusion_c_config,
-                        "state_dict": {k: v.cpu() for k, v in diffusion_c.model.state_dict().items()},
-                    },
-                    diffusion_c_artifact,
-                )
-                finger_manifest["models"]["diffusion_c"] = {
-                    "kind": "diffusion",
-                    "path": diffusion_c_artifact.name,
-                    "temporal": False,
-                    "sampler": "ddpm",
-                    "eta": 0.0,
-                }
-                
-                # Evaluate with DDPM sampler
-                pred_scaled_c_ddpm = diffusion_c.predict(test_obs_s, n_samples=4, sampler="ddpm", eta=0.0)
-                pred_c_ddpm = act_scaler.inverse_transform(pred_scaled_c_ddpm)
-                metrics_c_ddpm = compute_metrics(test_act, pred_c_ddpm)
-                metrics_c_ddpm["nll"] = float("nan")
-                finger_results["diffusion_c_ddpm"] = metrics_c_ddpm
-                print(f"[{finger}] diffusion_c|ddpm rmse={metrics_c_ddpm['rmse']:.4f} mae={metrics_c_ddpm['mae']:.4f} r2={metrics_c_ddpm['r2']:.4f}")
-                
-                # Evaluate with DDIM sampler
-                diffusion_eta = 1.0
-                pred_scaled_c_ddim = diffusion_c.predict(test_obs_s, n_samples=4, sampler="ddim", eta=diffusion_eta)
-                pred_c_ddim = act_scaler.inverse_transform(pred_scaled_c_ddim)
-                metrics_c_ddim = compute_metrics(test_act, pred_c_ddim)
-                metrics_c_ddim["nll"] = float("nan")
-                finger_results["diffusion_c_ddim"] = metrics_c_ddim
-                finger_manifest["models"]["diffusion_c_ddim"] = {
-                    "kind": "diffusion",
-                    "path": diffusion_c_artifact.name,
-                    "temporal": False,
-                    "sampler": "ddim",
-                    "eta": diffusion_eta,
-                }
-                print(f"[{finger}] diffusion_c|ddim rmse={metrics_c_ddim['rmse']:.4f} mae={metrics_c_ddim['mae']:.4f} r2={metrics_c_ddim['r2']:.4f}")
-                
-                if diff_c_writer is not None:
-                    diff_c_writer.flush()
-                    diff_c_writer.close()
-            except Exception as exc:
-                print(f"[{finger}] diffusion_c training failed: {exc}")
-        
-        # Train Diffusion Temporal model
-        if "diffusion_t" in models_requested:
-            if train_seq_obs.shape[0] == 0 or test_seq_obs.shape[0] == 0:
-                print(f"[{finger}] diffusion_t skipped (insufficient sequence data)")
-            else:
-                print(f"[{finger}] training diffusion policy (temporal) ...")
-                try:
-                    diffusion_t = DiffusionPolicyBaseline(
-                        obs_dim=train_seq_obs.shape[-1],
-                        act_dim=train_seq_act_s.shape[1],
-                        timesteps=args.diffusion_steps,
-                        hidden_dim=args.diffusion_hidden,
-                        lr=args.diffusion_lr,
-                        batch_size=args.diffusion_batch,
-                        epochs=args.diffusion_epochs,
-                        seed=args.seed,
-                        log_name=f"diffusion_t_{finger}",
-                        temporal=True,
-                    )
-                    diff_t_writer = make_writer(run_tensorboard_dir, f"diffusion_t_{finger}")
-                    diffusion_t.fit(train_seq_obs, train_seq_act_s, writer=diff_t_writer, verbose=False)
-                    
-                    # Save model
-                    diffusion_t_artifact = finger_artifact_dir / "diffusion_t.pt"
-                    diffusion_t_config = {
-                        "obs_dim": train_seq_obs.shape[-1],
-                        "act_dim": train_seq_act_s.shape[1],
-                        "timesteps": args.diffusion_steps,
-                        "hidden_dim": args.diffusion_hidden,
-                        "time_dim": diffusion_t.model.time_embed.dim if hasattr(diffusion_t.model.time_embed, "dim") else 64,
-                        "lr": args.diffusion_lr,
-                        "batch_size": args.diffusion_batch,
-                        "epochs": args.diffusion_epochs,
-                        "seed": args.seed,
-                        "temporal": True,
-                        "seq_len": window,
-                    }
-                    torch.save(
-                        {
-                            "config": diffusion_t_config,
-                            "state_dict": {k: v.cpu() for k, v in diffusion_t.model.state_dict().items()},
-                        },
-                        diffusion_t_artifact,
-                    )
-                    finger_manifest["models"]["diffusion_t"] = {
-                        "kind": "diffusion",
-                        "path": diffusion_t_artifact.name,
-                        "temporal": True,
-                        "sampler": "ddpm",
-                        "eta": 0.0,
-                        "seq_len": window,
-                    }
-                    
-                    # Evaluate with DDPM sampler
-                    pred_scaled_t_ddpm = diffusion_t.predict(test_seq_obs, n_samples=4, sampler="ddpm", eta=0.0)
-                    pred_t_ddpm = act_scaler.inverse_transform(pred_scaled_t_ddpm)
-                    metrics_t_ddpm = compute_metrics(test_seq_act_raw, pred_t_ddpm)
-                    metrics_t_ddpm["nll"] = float("nan")
-                    finger_results["diffusion_t_ddpm"] = metrics_t_ddpm
-                    print(f"[{finger}] diffusion_t|ddpm rmse={metrics_t_ddpm['rmse']:.4f} mae={metrics_t_ddpm['mae']:.4f} r2={metrics_t_ddpm['r2']:.4f}")
-                    
-                    # Evaluate with DDIM sampler
-                    diffusion_eta = 1.0
-                    pred_scaled_t_ddim = diffusion_t.predict(test_seq_obs, n_samples=4, sampler="ddim", eta=diffusion_eta)
-                    pred_t_ddim = act_scaler.inverse_transform(pred_scaled_t_ddim)
-                    metrics_t_ddim = compute_metrics(test_seq_act_raw, pred_t_ddim)
-                    metrics_t_ddim["nll"] = float("nan")
-                    finger_results["diffusion_t_ddim"] = metrics_t_ddim
-                    finger_manifest["models"]["diffusion_t_ddim"] = {
-                        "kind": "diffusion",
-                        "path": diffusion_t_artifact.name,
-                        "temporal": True,
-                        "sampler": "ddim",
-                        "eta": diffusion_eta,
-                        "seq_len": window,
-                    }
-                    print(f"[{finger}] diffusion_t|ddim rmse={metrics_t_ddim['rmse']:.4f} mae={metrics_t_ddim['mae']:.4f} r2={metrics_t_ddim['r2']:.4f}")
-                    
-                    if diff_t_writer is not None:
-                        diff_t_writer.flush()
-                        diff_t_writer.close()
-                except Exception as exc:
-                    print(f"[{finger}] diffusion_t training failed: {exc}")
-        
-        # Train IBC model
-        if "ibc" in models_requested:
-            print(f"[{finger}] training IBC baseline ...")
-            try:
-                ibc_batch = args.ibc_batch if args.ibc_batch is not None else args.bc_batch
-                ibc_policy = IBCBaseline(
-                    obs_dim=train_obs_s.shape[1],
-                    act_dim=train_act_s.shape[1],
-                    hidden_dim=args.ibc_hidden,
-                    depth=args.ibc_depth,
-                    lr=args.ibc_lr,
-                    batch_size=ibc_batch,
-                    epochs=args.ibc_epochs,
-                    noise_std=args.ibc_noise_std,
-                    langevin_steps=args.ibc_langevin_steps,
-                    step_size=args.ibc_step_size,
-                    seed=args.seed,
-                    log_name=f"ibc_{finger}",
-                )
-                ibc_writer = make_writer(run_tensorboard_dir, f"ibc_{finger}")
-                ibc_policy.fit(train_obs_s, train_act_s, writer=ibc_writer, verbose=False)
-                
-                # Save IBC model
-                ibc_artifact = finger_artifact_dir / "ibc.pt"
-                ibc_config = {
-                    "obs_dim": train_obs_s.shape[1],
-                    "act_dim": train_act_s.shape[1],
-                    "hidden_dim": args.ibc_hidden,
-                    "depth": args.ibc_depth,
-                    "lr": args.ibc_lr,
-                    "batch_size": ibc_batch,
-                    "epochs": args.ibc_epochs,
-                    "noise_std": args.ibc_noise_std,
-                    "langevin_steps": args.ibc_langevin_steps,
-                    "step_size": args.ibc_step_size,
-                    "seed": args.seed,
-                }
-                torch.save(
-                    {
-                        "config": ibc_config,
-                        "state_dict": {k: v.cpu() for k, v in ibc_policy.model.state_dict().items()},
-                    },
-                    ibc_artifact,
-                )
-                finger_manifest["models"]["ibc"] = {
-                    "kind": "ibc",
-                    "path": ibc_artifact.name,
-                }
-                
-                # Evaluate
-                pred_act_s = ibc_policy.predict(test_obs_s)
-                pred_act = act_scaler.inverse_transform(pred_act_s)
-                
-                metrics = compute_metrics(test_act, pred_act)
-                metrics["nll"] = float("nan")
-                print(f"[{finger}] ibc rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
-                finger_results["ibc"] = metrics
-                
-                if ibc_writer is not None:
-                    ibc_writer.flush()
-                    ibc_writer.close()
-            except Exception as exc:
-                print(f"[{finger}] ibc training failed: {exc}")
-        
-        # Store results
-        all_results[finger] = finger_results
-        all_manifests[finger] = finger_manifest
-        
-        # Save manifest for this finger
-        manifest_path = finger_artifact_dir / "manifest.json"
-        with manifest_path.open("w", encoding="utf-8") as fh:
-            json.dump(finger_manifest, fh, indent=2)
-    
-    # Save combined summary
-    summary = {
-        "mode": "per-finger",
-        "timestamp": timestamp,
-        "artifacts_root": str(artifacts_root),
-        "results_per_finger": all_results,
-        "manifests_per_finger": all_manifests,
-        "config": {
-            "test_size": args.test_size,
-            "seed": args.seed,
-            "stride": args.stride,
-            "bc_epochs": args.bc_epochs,
-            "bc_hidden": args.bc_hidden,
-            "bc_depth": args.bc_depth,
-            "bc_batch": args.bc_batch,
-            "bc_lr": args.bc_lr,
-        },
-    }
-    
-    out_json = args.output_dir / f"benchmark_summary_per_finger_{timestamp}.json"
-    with out_json.open("w", encoding="utf-8") as fh:
-        json.dump(summary, fh, indent=2)
-    print(f"\n[done] per-finger summary saved to {out_json}")
-    print(f"[done] artifacts stored in {artifacts_root}")
-    
-    # Print aggregate results
-    print(f"\n{'='*80}")
-    print("AGGREGATE RESULTS (per-finger mode)")
-    print(f"{'='*80}")
-    for finger in ["th", "if", "mf"]:
-        if finger in all_results and "bc" in all_results[finger]:
-            m = all_results[finger]["bc"]
-            print(f"{finger.upper()}: RMSE={m['rmse']:.2f}, MAE={m['mae']:.2f}, R²={m['r2']:.4f}")
-
-
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()
-

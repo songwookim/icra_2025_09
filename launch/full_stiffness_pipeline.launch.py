@@ -13,14 +13,19 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     args = [
-        DeclareLaunchArgument('model_type', default_value='diffusion_t_ddim'),  # Best: R²=0.96
+        # Model type: simple ('lstm_gmm', 'bc') or with params ('lstm_gmm_seq4', 'diffusion_t_seq4_h1', ibc, gmr, bc)
+        # If using sweep format, artifact_dir is auto-detected from benchmark_sweep/
+        DeclareLaunchArgument('model_type', default_value='diffusion_t_seq16_h4'),  # Best: R²=0.9961
+        # DeclareLaunchArgument('model_type', default_value='diffusion_t_seq4_h1'),
         # DeclareLaunchArgument('model_type', default_value='bc'),
-        DeclareLaunchArgument('artifact_dir', default_value='/home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge/outputs/models/policy_learning_unified/artifacts/20251130_063538'),  # Latest with diffusion_t
-        DeclareLaunchArgument('rate_hz', default_value='50.0'),
+        
+        # artifact_dir: Leave empty for auto-detection, or specify manually
+        DeclareLaunchArgument('artifact_dir', default_value=''),  # Auto-detect from model_type
+        DeclareLaunchArgument('rate_hz', default_value='30.0'),
         # DeclareLaunchArgument('stiffness_scale', default_value='1.5'), # GOOD
-        DeclareLaunchArgument('stiffness_scale', default_value='0.11'),  # Full scale (use with tau_scale=0.5 in demo_ee_player)
+        DeclareLaunchArgument('stiffness_scale', default_value='0.85'),  # Full scale (use with tau_scale=0.5 in demo_ee_player)
         DeclareLaunchArgument('run_mujoco', default_value='true'),
-        DeclareLaunchArgument('manual_start', default_value='false'),
+        DeclareLaunchArgument('manual_start', default_value='true'),
         DeclareLaunchArgument('start_key', default_value='p'),
         DeclareLaunchArgument('rc_use_force_control', default_value='true'),
         DeclareLaunchArgument('rc_safe_mode', default_value='false'),  # Set to true for zero torque output
@@ -30,7 +35,7 @@ def generate_launch_description():
         DeclareLaunchArgument('max_torque', default_value='100.'),  # [SAFETY] Reduced from 500
         DeclareLaunchArgument('max_current_units_pos', default_value='1'),
         DeclareLaunchArgument('max_current_units_neg', default_value='200'),  # Allow up to -200 current units for grasping
-        DeclareLaunchArgument('max_pwm_limit', default_value='200'),  # Full PWM range (100%)
+        DeclareLaunchArgument('max_pwm_limit', default_value='250'),  # Full PWM range (100%)
         DeclareLaunchArgument('position_error_threshold', default_value='500.'),
         DeclareLaunchArgument('damping_ratio', default_value='0.5'),
         DeclareLaunchArgument('virtual_mass', default_value='0.1'),
@@ -39,17 +44,17 @@ def generate_launch_description():
         DeclareLaunchArgument('torque_filter_alpha', default_value='0.3'),      # 토크 스무딩 (0.3 = 30% 새값)
         DeclareLaunchArgument('stiffness_filter_alpha', default_value='0.5'),   # Stiffness 스무딩 (0.5 = 50% 새값, 더 빠른 반응)
         DeclareLaunchArgument('max_stiffness_change', default_value='100.0'),   # K값 급발진 방지 (Rate Limit, 기존 50 -> 100)
-        DeclareLaunchArgument('smooth_window', default_value='5'),
+        DeclareLaunchArgument('smooth_window', default_value='10'),
         
-        # --- [추가] 시간 기반 stiffness 스케일링 (DISABLED: 처음부터 100%) ---
-        DeclareLaunchArgument('time_ramp_duration', default_value='0.0'),  # 0 = ramp 비활성화 (즉시 100%)
-        DeclareLaunchArgument('initial_stiffness_scale', default_value='1.0'),  # 처음부터 100%
+        # --- [추가] 시간 기반 stiffness 스케일링 (ENABLED: 부드러운 시작) ---
+        DeclareLaunchArgument('time_ramp_duration', default_value='5.0'),  # 3초 동안 램프업
+        DeclareLaunchArgument('initial_stiffness_scale', default_value='0.1'),  # 처음 30%
         DeclareLaunchArgument('final_stiffness_scale', default_value='1.0'),  # 최종 100%
         # -----------------------------
         
         # DeclareLaunchArgument('current_units_scale', default_value='[2.5, 7.5, 7.5, 2.5, 11.5, 9.5, 2.5, 15.5, 7.5]'),
-        # DeclareLaunchArgument('current_units_scale', default_value='[0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1]'),
-        DeclareLaunchArgument('current_units_scale', default_value='[1.,1.25,1.,1.,1.,1.0,1.,1.,0.9]'),
+        DeclareLaunchArgument('current_units_scale', default_value='[0.1,0.1,0.1,0.1,0.1,0.9,0.1,0.1,0.9]'),
+        # DeclareLaunchArgument('current_units_scale', default_value='[1.,1.,1.,1.,1.,1.0,1.,1.,0.9]'),
     ]
 
     # Config substitutions
@@ -147,6 +152,10 @@ def generate_launch_description():
             'stiffness_filter_alpha': stiffness_filter_alpha,
             'max_stiffness_change': max_stiffness_change,
             'max_pwm_limit': max_pwm_limit,  # For PWM plot visualization
+            # [추가] 시간 기반 스케일링 (controller에서 적용)
+            'time_ramp_duration': time_ramp_duration,
+            'initial_stiffness_scale': initial_stiffness_scale,
+            'final_stiffness_scale': final_stiffness_scale,
         }]
     )
 

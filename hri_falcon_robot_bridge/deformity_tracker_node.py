@@ -407,7 +407,11 @@ class DeformityTrackerNode(Node):
                 # ROS2 콜백 처리를 위해 spin_once 호출
                 rclpy.spin_once(self, timeout_sec=0.001)
                 
-                frames = self.pipe.wait_for_frames()
+                # [PERFORMANCE] Use poll_for_frames to skip old frames and only process the latest
+                # This prevents frame accumulation when processing is slower than camera FPS
+                frames = self.pipe.poll_for_frames()
+                if not frames:
+                    continue  # No new frame available, try again
                 color = frames.get_color_frame()
                 if not color:
                     continue

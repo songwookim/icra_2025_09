@@ -32,6 +32,7 @@ dynamixel:
     addr_torque_enable: 64
     ADDR_GOAL_CURRENT: 102
     ADDR_GOAL_POSITION: 116
+    ADDR_PWM_LIMIT: 36            # XM430: PWM Limit (2 bytes, range: 0 ~ 885)
     ADDR_PRESENT_PWM: 124         # XM430: Present PWM (range: -885 ~ +885)
     ADDR_PRESENT_VELOCITY: 128
     ADDR_PRESENT_POSITION: 132

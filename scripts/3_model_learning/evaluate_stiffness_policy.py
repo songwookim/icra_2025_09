@@ -40,7 +40,6 @@ build_sequence_dataset = benchmarks.build_sequence_dataset
 compute_metrics = benchmarks.compute_metrics
 compute_offsets = benchmarks.compute_offsets
 load_dataset = benchmarks.load_dataset
-load_dataset_per_finger = benchmarks.load_dataset_per_finger
 scale_trajectories = benchmarks.scale_trajectories
 
 BehaviorCloningBaseline = getattr(benchmarks, "BehaviorCloningBaseline", None)
@@ -50,14 +49,18 @@ LSTMGMMBaseline = getattr(benchmarks, "LSTMGMMBaseline", None)
 GPBaseline = getattr(benchmarks, "GPBaseline", None)
 MDNBaseline = getattr(benchmarks, "MDNBaseline", None)
 
+# Auto-detect device: use GPU if available
+def _get_device() -> str:
+    if torch is not None and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+DEVICE = _get_device()
+
 # Override DEFAULT_ARTIFACT_ROOT to point to actual artifact location
 _PKG_ROOT = Path(__file__).resolve().parents[2]  # .../src/hri_falcon_robot_bridge
 DEFAULT_ARTIFACT_ROOT_UNIFIED = _PKG_ROOT / "outputs" / "models" / "policy_learning_unified" / "artifacts"
-DEFAULT_ARTIFACT_ROOT_PER_FINGER = _PKG_ROOT / "outputs" / "models" / "policy_learning_per_finger" / "artifacts"
 DEFAULT_PLOT_DIR = DEFAULT_OUTPUT_DIR / "plots"
-
-# Finger configuration for per-finger mode
-FINGER_LIST = ["th", "if", "mf"]
 
 
 def _normalise_finger_token(token: str) -> str:
@@ -120,6 +123,28 @@ def _fingerwise_metrics(target: np.ndarray, pred: np.ndarray, finger_slices: Dic
     return summary
 
 
+def _apply_moving_average_smoothing(pred: np.ndarray, window: int) -> np.ndarray:
+    """Apply causal moving average smoothing to predictions (same as run_policy_node).
+    
+    This mimics real-time deployment where we only have access to past predictions.
+    For each timestep t, the smoothed value is the mean of predictions from t-window+1 to t.
+    """
+    if window <= 1:
+        return pred
+    
+    T, D = pred.shape
+    smoothed = np.zeros_like(pred)
+    buffer: List[np.ndarray] = []
+    
+    for t in range(T):
+        buffer.append(pred[t])
+        if len(buffer) > window:
+            buffer.pop(0)
+        smoothed[t] = np.mean(buffer, axis=0)
+    
+    return smoothed
+
+
 def _ensure_baseline_available(name: str, cls: Any) -> Any:
     if cls is None or torch is None:
         raise RuntimeError(f"{name} baseline is unavailable. Install PyTorch to evaluate this model.")
@@ -165,17 +190,23 @@ def _select_eval_demo(
     """Select evaluation demo, optionally matching finger suffix for per-finger mode."""
     if desired:
         eval_name = Path(desired).stem
+        # Try exact match first
+        if any(t.name == eval_name for t in trajectories):
+            return eval_name
+        # Try adding _signaligned suffix if not present
+        if not eval_name.endswith("_signaligned"):
+            eval_name_aligned = eval_name.replace("_synced", "_synced_signaligned")
+            if any(t.name == eval_name_aligned for t in trajectories):
+                return eval_name_aligned
         # If requesting an augmented variant that is not present, fall back to base stem
-        if eval_name.endswith("_synced") is False and "_aug" in eval_name:
+        if "_aug" in eval_name:
             base_candidate = eval_name.split("_aug")[0]
             if any(t.name == base_candidate for t in trajectories):
-                eval_name = base_candidate
+                return base_candidate
         if finger_suffix:
             eval_name_with_finger = f"{eval_name}_{finger_suffix}"
             if any(t.name == eval_name_with_finger for t in trajectories):
                 return eval_name_with_finger
-        if any(t.name == eval_name for t in trajectories):
-            return eval_name
         available = ", ".join(sorted(t.name for t in trajectories))
         raise RuntimeError(f"Requested evaluation demo '{desired}' not available. Options: {available}")
 
@@ -488,14 +519,7 @@ def _torch_load(path: Path) -> Dict[str, Any]:
 
 
 def evaluate_models(args: argparse.Namespace) -> None:
-    mode = args.mode.lower()
-    
-    if mode == "per-finger":
-        # Per-finger mode: evaluate each finger separately
-        evaluate_per_finger_models(args)
-        return
-    
-    # Unified mode (default)
+    # Unified mode only
     default_root = DEFAULT_ARTIFACT_ROOT_UNIFIED
     artifact_dir = args.artifact_dir if args.artifact_dir else _latest_artifact_dir(default_root)
     print(f"[info] Mode: unified")
@@ -527,7 +551,8 @@ def evaluate_models(args: argparse.Namespace) -> None:
     finger_slices_rel = {finger: finger_slices_rel.get(finger, []) for finger in selected_fingers}
 
     obs_scaler, act_scaler = _load_scalers(artifact_dir, manifest)
-    window = int(manifest.get("sequence_window", 1))
+    # seq_len (preferred) or sequence_window (legacy)
+    window = int(manifest.get("seq_len", manifest.get("sequence_window", 1)))
     diffusion_sampler = args.diffusion_sampler.lower()
     diffusion_eta = max(0.0, float(args.diffusion_eta))
 
@@ -621,7 +646,7 @@ def evaluate_models(args: argparse.Namespace) -> None:
                 batch_size=int(config.get("batch_size", 256)),
                 epochs=int(config.get("epochs", 0)),
                 seed=int(config.get("seed", 0)),
-                device="cpu",
+                device=DEVICE,
                 log_name="bc_eval",
             )
             bc.model.load_state_dict(state["state_dict"])
@@ -649,7 +674,7 @@ def evaluate_models(args: argparse.Namespace) -> None:
                 langevin_steps=int(config.get("langevin_steps", 30)),
                 step_size=float(config.get("step_size", 1e-2)),
                 seed=int(config.get("seed", 0)),
-                device="cpu",
+                device=DEVICE,
                 log_name="ibc_eval",
             )
             ibc.model.load_state_dict(state["state_dict"])
@@ -684,114 +709,45 @@ def evaluate_models(args: argparse.Namespace) -> None:
                 seed=int(config.get("seed", 0)),
                 temporal=temporal,
                 action_horizon=action_horizon,
-                device="cpu",
+                device=DEVICE,
                 log_name=f"{model_name}_eval",
             )
             diff.model.load_state_dict(state["state_dict"])
             sample_count = int(entry.get("n_samples", 4))
+            smooth_window = getattr(args, 'smooth_window', 0)
             
-            # Temporal Ensembling: if action_horizon > 1, apply receding horizon control
-            if action_horizon > 1:
-                print(f"[{model_name}] Using temporal ensembling with action_horizon={action_horizon}")
-                action_buffer: List[np.ndarray] = []
-                if temporal:
-                    obs_input = seq_obs if seq_obs.shape[0] > 0 else test_obs_s
+            # For action_horizon > 1, we use the first action at each step (receding horizon control)
+            # This matches real deployment: at each step, predict action sequence but only use first action
+            if temporal:
+                if seq_obs.shape[0] == 0:
+                    full_pred = np.full_like(test_act_full, np.nan)
                 else:
-                    obs_input = test_obs_s
-                
-                full_pred_scaled = []
-                for t in range(obs_input.shape[0]):
-                    # Predict action sequence (horizon steps)
-                    obs_t = obs_input[t:t+1]
-                    action_seq_scaled = diff.predict(
-                        obs_t,
+                    pred_seq_scaled = diff.predict(
+                        seq_obs,
                         n_samples=sample_count,
                         sampler=diffusion_sampler,
                         eta=diffusion_eta,
-                    )  # Returns (1, act_dim) - only first action after chunking
-                    
-                    # For proper temporal ensembling, we need full sequence
-                    # Workaround: predict with model directly to get full horizon
-                    diff.model.eval()
-                    with torch.no_grad():
-                        obs_tensor = torch.from_numpy(obs_t.astype(np.float32)).to(diff.device)
-                        x = torch.randn(1, diff.act_dim * action_horizon, device=diff.device)
-                        for t_inv in reversed(range(diff.timesteps)):
-                            t_step = torch.full((1,), t_inv, device=diff.device, dtype=torch.long)
-                            pred_noise = diff.model(obs_tensor, x, t_step)
-                            alpha_hat = diff.alpha_cumprod[t_inv]
-                            sqrt_alpha_hat = diff.sqrt_alpha_cumprod[t_inv]
-                            sqrt_one_minus = diff.sqrt_one_minus_alpha_cumprod[t_inv]
-                            pred_x0 = (x - pred_noise * sqrt_one_minus) / sqrt_alpha_hat
-                            if t_inv > 0:
-                                coef1 = diff.posterior_mean_coef1[t_inv]
-                                coef2 = diff.posterior_mean_coef2[t_inv]
-                                mean = coef1 * pred_x0 + coef2 * x
-                                noise_sample = torch.randn_like(x)
-                                var = diff.posterior_variance[t_inv]
-                                x = mean + torch.sqrt(torch.clamp(var, min=1e-6)) * noise_sample
-                            else:
-                                x = pred_x0
-                        action_seq_full = x.cpu().numpy().reshape(action_horizon, diff.act_dim)
-                    
-                    action_buffer.append(action_seq_full)
-                    
-                    # Temporal ensembling: average overlapping predictions
-                    valid_actions = []
-                    for i, buffered_seq in enumerate(action_buffer):
-                        offset = t - (len(action_buffer) - 1 - i)
-                        if 0 <= offset < action_horizon:
-                            valid_actions.append(buffered_seq[offset])
-                    
-                    if valid_actions:
-                        ensembled_action = np.mean(valid_actions, axis=0)
-                    else:
-                        ensembled_action = action_seq_full[0]
-                    
-                    full_pred_scaled.append(ensembled_action)
-                    
-                    # Keep buffer size = action_horizon
-                    if len(action_buffer) > action_horizon:
-                        action_buffer.pop(0)
-                
-                pred_scaled = np.array(full_pred_scaled)
-                pred = act_scaler.inverse_transform(pred_scaled)
-                pred_subset = pred[:, selected_indices_abs]
-                predictions[model_name] = pred_subset
-                if temporal and seq_obs.shape[0] > 0:
+                    )
+                    pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
+                    # Apply smoothing if enabled (same as run_policy_node)
+                    if smooth_window > 1:
+                        pred_seq = _apply_moving_average_smoothing(pred_seq, smooth_window)
                     full_pred = np.full_like(test_act_full, np.nan)
-                    full_pred[seq_indices] = pred
-                    pred_subset = full_pred[:, selected_indices_abs]
-                    metrics_summary[model_name] = _metrics_with_mask(target_subset, pred_subset)
-                else:
-                    metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+                    full_pred[seq_indices] = pred_seq
+                pred_subset = full_pred[:, selected_indices_abs]
+                predictions[model_name] = pred_subset
+                metrics_summary[model_name] = _metrics_with_mask(target_subset, pred_subset)
                 finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             else:
-                # Original single-step prediction
-                if temporal:
-                    if seq_obs.shape[0] == 0:
-                        full_pred = np.full_like(test_act_full, np.nan)
-                    else:
-                        pred_seq_scaled = diff.predict(
-                            seq_obs,
-                            n_samples=sample_count,
-                            sampler=diffusion_sampler,
-                            eta=diffusion_eta,
-                        )
-                        pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
-                        full_pred = np.full_like(test_act_full, np.nan)
-                        full_pred[seq_indices] = pred_seq
-                    pred_subset = full_pred[:, selected_indices_abs]
-                    predictions[model_name] = pred_subset
-                    metrics_summary[model_name] = _metrics_with_mask(target_subset, pred_subset)
-                    finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
-                else:
-                    pred_scaled = diff.predict(test_obs_s, n_samples=sample_count, sampler=diffusion_sampler, eta=diffusion_eta)
-                    pred = act_scaler.inverse_transform(pred_scaled)
-                    pred_subset = pred[:, selected_indices_abs]
-                    predictions[model_name] = pred_subset
-                    metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
-                    finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
+                pred_scaled = diff.predict(test_obs_s, n_samples=sample_count, sampler=diffusion_sampler, eta=diffusion_eta)
+                pred = act_scaler.inverse_transform(pred_scaled)
+                # Apply smoothing if enabled
+                if smooth_window > 1:
+                    pred = _apply_moving_average_smoothing(pred, smooth_window)
+                pred_subset = pred[:, selected_indices_abs]
+                predictions[model_name] = pred_subset
+                metrics_summary[model_name] = compute_metrics(target_subset, pred_subset)
+                finger_metrics_summary[model_name] = _fingerwise_metrics(target_subset, pred_subset, finger_slices_rel)
             continue
 
         if kind == "lstm_gmm":
@@ -815,7 +771,7 @@ def evaluate_models(args: argparse.Namespace) -> None:
                 batch_size=int(config.get("batch_size", 256)),
                 epochs=int(config.get("epochs", 0)),
                 seed=int(config.get("seed", 0)),
-                device="cpu",
+                device=DEVICE,
                 log_name="lstm_gmm_eval",
             )
             lstm.model.load_state_dict(state["state_dict"])
@@ -864,7 +820,7 @@ def evaluate_models(args: argparse.Namespace) -> None:
                 batch_size=int(config.get("batch_size", 256)),
                 epochs=int(config.get("epochs", 0)),
                 seed=int(config.get("seed", 0)),
-                device="cpu",
+                device=DEVICE,
                 log_name="mdn_eval",
             )
             mdn.model.load_state_dict(state["model_state"])
@@ -932,423 +888,11 @@ def evaluate_models(args: argparse.Namespace) -> None:
     print(f"[done] plot saved to {plot_path}")
 
 
-def evaluate_per_finger_models(args: argparse.Namespace) -> None:
-    """Evaluate per-finger trained models with finger-specific artifacts."""
-    # Get base artifact directory
-    default_root = DEFAULT_ARTIFACT_ROOT_PER_FINGER
-    base_artifact_dir = args.artifact_dir if args.artifact_dir else _latest_artifact_dir(default_root)
-    print(f"[info] Mode: per-finger")
-    print(f"[info] Base artifact directory: {base_artifact_dir}")
-    
-    # Determine which fingers to evaluate
-    requested_fingers = args.fingers.lower().split(",") if args.fingers and args.fingers.lower() != "all" else FINGER_LIST
-    requested_fingers = [f.strip() for f in requested_fingers if f.strip() in FINGER_LIST]
-    
-    if not requested_fingers:
-        raise RuntimeError(f"No valid fingers selected. Available: {', '.join(FINGER_LIST)}")
-    
-    print(f"[info] Evaluating fingers: {', '.join(requested_fingers)}")
-    
-    # Collect all finger results for unified visualization
-    all_finger_data: Dict[str, Dict[str, Any]] = {}
-    
-    # Process each finger independently
-    for finger in requested_fingers:
-        finger_artifact_dir = base_artifact_dir / finger
-        if not finger_artifact_dir.exists():
-            print(f"[warn] Skipping {finger.upper()}: artifact directory not found at {finger_artifact_dir}")
-            continue
-        
-        print(f"\n{'='*80}")
-        print(f"[info] Evaluating finger: {finger.upper()}")
-        print(f"[info] Artifact directory: {finger_artifact_dir}")
-        print(f"{'='*80}")
-        
-        # Load finger-specific manifest
-        manifest = _load_manifest(finger_artifact_dir)
-        action_columns = manifest.get("action_columns", ACTION_COLUMNS)
-        if not action_columns:
-            print(f"[warn] Skipping {finger.upper()}: no action columns in manifest")
-            continue
-        
-        obs_scaler, act_scaler = _load_scalers(finger_artifact_dir, manifest)
-        window = int(manifest.get("sequence_window", 1))
-        diffusion_sampler = args.diffusion_sampler.lower()
-        diffusion_eta = max(0.0, float(args.diffusion_eta))
-        
-        # Load dataset using per-finger loader to get correct observation dimensions
-        trajectories = load_dataset_per_finger(args.stiffness_dir, args.stride, finger, include_aug=args.augment)
-        manifest_tests = manifest.get("test_trajectories", [])
-        desired_demo = args.eval_demo or (manifest_tests[0] if manifest_tests else None)
-        eval_name = _select_eval_demo(trajectories, desired_demo, finger_suffix=finger)
-        # Avoid double suffixing (function may already return suffixed name)
-        eval_name_finger = eval_name if eval_name.endswith(f"_{finger}") else f"{eval_name}_{finger}"
-        print(f"[info] Using demonstration: '{eval_name_finger}'")
-        
-        try:
-            test_traj = next(t for t in trajectories if t.name == eval_name_finger)
-        except StopIteration:
-            print(f"[warn] Skipping {finger.upper()}: trajectory '{eval_name_finger}' not found")
-            continue
-        
-        test_obs = test_traj.observations
-        test_act_full = test_traj.actions
-        test_obs_s = obs_scaler.transform(test_obs)
-        
-        test_scaled = scale_trajectories([test_traj], obs_scaler, act_scaler)
-        test_offsets = compute_offsets([test_traj])
-        seq_obs, _, _, seq_indices = build_sequence_dataset(
-            test_scaled,
-            [test_traj],
-            max(1, window),
-            test_offsets,
-        )
-        
-        available_models = list(manifest.get("models", {}).keys())
-        if not available_models:
-            print(f"[warn] Skipping {finger.upper()}: no models in manifest")
-            continue
-        
-        requested = {token.strip().lower() for token in args.models.split(",") if token.strip()}
-        if not requested or "all" in requested:
-            model_order = available_models
-        else:
-            model_order = [name for name in available_models if name.lower() in requested]
-        
-        if not model_order:
-            print(f"[warn] Skipping {finger.upper()}: no valid models selected")
-            continue
-        
-        predictions: Dict[str, np.ndarray] = {}
-        metrics_summary: Dict[str, Dict[str, float]] = {}
-        gmm_cache: Dict[str, GMMConditional] = {}
-        time_idx = np.arange(test_act_full.shape[0])
-        
-        # Evaluate each model for this finger
-        for model_name in model_order:
-            entry = manifest["models"][model_name]
-            kind = entry.get("kind", model_name).lower()
-            artifact_path = finger_artifact_dir / entry["path"]
-            
-            if not artifact_path.exists():
-                print(f"[warn] Skipping {model_name}: artifact not found at {artifact_path}")
-                continue
-            
-            try:
-                # Use same evaluation logic as unified mode
-                if kind in {"gmm", "gmr"}:
-                    cache_key = entry["path"]
-                    gmm_model = gmm_cache.get(cache_key)
-                    if gmm_model is None:
-                        with artifact_path.open("rb") as fh:
-                            gmm_model = pickle.load(fh)
-                        if not isinstance(gmm_model, GMMConditional):
-                            gmm_model = gmm_model.get("model")  # Try extracting from dict
-                        gmm_cache[cache_key] = gmm_model
-                    mode_str = "mean" if kind == "gmr" else entry.get("mode", "sample")
-                    n_samples = 1 if kind == "gmr" else int(entry.get("n_samples", 16))
-                    pred_scaled = gmm_model.predict(test_obs_s, mode=mode_str, n_samples=n_samples)
-                    pred = act_scaler.inverse_transform(pred_scaled)
-                    predictions[model_name] = pred
-                    metrics_summary[model_name] = compute_metrics(test_act_full, pred)
-                
-                elif kind == "bc":
-                    bc_cls = _ensure_baseline_available("Behavior cloning", BehaviorCloningBaseline)
-                    state = _torch_load(artifact_path)
-                    config = state.get("config", {})
-                    bc = bc_cls(
-                        obs_dim=int(config.get("obs_dim", test_obs_s.shape[1])),
-                        act_dim=int(config.get("act_dim", test_act_full.shape[1])),
-                        hidden_dim=int(config.get("hidden_dim", 256)),
-                        depth=int(config.get("depth", 3)),
-                        lr=float(config.get("lr", 1e-3)),
-                        batch_size=int(config.get("batch_size", 256)),
-                        epochs=int(config.get("epochs", 0)),
-                        seed=int(config.get("seed", 0)),
-                        device="cpu",
-                        log_name="bc_eval",
-                    )
-                    bc.model.load_state_dict(state["state_dict"])
-                    pred_scaled = bc.predict(test_obs_s)
-                    pred = act_scaler.inverse_transform(pred_scaled)
-                    predictions[model_name] = pred
-                    metrics_summary[model_name] = compute_metrics(test_act_full, pred)
-                
-                elif kind == "ibc":
-                    ibc_cls = _ensure_baseline_available("IBC", IBCBaseline)
-                    state = _torch_load(artifact_path)
-                    config = state.get("config", {})
-                    ibc = ibc_cls(
-                        obs_dim=int(config.get("obs_dim", test_obs_s.shape[1])),
-                        act_dim=int(config.get("act_dim", test_act_full.shape[1])),
-                        hidden_dim=int(config.get("hidden_dim", 256)),
-                        depth=int(config.get("depth", 3)),
-                        lr=float(config.get("lr", 1e-3)),
-                        batch_size=int(config.get("batch_size", 256)),
-                        epochs=int(config.get("epochs", 0)),
-                        noise_std=float(config.get("noise_std", 0.5)),
-                        langevin_steps=int(config.get("langevin_steps", 30)),
-                        step_size=float(config.get("step_size", 1e-2)),
-                        seed=int(config.get("seed", 0)),
-                        device="cpu",
-                        log_name="ibc_eval",
-                    )
-                    ibc.model.load_state_dict(state["state_dict"])
-                    pred_scaled = ibc.predict(test_obs_s, n_samples=int(entry.get("n_samples", 1)))
-                    pred = act_scaler.inverse_transform(pred_scaled)
-                    predictions[model_name] = pred
-                    metrics_summary[model_name] = compute_metrics(test_act_full, pred)
-                
-                elif kind == "diffusion":
-                    diff_cls = _ensure_baseline_available("Diffusion policy", DiffusionPolicyBaseline)
-                    state = _torch_load(artifact_path)
-                    config = state.get("config", {})
-                    temporal = bool(config.get("temporal", entry.get("temporal", False)))
-                    action_horizon = int(config.get("action_horizon", entry.get("action_horizon", 1)))
-                    diff = diff_cls(
-                        obs_dim=int(config.get("obs_dim", seq_obs.shape[-1] if temporal and seq_obs.size else test_obs_s.shape[1])),
-                        act_dim=int(config.get("act_dim", test_act_full.shape[1])),
-                        timesteps=int(config.get("timesteps", 50)),
-                        hidden_dim=int(config.get("hidden_dim", 256)),
-                        time_dim=int(config.get("time_dim", 64)),
-                        lr=float(config.get("lr", 1e-3)),
-                        batch_size=int(config.get("batch_size", 256)),
-                        epochs=int(config.get("epochs", 0)),
-                        seed=int(config.get("seed", 0)),
-                        temporal=temporal,
-                        action_horizon=action_horizon,
-                        device="cpu",
-                        log_name=f"{model_name}_eval",
-                    )
-                    diff.model.load_state_dict(state["state_dict"])
-                    sample_count = int(entry.get("n_samples", 4))
-                    
-                    # Temporal Ensembling for per-finger mode
-                    if action_horizon > 1:
-                        print(f"[{model_name}] Finger {finger.upper()}: Using temporal ensembling with action_horizon={action_horizon}")
-                        action_buffer: List[np.ndarray] = []
-                        obs_input = seq_obs if temporal and seq_obs.shape[0] > 0 else test_obs_s
-                        
-                        full_pred_scaled = []
-                        for t in range(obs_input.shape[0]):
-                            obs_t = obs_input[t:t+1]
-                            # Get full action sequence using model directly
-                            diff.model.eval()
-                            with torch.no_grad():
-                                obs_tensor = torch.from_numpy(obs_t.astype(np.float32)).to(diff.device)
-                                x = torch.randn(1, diff.act_dim * action_horizon, device=diff.device)
-                                for t_inv in reversed(range(diff.timesteps)):
-                                    t_step = torch.full((1,), t_inv, device=diff.device, dtype=torch.long)
-                                    pred_noise = diff.model(obs_tensor, x, t_step)
-                                    alpha_hat = diff.alpha_cumprod[t_inv]
-                                    sqrt_alpha_hat = diff.sqrt_alpha_cumprod[t_inv]
-                                    sqrt_one_minus = diff.sqrt_one_minus_alpha_cumprod[t_inv]
-                                    pred_x0 = (x - pred_noise * sqrt_one_minus) / sqrt_alpha_hat
-                                    if t_inv > 0:
-                                        coef1 = diff.posterior_mean_coef1[t_inv]
-                                        coef2 = diff.posterior_mean_coef2[t_inv]
-                                        mean = coef1 * pred_x0 + coef2 * x
-                                        noise_sample = torch.randn_like(x)
-                                        var = diff.posterior_variance[t_inv]
-                                        x = mean + torch.sqrt(torch.clamp(var, min=1e-6)) * noise_sample
-                                    else:
-                                        x = pred_x0
-                                action_seq_full = x.cpu().numpy().reshape(action_horizon, diff.act_dim)
-                            
-                            action_buffer.append(action_seq_full)
-                            
-                            # Temporal ensembling
-                            valid_actions = []
-                            for i, buffered_seq in enumerate(action_buffer):
-                                offset = t - (len(action_buffer) - 1 - i)
-                                if 0 <= offset < action_horizon:
-                                    valid_actions.append(buffered_seq[offset])
-                            
-                            if valid_actions:
-                                ensembled_action = np.mean(valid_actions, axis=0)
-                            else:
-                                ensembled_action = action_seq_full[0]
-                            
-                            full_pred_scaled.append(ensembled_action)
-                            
-                            if len(action_buffer) > action_horizon:
-                                action_buffer.pop(0)
-                        
-                        pred_scaled = np.array(full_pred_scaled)
-                        pred = act_scaler.inverse_transform(pred_scaled)
-                        if temporal and seq_obs.shape[0] > 0:
-                            full_pred = np.full_like(test_act_full, np.nan)
-                            full_pred[seq_indices] = pred
-                            predictions[model_name] = full_pred
-                            metrics_summary[model_name] = _metrics_with_mask(test_act_full, full_pred)
-                        else:
-                            predictions[model_name] = pred
-                            metrics_summary[model_name] = compute_metrics(test_act_full, pred)
-                    else:
-                        # Original single-step prediction
-                        if temporal:
-                            if seq_obs.shape[0] == 0:
-                                pred = np.full_like(test_act_full, np.nan)
-                            else:
-                                pred_seq_scaled = diff.predict(seq_obs, n_samples=sample_count, sampler=diffusion_sampler, eta=diffusion_eta)
-                                pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
-                                pred = np.full_like(test_act_full, np.nan)
-                                pred[seq_indices] = pred_seq
-                            predictions[model_name] = pred
-                            metrics_summary[model_name] = _metrics_with_mask(test_act_full, pred)
-                        else:
-                            pred_scaled = diff.predict(test_obs_s, n_samples=sample_count, sampler=diffusion_sampler, eta=diffusion_eta)
-                            pred = act_scaler.inverse_transform(pred_scaled)
-                            predictions[model_name] = pred
-                            metrics_summary[model_name] = compute_metrics(test_act_full, pred)
-                
-                elif kind == "lstm_gmm":
-                    lstm_cls = _ensure_baseline_available("LSTM-GMM", LSTMGMMBaseline)
-                    state = _torch_load(artifact_path)
-                    config = state.get("config", {})
-                    seq_len = int(config.get("seq_len", entry.get("seq_len", window)))
-                    lstm = lstm_cls(
-                        obs_dim=int(config.get("obs_dim", seq_obs.shape[-1] if seq_obs.size else test_obs_s.shape[1])),
-                        act_dim=int(config.get("act_dim", test_act_full.shape[1])),
-                        seq_len=seq_len,
-                        n_components=int(config.get("n_components", 5)),
-                        hidden_dim=int(config.get("hidden_dim", 256)),
-                        n_layers=int(config.get("n_layers", 1)),
-                        lr=float(config.get("lr", 1e-3)),
-                        batch_size=int(config.get("batch_size", 256)),
-                        epochs=int(config.get("epochs", 0)),
-                        seed=int(config.get("seed", 0)),
-                        device="cpu",
-                        log_name="lstm_gmm_eval",
-                    )
-                    lstm.model.load_state_dict(state["state_dict"])
-                    sample_count = int(entry.get("n_samples", config.get("n_components", 5)))
-                    if seq_obs.shape[0] == 0:
-                        pred = np.full_like(test_act_full, np.nan)
-                    else:
-                        pred_seq_scaled = lstm.predict(seq_obs, mode="mean", n_samples=sample_count)
-                        pred_seq = act_scaler.inverse_transform(pred_seq_scaled)
-                        pred = np.full_like(test_act_full, np.nan)
-                        pred[seq_indices] = pred_seq
-                    predictions[model_name] = pred
-                    metrics_summary[model_name] = _metrics_with_mask(test_act_full, pred)
-                
-            except Exception as exc:
-                print(f"[warn] Failed to evaluate {model_name} for {finger.upper()}: {exc}")
-                continue
-        
-        # Store finger results for unified plot
-        if predictions:
-            all_finger_data[finger] = {
-                "predictions": predictions,
-                "metrics": metrics_summary,
-                "target": test_act_full,
-                "time_idx": time_idx,
-                "action_columns": action_columns,
-                "model_order": model_order,
-                "eval_name": eval_name,
-            }
-            
-            # Print metrics
-            for model_name in model_order:
-                metrics = metrics_summary.get(model_name, {"rmse": float("nan"), "mae": float("nan"), "r2": float("nan")})
-                print(f"[{model_name}] rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
-    
-    # Create unified plot showing all fingers together
-    if all_finger_data:
-        print(f"\n{'='*80}")
-        print("[info] Creating unified plot for all fingers")
-        print(f"{'='*80}")
-        
-        # Use first finger's model order (should be same for all)
-        first_finger = list(all_finger_data.keys())[0]
-        model_order = all_finger_data[first_finger]["model_order"]
-        eval_name = all_finger_data[first_finger]["eval_name"]
-        
-        # Build combined predictions and targets
-        combined_predictions: Dict[str, List[np.ndarray]] = {}
-        combined_targets: List[np.ndarray] = []
-        combined_labels: List[str] = []
-        
-        for finger in requested_fingers:
-            if finger not in all_finger_data:
-                continue
-            data = all_finger_data[finger]
-            combined_targets.append(data["target"])
-            combined_labels.extend([f"{finger.upper()}_{col}" for col in data["action_columns"]])
-            
-            for model_name in model_order:
-                if model_name not in combined_predictions:
-                    combined_predictions[model_name] = []
-                combined_predictions[model_name].append(data["predictions"][model_name])
-        
-        # Concatenate along action dimension (axis=1)
-        combined_target = np.hstack(combined_targets)
-        combined_preds_final: Dict[str, np.ndarray] = {}
-        for model_name in model_order:
-            combined_preds_final[model_name] = np.hstack(combined_predictions[model_name])
-        
-        # Use first finger's time index (should be same for all if same demo)
-        time_idx = all_finger_data[first_finger]["time_idx"]
-        
-        # Create unified plot (original grid)
-        plot_dir = args.output_dir if args.output_dir else (base_artifact_dir / "plots")
-        plot_path = plot_dir / f"{eval_name}_all_fingers_comparison.png"
-        _plot_model_grid(
-            time_idx,
-            combined_target,
-            combined_preds_final,
-            model_order,
-            combined_labels,
-            plot_path,
-        )
-        
-        # NEW: Finger-grouped plot (same finger's k1/k2/k3 overlaid)
-        plot_path_finger = plot_dir / f"{eval_name}_all_fingers_by_finger.png"
-        _plot_model_grid_by_finger(
-            time_idx,
-            combined_target,
-            combined_preds_final,
-            model_order,
-            combined_labels,
-            plot_path_finger,
-        )
-        
-        print(f"[done] Unified plot saved to {plot_path}")
-        
-        # Print overall metrics summary
-        print(f"\n{'='*80}")
-        print("[info] Overall metrics summary")
-        print(f"{'='*80}")
-        for model_name in model_order:
-            model_metrics = []
-            for finger in requested_fingers:
-                if finger in all_finger_data:
-                    metrics = all_finger_data[finger]["metrics"].get(model_name)
-                    if metrics:
-                        model_metrics.append((finger, metrics))
-            
-            if model_metrics:
-                avg_rmse = np.mean([m[1]["rmse"] for m in model_metrics if not np.isnan(m[1]["rmse"])])
-                avg_mae = np.mean([m[1]["mae"] for m in model_metrics if not np.isnan(m[1]["mae"])])
-                avg_r2 = np.mean([m[1]["r2"] for m in model_metrics if not np.isnan(m[1]["r2"])])
-                print(f"[{model_name}] avg_rmse={avg_rmse:.4f} avg_mae={avg_mae:.4f} avg_r2={avg_r2:.4f}")
-                for finger, metrics in model_metrics:
-                    print(f"    ({finger.upper()}) rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}")
-
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualise saved stiffness policy predictions for a single demonstration."
     )
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="unified",
-        choices=["unified", "per-finger"],
-        help="Evaluation mode: 'unified' (single model) or 'per-finger' (separate models per finger).",
-    )
+    # NOTE: per-finger mode has been removed. Only unified mode is supported.
     parser.add_argument(
         "--artifact-dir",
         type=Path,
@@ -1415,6 +959,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Directory to store the generated comparison plot (defaults to artifacts/<run>/plots).",
+    )
+    parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=0,
+        help="Moving average window size for stiffness prediction smoothing (0=disabled, 5=default in run_policy_node).",
     )
     return parser.parse_args()
 
