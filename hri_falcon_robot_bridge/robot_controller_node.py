@@ -421,9 +421,31 @@ class RobotControllerNode(Node):
             if self.publish_joint_state:
                 self.publish_joint_state_message(targets)
         except Exception as e:
+            err_msg = str(e)
             self.get_logger().error(f"set_joint_positions 실패: {e}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
+            # Hardware error 자동 복구 시도
+            if 'Hardware error' in err_msg:
+                self.get_logger().warn("[HW Error Recovery] Hardware error 감지 → reboot 시도...")
+                try:
+                    hw_errors = self.controller.read_all_hardware_errors()
+                    for mid, ev in hw_errors.items():
+                        if ev > 0:
+                            flags = []
+                            if ev & 0x01: flags.append('InputVoltage')
+                            if ev & 0x04: flags.append('Overheating')
+                            if ev & 0x08: flags.append('MotorEncoder')
+                            if ev & 0x10: flags.append('ElectricalShock')
+                            if ev & 0x20: flags.append('Overload')
+                            self.get_logger().error(f"  ID {mid}: HW Error = 0x{ev:02X} ({', '.join(flags)})")
+                    self.controller.reboot_all()
+                    self.get_logger().info("[HW Error Recovery] Reboot 완료, 재시도...")
+                    self.controller.set_joint_positions(targets)
+                    self.get_logger().info("[HW Error Recovery] 재시도 성공!")
+                except Exception as e2:
+                    self.get_logger().error(f"[HW Error Recovery] 복구 실패: {e2}")
+            else:
+                import traceback
+                self.get_logger().error(traceback.format_exc())
             if self.publish_joint_state:
                 self.publish_joint_state_message(targets)
 

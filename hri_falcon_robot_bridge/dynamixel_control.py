@@ -299,6 +299,48 @@ class DynamixelControl:
         else:
             if log:
                 print(f"Torque written for Dynamixel ID {id}")
+    def reboot(self, motor_id: int) -> bool:
+        """Reboot a single Dynamixel motor to clear hardware error flags."""
+        dxl_comm_result, dxl_error = self.packetHandler.reboot(self.portHandler, motor_id)
+        if dxl_comm_result != COMM_SUCCESS:
+            print(f"[Reboot] ID {motor_id}: Failed - {self.packetHandler.getTxRxResult(dxl_comm_result)}")
+            return False
+        elif dxl_error != 0:
+            print(f"[Reboot] ID {motor_id}: Error - {self.packetHandler.getRxPacketError(dxl_error)}")
+            return False
+        else:
+            print(f"[Reboot] ID {motor_id}: Rebooted successfully")
+            return True
+
+    def reboot_all(self) -> None:
+        """Reboot all Dynamixel motors to clear hardware error flags."""
+        import time
+        for motor_id in self.cfg.ids:
+            self.reboot(motor_id)
+        time.sleep(0.5)  # wait for reboot completion
+        self.enable_torque()
+        print("[Reboot] All motors rebooted and torque re-enabled")
+
+    def read_hardware_error(self, motor_id: int) -> int:
+        """Read Hardware Error Status register (addr 70 for XM430).
+        Bit flags: 0=Input Voltage, 2=Overheating, 3=Motor Encoder,
+                   4=Electrical Shock, 5=Overload
+        """
+        ADDR_HW_ERROR_STATUS = 70
+        value, dxl_comm_result, dxl_error = self.packetHandler.read1ByteTxRx(
+            self.portHandler, motor_id, ADDR_HW_ERROR_STATUS)
+        if dxl_comm_result != COMM_SUCCESS:
+            print(f"[HW Error] ID {motor_id}: Read failed - {self.packetHandler.getTxRxResult(dxl_comm_result)}")
+            return -1
+        return value
+
+    def read_all_hardware_errors(self) -> dict:
+        """Read hardware error status for all motors. Returns {id: error_value}."""
+        errors = {}
+        for motor_id in self.cfg.ids:
+            errors[motor_id] = self.read_hardware_error(motor_id)
+        return errors
+
     def close_port(self):
         self.disable_torque()
         self.portHandler.closePort()

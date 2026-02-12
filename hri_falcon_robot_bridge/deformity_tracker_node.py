@@ -51,9 +51,10 @@ else:
         except Exception:
             pass
 
-# HSV 색범위 프리셋 (기존과 동일)
+# HSV 색범위 프리셋
 COLOR_RANGES = {
     'yellow': [(np.array([20, 100, 100], np.uint8), np.array([35, 255, 255], np.uint8))],
+    'orange': [(np.array([10, 100, 100], np.uint8), np.array([20, 255, 255], np.uint8))],  # 귤(tangerine)
     'green':  [(np.array([40, 60, 60],  np.uint8), np.array([85, 255, 255], np.uint8))],
     'blue':   [(np.array([90, 100, 60],  np.uint8), np.array([130, 255, 255], np.uint8))],
     'red':    [
@@ -61,12 +62,28 @@ COLOR_RANGES = {
         (np.array([170, 120, 70], np.uint8), np.array([179, 255, 255], np.uint8)),
     ],
 }
-ACTIVE_COLORS = {
-    'red',
-    # 'green',
-    # 'blue',
-    # 'yellow',
+
+# 물체별 활성 색상 매핑
+OBJECT_COLOR_MAP = {
+    'balloon':   {'red'},
+    'apple':     {'red'},
+    'tangerine': {'orange'},
+    'tomato':    {'red'},
 }
+
+# 물체별 카메라/이미지 설정
+# manual_exposure: None이면 자동 노출, 숫자면 수동 노출 (1~10000)
+# morph_close: True이면 내부 구멍 메우기 적용
+OBJECT_CAMERA_SETTINGS = {
+    'balloon':   {'manual_exposure': None,  'morph_close': False},
+    'apple':     {'manual_exposure': 150,   'morph_close': True},
+    'tangerine': {'manual_exposure': None,  'morph_close': False},
+    'tomato':    {'manual_exposure': None,  'morph_close': False},
+}
+
+# 현재 추적 대상 물체 (여기서 변경)
+ACTIVE_OBJECT = 'tomato'
+ACTIVE_COLORS = OBJECT_COLOR_MAP.get(ACTIVE_OBJECT, {'red'})
 
 class DeformityTrackerNode(Node):
     def __init__(self) -> None:
@@ -233,7 +250,18 @@ class DeformityTrackerNode(Node):
                 try:
                     cfg.enable_device(cand)
                     cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)  # type: ignore[attr-defined]
-                    pipe.start(cfg)
+                    profile = pipe.start(cfg)
+                    # 물체별 카메라 설정 적용
+                    cam_settings = OBJECT_CAMERA_SETTINGS.get(ACTIVE_OBJECT, {})
+                    manual_exp = cam_settings.get('manual_exposure')
+                    if manual_exp is not None:
+                        try:
+                            sensor = profile.get_device().first_color_sensor()
+                            sensor.set_option(rs.option.enable_auto_exposure, 0)  # type: ignore[attr-defined]
+                            sensor.set_option(rs.option.exposure, float(manual_exp))  # type: ignore[attr-defined]
+                            self.get_logger().info(f"[RealSense] 수동 노출 설정: {manual_exp} (object={ACTIVE_OBJECT})")
+                        except Exception as e:
+                            self.get_logger().warn(f"[RealSense] 노출 설정 실패: {e}")
                     self.active_serial = cand
                     self.get_logger().info(f"[RealSense] using serial={cand} (attempt {attempt+1})")
                     return pipe
@@ -262,6 +290,8 @@ class DeformityTrackerNode(Node):
         mask_total = np.zeros(hsv.shape[:2], dtype=np.uint8)
         masks_by_color = {}
         for name, ranges in COLOR_RANGES.items():
+            if name not in ACTIVE_COLORS:
+                continue
             acc = None
             for lo, hi in ranges:
                 mr = cv2.inRange(hsv, lo, hi)
@@ -272,6 +302,11 @@ class DeformityTrackerNode(Node):
         kernel = np.ones((5, 5), np.uint8)
         mask_total = cv2.erode(mask_total, kernel, iterations=2)
         mask_total = cv2.dilate(mask_total, kernel, iterations=2)
+        # 물체별 설정: 내부 구멍 메우기 (MORPH_CLOSE)
+        cam_settings = OBJECT_CAMERA_SETTINGS.get(ACTIVE_OBJECT, {})
+        if cam_settings.get('morph_close', False):
+            close_kernel = np.ones((15, 15), np.uint8)
+            mask_total = cv2.morphologyEx(mask_total, cv2.MORPH_CLOSE, close_kernel)
         contours = cv2.findContours(mask_total.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if HAS_IMUTILS:
             cnts = imutils.grab_contours(contours)  # type: ignore[attr-defined]

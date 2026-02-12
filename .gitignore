@@ -1,17 +1,53 @@
 ############################################################
-# Global ignore rules for generated / large artifacts
+# hri_falcon_robot_bridge — .gitignore
 ############################################################
 
-# Database or cache fragments
-*.db
+# ── Python artifacts ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+*.whl
 
-# Ignore ALL generated outputs (logs, analysis, profiles, models, plots, etc.)
-# User wants local-only storage; keep completely out of Git history.
+# ── Build / colcon artifacts ──
+build/
+install/
+log/
+
+# ── Generated outputs (models, logs, plots, analysis) ──
+# → Google Drive에 별도 백업 (README.md 참조)
 outputs/
 
-# (Optional) If later you want to track lightweight summaries, you can whitelist:
-# !outputs/reports/
-# !outputs/reports/*.json
-# For now everything under outputs/ is ignored.
+# ── Log files ──
+*.log
+nohup.out
+MUJOCO_LOG.TXT
 
-# End of file
+# ── Large data / model files ──
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pkl
+*.db
+*.bag
+*.db3
+
+# ── Dataset images (Conditional Diffusion tutorial 등) ──
+scripts/3_model_learning/Conditional Diffusion/datasets/images/
+
+# ── Generated plots / images (논문용은 docs/에 보관) ──
+scripts/legacy/plots/
+
+# ── IDE / editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db

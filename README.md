@@ -1,384 +1,386 @@
+# HRI Falcon Robot Bridge
+
+**Human-Robot Interaction Stiffness Policy Learning for Dexterous Manipulation**
+
+ROS 2 Humble 기반의 햅틱 로봇 제어 및 강성(Stiffness) 정책 학습 프레임워크입니다. Force 센서, Falcon 햅틱 장치, Dynamixel 모터를 연동하여 인간 시연 데이터로부터 물체별 강성 정책을 학습하고 배포합니다.
+
+---
+
+## 📋 Table of Contents
+
+1. [Features](#-features)
+2. [System Architecture](#-system-architecture)
+3. [Experiment Progress](#-experiment-progress)
+4. [Installation](#-installation)
+5. [Package Structure](#-package-structure)
+6. [Pipeline Overview](#-pipeline-overview)
+7. [Quick Start](#-quick-start)
+8. [Detailed Usage](#-detailed-usage)
+9. [ROS 2 Nodes](#-ros-2-nodes)
+10. [Troubleshooting](#-troubleshooting)
+
+---
+
+## ✨ Features
+
+- **Multi-finger Stiffness Estimation**: 3-finger (Thumb, Index, Middle) × 3-axis (X, Y, Z) 강성 프로파일 생성
+- **Multiple Policy Learning Models**: BC, Diffusion Policy, LSTM-GMM, IBC, GMR 지원
+- **Multi-Object Experiments**: 물체별(풍선, 사과, 귤, 토마토) 시연 데이터 수집 및 정책 학습
+- **Real-time Deployment**: 학습된 모델을 ROS 2 노드로 실시간 배포
+- **Comprehensive Evaluation**: Pearson 상관계수, R², RMSE 기반 비교 분석
+- **Data Augmentation**: Physics-aware 데이터 증강으로 일반화 성능 향상
+
+---
+
+## 🏗 System Architecture
 
 ```
-cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer 
-sudo vi /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
-   # change to 16 -> 1
-   
-
-   # 특정 토픽의 메시지 실시간 출력 (force sensor 예시)
-ros2 topic echo /force_sensor/s1/wrench
-
-# EE pose 토픽 확인
-ros2 topic echo /ee_pose_if
-ros2 topic echo /ee_pose_mf
-ros2 topic echo /ee_pose_th
-
-# JointState 확인
-ros2 topic echo /joint_states
-
-# 실행 중인 ROS2 노드 확인
-ros2 node list
-
-# force_sensor 관련 프로세스 확인
-ps aux | grep force_sensor
-
-# 프로세스 강제 종료
-pkill -9 -f force_sensor_node
-
-# 모든 활성 토픽 나열
-ros2 topic list -t
-
-ros2 topic info /force_sensor/s1/wrench -v
-
-pkill -9 -f "ros2|python3.*hri_falcon"
-
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Hardware Layer                                     │
+├─────────────────┬─────────────────┬─────────────────┬───────────────────────┤
+│   Force Sensors │  Falcon Haptic  │   Dynamixel     │      SenseGlove       │
+│   (ATI Mini45)  │    Devices      │    Motors       │   (Hand Tracking)     │
+└────────┬────────┴────────┬────────┴────────┬────────┴───────────┬───────────┘
+         │                 │                 │                     │
+         ▼                 ▼                 ▼                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ROS 2 Node Layer                                   │
+├─────────────────┬─────────────────┬─────────────────┬───────────────────────┤
+│ force_sensor_   │   falcon_node   │ dynamixel_      │  sense_glove_node     │
+│ node            │                 │ control         │                       │
+└────────┬────────┴────────┬────────┴────────┬────────┴───────────┬───────────┘
+         │                 │                 │                     │
+         ▼                 ▼                 ▼                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Processing Layer                                      │
+├─────────────────┬─────────────────┬─────────────────────────────────────────┤
+│  data_logger    │  deformity_     │  robot_controller_node                  │
+│  _node          │  tracker_node   │  (Impedance Control)                    │
+└────────┬────────┴────────┬────────┴────────────────────┬────────────────────┘
+         │                 │                              │
+         ▼                 ▼                              ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Policy Learning Pipeline                                │
+├───────────────┬───────────────┬───────────────┬───────────────┬─────────────┤
+│ 1. Stiffness  │ 2. Data       │ 3. Model      │ 4. Policy     │ 5. Result   │
+│   Profiling   │   Augment     │   Learning    │   Deploy      │   Analysis  │
+└───────────────┴───────────────┴───────────────┴───────────────┴─────────────┘
 ```
 
+---
 
-## Stiffness Policy Learning Pipeline
+## 🧪 Experiment Progress
 
-### 1. Generate Stiffness Profiles
-Extract stiffness from EMG and force data:
+### 실험 대상 물체
+
+| 물체 | 상태 | 시연 수 | 비고 |
+|------|------|---------|------|
+| 🎈 **풍선 (Balloon)** | ✅ 완료 | 10회 (+ 증강 데이터) | 기본 실험 완료, 모델 학습 및 평가 완료 |
+| 🍎 **사과 (Apple)** | ⬜ 예정 | - | - |
+| 🍊 **귤 (Tangerine)** | ⬜ 예정 | - | - |
+| 🍅 **토마토 (Tomato)** | ⬜ 예정 | - | - |
+
+### 풍선 실험 결과 요약
+
+- **시연 데이터**: 10회 성공 시연 (2025.11.22 수집)
+- **강성 프로파일**: Sign-aligned Global T_K 기반 생성 완료
+- **학습 모델**: BC, Diffusion Policy (seq16_h2), LSTM-GMM, IBC, GMR
+- **평가 지표**: Pearson 상관계수, R², RMSE
+- **결과 시각화**: 6종 논문용 Figure 생성 완료
+
+---
+
+## 📦 Installation
+
+### Prerequisites
+
+- Ubuntu 22.04
+- ROS 2 Humble
+- Python 3.10+
+- CUDA 11.8+ (GPU 학습 시)
+
+### Build
+
 ```bash
-python3 scripts/generate_stiffness_profiles.py
+# Clone repository
+cd ~/ros2_ws/src
+git clone https://github.com/your-repo/hri_falcon_robot_bridge.git
+
+# Install dependencies
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+
+# Build
+colcon build --packages-select hri_falcon_robot_bridge
+source install/setup.bash
 ```
 
-### 2. Data Augmentation
-Augment demonstrations with physics-aware noise:
+### Python Dependencies
+
 ```bash
-cd /home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge
-
-# 기본 설정 (5x augmentation)
-python3 scripts/augment_demonstration_data.py --num-augment 5
-
-# 또는 더 aggressive (noise 증가)
-python3 scripts/augment_demonstration_data.py \
-  --num-augment 5 \
-  --noise-force 0.03 \
-  --noise-stiffness 0.08 \
-  --noise-deform 0.02
+pip install torch torchvision numpy pandas scipy scikit-learn matplotlib seaborn
+pip install gpytorch hydra-core omegaconf tensorboard
 ```
-- Input: 15 original demonstrations
-- Output: 90 total demonstrations (15 original + 75 augmented)
-- Applies Gaussian noise to forces, stiffness, deformation, end-effector positions
-- Preserves physical constraints (K ≥ 1 N/m)
 
+---
 
-### 3. Train Stiffness Prediction Models
+## 📁 Package Structure
 
-**4가지 구성 중 선택하여 실행:**
+```
+hri_falcon_robot_bridge/
+├── hri_falcon_robot_bridge/          # Python ROS 2 노드들
+│   ├── data_logger_node.py           # 시연 데이터 로깅
+│   ├── deformity_tracker_node.py     # 변형도 추적 (eccentricity)
+│   ├── force_sensor_node.py          # Force 센서 인터페이스
+│   ├── robot_controller_node.py      # 로봇 제어 (Impedance)
+│   ├── run_policy_node.py            # 학습된 정책 실행
+│   └── ...
+│
+├── src/                              # C++ 노드들
+│   ├── falcon_node.cpp               # Falcon 햅틱 장치 드라이버
+│   └── sense_glove_node.cpp          # SenseGlove 인터페이스
+│
+├── scripts/                          # 파이프라인 스크립트
+│   ├── 1_stiffness_profiling/        # 강성 프로파일 생성
+│   ├── 2_data_augmentation/          # 데이터 증강
+│   ├── 3_model_learning/             # 모델 학습 & 평가
+│   ├── 4_policy_depolyer/            # 정책 배포
+│   ├── 5_plot_result/                # 결과 시각화
+│   ├── analysis/                     # 추가 분석 스크립트
+│   └── legacy/                       # 레거시 코드 (DMP 등)
+│
+├── launch/                           # ROS 2 Launch 파일
+│   └── full_stiffness_pipeline.launch.py
+│
+├── outputs/                          # 출력 데이터 (물체별 정리)
+│   ├── logs/                         # 시연 로그
+│   │   ├── balloon/                  # 풍선 시연 (✅ 완료)
+│   │   │   ├── success/              #   성공 시연 10회 (20251122)
+│   │   │   ├── success_251117/       #   이전 성공 시연 + 증강
+│   │   │   └── 20251122/             #   날짜별 원본
+│   │   ├── apple/success/            # 사과 시연 (⬜ 예정)
+│   │   ├── tangerine/success/        # 귤 시연 (⬜ 예정)
+│   │   └── tomato/success/           # 토마토 시연 (⬜ 예정)
+│   ├── stiffness_profiles/           # 강성 프로파일
+│   │   └── balloon/                  #   풍선 프로파일 (✅)
+│   ├── stiffness_profiles_signaligned/ # Sign-aligned 프로파일
+│   │   └── balloon/                  #   풍선 (✅)
+│   ├── models/                       # 학습 모델
+│   │   └── balloon/                  #   풍선 모델 (✅)
+│   ├── analysis/                     # 분석 결과
+│   │   └── balloon/plots/            #   풍선 intent mapping (✅)
+│   └── plots/                        # 시각화
+│       └── balloon/full_profiles/    #   풍선 프로파일 플롯 (✅)
+│
+└── docs/                             # 문서
+```
+
+---
+
+## 🔄 Pipeline Overview
+
+### 전체 파이프라인 (5단계)
+
+| 단계 | 스크립트 위치 | 설명 |
+|------|--------------|------|
+| **1. Stiffness Profiling** | `scripts/1_stiffness_profiling/` | Force/EMG 데이터에서 강성 프로파일 추출 |
+| **2. Data Augmentation** | `scripts/2_data_augmentation/` | Physics-aware 노이즈로 데이터 증강 |
+| **3. Model Learning** | `scripts/3_model_learning/` | 다양한 모델 학습 (BC, Diffusion 등) |
+| **4. Policy Deploy** | `scripts/4_policy_depolyer/` | 학습된 모델 실시간 배포 |
+| **5. Result Analysis** | `scripts/5_plot_result/` | 결과 비교 및 시각화 |
+
+### 지원 모델
+
+| Model | Type | 특징 |
+|-------|------|------|
+| **BC** | Behavior Cloning | MLP 기반 회귀, 기본 baseline |
+| **Diffusion Policy** | Generative | DDPM/DDIM, seq16_h2 최적 구성 |
+| **LSTM-GMM** | Sequence | 시계열 + GMM 출력 |
+| **IBC** | Energy-based | Implicit Behavior Cloning |
+| **GMR** | Probabilistic | Gaussian Mixture Regression |
+
+---
+
+## 🚀 Quick Start
+
+### 1. 시연 데이터 수집
 
 ```bash
-cd /home/songwoo/ros2_ws/icra2025/src/hri_falcon_robot_bridge
+# ROS 2 파이프라인 실행 후 시연 녹화
+ros2 launch hri_falcon_robot_bridge full_stiffness_pipeline.launch.py
+# 성공 시연 CSV → outputs/logs/<object>/success/ 에 저장
+```
 
-# [구성 1] Unified + Original
+### 2. 강성 프로파일 생성
+
+```bash
+cd ~/ros2_ws/src/hri_falcon_robot_bridge
+
+# Sign-aligned Global T_K 방식으로 강성 프로파일 생성
+python3 scripts/1_stiffness_profiling/generate_stiffness_profiles_global_tk_sign_aligned.py
+```
+
+### 3. 모델 학습
+
+```bash
+# 모든 모델 학습 (Unified + Global T_K) - 추천
 python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
   --mode unified \
-  --stiffness-dir outputs/analysis/stiffness_profiles \
   --models all \
   --bc-epochs 200 \
   --diffusion-epochs 200 \
-  --augment --augment-num 1 \
-  --augment-noise-force 0.015 \
-  --augment-noise-stiffness 0.04 \
-  --augment-temporal-jitter 1
-
-# [구성 2] Unified + Global T_K (추천: 성능 가장 좋음)
-python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
-  --mode unified \
-  --stiffness-dir outputs/analysis/stiffness_profiles_global_tk \
-  --models all \
-  --bc-epochs 200 \
-  --diffusion-epochs 200 \
-  --augment --augment-num 1 \
-  --augment-noise-force 0.015 \
-  --augment-noise-stiffness 0.04 \
-  --augment-temporal-jitter 1
-
-# [구성 3] Per-Finger + Original
-python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
-  --mode per-finger \
-  --stiffness-dir outputs/analysis/stiffness_profiles \
-  --models all \
-  --bc-epochs 200 \
-  --augment --augment-num 1 \
-  --augment-noise-force 0.015 \
-  --augment-noise-stiffness 0.04 \
-  --augment-temporal-jitter 1
-
-# [구성 4] Per-Finger + Global T_K
-python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
-  --mode per-finger \
-  --stiffness-dir outputs/analysis/stiffness_profiles_global_tk \
-  --models all \
-  --bc-epochs 200 \
-  --augment --augment-num 1 \
-  --augment-noise-force 0.015 \
-  --augment-noise-stiffness 0.04 \
-  --augment-temporal-jitter 1
-
-# 4가지 모두 자동 실행 (배치 스크립트)
-bash run_all_with_tb.sh
+  --augment --augment-num 1
 ```
 
-**Available Models:**
-- **GMM/GMR**: Gaussian Mixture Model/Regression (multimodal, uncertainty)
-- **BC**: Behavior Cloning (MLP regression, baseline)
-- **LSTM-GMM**: Sequence model with mixture outputs
-- **Diffusion**: Diffusion Policy (C/T variants)
-- **IBC**: Implicit Behavior Cloning (energy-based)
-- **GP**: Gaussian Process Regression (small data + uncertainty)
-- **MDN**: Mixture Density Network (GMM + deep learning)
+### 4. 결과 시각화
 
-**Tip:** Line continuation uses backslash (\) as the very last character — no trailing spaces. To use global-T_K, change `--stiffness-dir` to `outputs/analysis/stiffness_profiles_global_tk`.
-
-### GP 대용량 처리 메모 (중요)
-- Exact GP는 메모리 O(N^2), 시간 O(N^3) 복잡도로, 수십만 샘플에서 메모리 에러가 납니다.
-- 본 레포 GPBaseline은 자동으로 학습용 샘플을 최대 4k로 랜덤 서브샘플링하고, 예측은 배치로 분할해 메모리 폭주를 막습니다.
-- 설정은 `scripts/3_model_learning/configs/stiffness_policy/gp.yaml`에서 조정 가능합니다:
-  - `max_train_points`: 학습 최대 샘플 수 (기본 4000)
-  - `batch_predict_size`: 배치 예측 크기 (기본 2048)
-  - `subsample_strategy`: random (추후 kmeans 등 추가 가능)
-  
-대용량에서 GP가 너무 느리면, `--stride`를 늘려 입력 데이터 자체를 다운샘플링하거나, GP를 제외하고 다른 모델군(MDN/BC/Diffusion 등)을 활용하세요.
+```bash
+python3 scripts/5_plot_result/compare_stiffness_sessions.py
 ```
-오프라인 증강
 
-장점
-재현성 높음: 한 번 생성하면 모든 실험에서 동일 데이터 사용.
-학습 속도 안정: 학습 중 증강 계산 오버헤드가 없음.
-복잡/무거운 물리 연산을 미리 계산해 둘 수 있음.
-디버깅 쉬움: 실제 CSV가 있으니 케이스 재현이 쉬움.
-단점
-디스크 용량 증가.
-데이터 split 주의 필요: 원본과 증강본이 서로 다른 split으로 섞이면 데이터 누수 위험.
-다양성이 고정됨: 만든 만큼만 다양함.
-온더플라이 증강
+---
 
-장점
-디스크 추가 사용 없음.
-실행마다(또는 매 epoch) 조금씩 다른 샘플 생성 → 다양성↑, 과적합 완화에 도움.
-데이터 누수 위험 낮음: 보통 train split 결정 후에 증강을 적용하므로 테스트로 새어 나가기 어려움.
-단점
-매 학습 스텝마다 증강을 계산 → CPU/GPU 오버헤드 증가 가능.
-재현성 낮아짐: seed로 고정 가능하지만, 완전 동일한 “셋”을 반복하기는 어려움.
-너무 강한/복잡한 물리 제약·후처리를 매번 하면 병목이 될 수 있음.
-```
-| unified <-> per-finger
+## 📖 Detailed Usage
+
+### 학습 구성 옵션
+
+| 구성 | 설명 | 명령 옵션 |
+|------|------|----------|
+| **Unified + Sign-aligned** | 단일 모델 (20D→9D), Sign-aligned Global T_K ⭐ | `--mode unified` |
+| **Per-Finger** | 손가락별 모델 (8D→3D) | `--mode per-finger` |
+
+### 데이터 차원
 
 **Observation (20D):**
-- Force sensors: 9D (3 sensors × 3 axes)
-- End-effector positions: 9D (3 fingers × 3 axes)
-- Deformation: 2D (circumferential, eccentricity)
+- Force 센서: 9D (3 센서 × 3 축)
+- End-effector 위치: 9D (3 손가락 × 3 축)
+- 변형도: 2D (circumferential, eccentricity)
 
 **Action (9D):**
-- Stiffness: 9D (3 fingers × 3 DOF: K1, K2, K3)
+- Stiffness: 9D (3 손가락 × 3 DOF: K1, K2, K3)
 
-
-### 4. Monitor Training with TensorBoard
-View real-time training metrics:
-```bash
-# Start TensorBoard
-tensorboard --logdir src/hri_falcon_robot_bridge/outputs/models/policy_learning/tensorboard --port 6006
-
-# Access in browser at http://localhost:6006
-```
-
-### 5. Evaluate Trained Models
-
-**먼저 최신 timestamp 확인:**
+### 배치 학습 실행
 
 ```bash
-# 모든 artifact 디렉토리 확인 (최신 순)
-ls -1dt outputs/models/policy_learning*/artifacts/*
-
-# 또는 특정 구성만
-ls -1t outputs/models/stiffness_policies/policy_learning_unified/artifacts/*
-ls -1t outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/*
-ls -1t outputs/models/stiffness_policies/policy_learning_per_finger/artifacts/*
-ls -1t outputs/models/stiffness_policies/policy_learning_global_tk_per_finger/artifacts/*
-```
-
-**평가 실행 (아래 `YYYYMMDD_HHMMSS`를 위에서 확인한 실제 timestamp로 교체):**
-
-```bash
-# Unified + Original 평가
-python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir outputs/models/stiffness_policies/policy_learning_unified/artifacts/YYYYMMDD_HHMMSS \
-  --models all
-
-# Unified + Global T_K 평가
-python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/YYYYMMDD_HHMMSS \
-  --models all
-
-# Per-Finger + Original 평가
-python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir outputs/models/stiffness_policies/policy_learning_per_finger/artifacts/YYYYMMDD_HHMMSS \
-  --models bc
-
-# Per-Finger + Global T_K 평가
-python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir outputs/models/stiffness_policies/policy_learning_global_tk_per_finger/artifacts/YYYYMMDD_HHMMSS \
-  --models all
-```
-
-**자동으로 최신 timestamp 사용 (고급):**
-
-```bash
-# Unified + Global T_K 최신 결과 자동 평가
-LATEST=$(ls -1dt outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/* | head -1)
-python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir "$LATEST" \
-  --models all
-```
-
-**평가 옵션:**
-- `--diffusion-sampler ddpm` : DDPM or DDIM sampling
-- `--models all` : 모든 모델 평가 (또는 bc, gmr, diffusion_c 등 개별 지정)
-
-### 6. Visualize Results
-Generate comprehensive comparison plots:
-```bash
-# 모든 모델 비교 시각화
-python3 scripts/3_model_learning/visualize_all_models.py
-```
-
-Outputs:
-- `all_models_comparison.png` : All models vs ground truth (3×3 grid)
-- `top3_models_comparison.png` : Top 3 models by R²
-- Per-model performance metrics table
-
-### Directory Structure
-```
-outputs/
-├── logs/success/                           # Raw demonstration logs (*.csv)
-├── analysis/
-│   └── stiffness_profiles_global_tk/      # Generated stiffness profiles (*_paper_profile.csv)
-└── models/stiffness_policies/
-  ├── policy_learning_unified/            # Unified (original stiffness) models
-  │   ├── artifacts/<timestamp>/
-  │   │   ├── bc.pt
-  │   │   ├── diffusion_c.pt / diffusion_t.pt
-  │   │   ├── gmm.pkl
-  │   │   ├── ibc.pt
-  │   │   ├── lstm_gmm.pt
-  │   │   ├── scalers.pkl
-  │   │   └── manifest.json
-  │   └── tensorboard/<timestamp>/        # TensorBoard events (bc, ibc, diffusion, lstm_gmm, mdn)
-  ├── policy_learning_global_tk_unified/  # Unified (global T_K) models
-  │   ├── artifacts/<timestamp>/ ... (same layout)
-  │   └── tensorboard/<timestamp>/
-  ├── policy_learning_per_finger/         # Per-finger (original stiffness) models
-  │   ├── artifacts/<timestamp>/
-  │   │   ├── th/bc.pt, scalers.pkl, manifest.json
-  │   │   ├── if/bc.pt, scalers.pkl, manifest.json
-  │   │   ├── mf/bc.pt, scalers.pkl, manifest.json
-  │   │   └── manifest.json (aggregate)
-  │   └── tensorboard/<timestamp>/        # (Reserved for future per-finger TB runs)
-  ├── policy_learning_global_tk_per_finger/ # Per-finger (global T_K) models
-  │   ├── artifacts/<timestamp>/ (same per-finger layout)
-  │   └── tensorboard/<timestamp>/
-  ├── artifacts/                          # Legacy (symlink to unified) – backward compatibility
-  │   └── <timestamp>/                    # (Old path retained for existing scripts)
-    │       ├── bc.pt                       # Behavior cloning model
-    │       ├── gmm.pkl, gmr.pkl           # Gaussian mixture models
-    │       ├── lstm_gmm.pt                 # LSTM-GMM model
-    │       ├── diffusion_*.pt              # Diffusion models (C/T, DDPM/DDIM)
-    │       ├── ibc.pt                      # Implicit BC model
-    │       ├── scalers.pkl                 # Data normalization scalers
-    │       └── manifest.json               # Model metadata
-    ├── tensorboard/                        # TensorBoard logs
-    │   └── <model_name>/                   # Per-model event files
-    ├── plots/                              # Evaluation visualizations
-    └── benchmark_summary_<timestamp>.json  # Performance summary
-```
-
-### 4가지 구성별 실행 & 평가 (Unified / Per-Finger × Original / Global T_K)
-
-| 구성 | 설명 | 학습 명령 예시 | 평가 경로 예시 |
-|------|------|----------------|----------------|
-| Unified + Original | 단일 모델 (20D→9D) 원본 강성 | `--mode unified --stiffness-dir outputs/analysis/stiffness_profiles` | `outputs/models/stiffness_policies/policy_learning_unified/artifacts/<ts>` |
-| Unified + Global T_K | 단일 모델 (20D→9D) 전역 T_K | `--mode unified --stiffness-dir outputs/analysis/stiffness_profiles_global_tk` | `outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/<ts>` |
-| Per-Finger + Original | 손가락별 3개 모델 (8D→3D) 원본 강성 | `--mode per-finger --stiffness-dir outputs/analysis/stiffness_profiles` | `outputs/models/stiffness_policies/policy_learning_per_finger/artifacts/<ts>` |
-| Per-Finger + Global T_K | 손가락별 3개 모델 (8D→3D) 전역 T_K | `--mode per-finger --stiffness-dir outputs/analysis/stiffness_profiles_global_tk` | `outputs/models/stiffness_policies/policy_learning_global_tk_per_finger/artifacts/<ts>` |
-
-학습 예시 (4-way 모두 실행):
-
-```bash
+# Unified 모드 전체 실행
 bash run_all_with_tb.sh
 ```
 
-개별 실행 예시 (Unified + Global T_K):
+### 데이터 증강 옵션
 
 ```bash
 python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
-  --mode unified \
-  --stiffness-dir outputs/analysis/stiffness_profiles_global_tk \
-  --models all \
-  --augment --augment-num 1 \
+  --augment \
+  --augment-num 1 \
   --augment-noise-force 0.015 \
   --augment-noise-stiffness 0.04 \
   --augment-temporal-jitter 1
 ```
 
-평가 (Unified + Global T_K):
+---
+
+## 🤖 ROS 2 Nodes
+
+### Core Nodes
+
+| Node | Topic (Pub/Sub) | 설명 |
+|------|-----------------|------|
+| `force_sensor_node` | `/force_sensor/s{1,2,3}/wrench` | ATI 센서 데이터 발행 |
+| `falcon_node` | `/falcon/{position,force}` | Falcon 위치/힘 피드백 |
+| `robot_controller_node` | `/joint_commands` | Dynamixel 제어 |
+| `data_logger_node` | 다수 Subscribe | 시연 데이터 CSV 저장 |
+| `deformity_tracker_node` | `/deformity` | 변형도 계산 |
+| `run_policy_node` | `/stiffness_command` | 학습된 정책 실행 |
+
+### Launch
 
 ```bash
-python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir outputs/models/stiffness_policies/policy_learning_global_tk_unified/artifacts/<timestamp> \
-  --models all
+# 전체 파이프라인 실행
+ros2 launch hri_falcon_robot_bridge full_stiffness_pipeline.launch.py
 ```
 
-평가 (Per-Finger + Original):
+### 유용한 명령어
 
 ```bash
-python3 scripts/3_model_learning/evaluate_stiffness_policy.py \
-  --artifact-dir outputs/models/stiffness_policies/policy_learning_per_finger/artifacts/<timestamp> \
-  --models bc
+# 토픽 확인
+ros2 topic list -t
+ros2 topic echo /force_sensor/s1/wrench
+
+# 노드 확인
+ros2 node list
+
+# USB 레이턴시 최적화 (Force 센서용)
+sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/ttyUSB0/latency_timer'
 ```
 
-주의: 기존 경로(`policy_learning`, `policy_learning_global_tk`)는 새 구조의 unified 폴더로 심볼릭 링크가 생성되어 기존 스크립트 호환이 유지됩니다.
+---
 
-### Common Commands
+## 🔧 Troubleshooting
 
-**Check Training Status:**
+### 프로세스 강제 종료
 
 ```bash
-# View training log
-tail -f outputs/unified_all_models.log
-
-# Check if training is running
-ps aux | grep "run_stiffness_policy_benchmarks.py"
+pkill -9 -f "ros2|python3.*hri_falcon"
 ```
 
-**View Benchmark Results:**
+### USB 레이턴시 최적화 (Force 센서)
 
 ```bash
-# List all benchmarks (sorted by time)
-ls -lt outputs/models/stiffness_policies/benchmark_summary_*.json | head -5
-
-# Pretty-print latest benchmark
-ls -t outputs/models/stiffness_policies/benchmark_summary_*.json | head -1 | xargs cat | python3 -m json.tool
-
-# Extract model performance
-cat benchmark_summary_<timestamp>.json | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for name, metrics in data['models'].items():
-    print(f\"{name:15s} R²={metrics['r2']:7.4f} RMSE={metrics['rmse']:7.2f}\")
-"
+sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/ttyUSB0/latency_timer'
 ```
 
-**Quick Data Stats:**
+### TensorBoard 포트 충돌
 
 ```bash
-# Count demonstrations
-ls outputs/logs/success/*.csv | wc -l
-
-# Count augmented demos
-ls outputs/logs/success/*_aug*.csv | wc -l
-
-# Check stiffness profiles
-ls outputs/analysis/stiffness_profiles_global_tk/*_paper_profile.csv | wc -l
+tensorboard --logdir outputs/models/balloon/policy_learning_unified/tensorboard --port 6007
 ```
+
+---
+
+## 📊 Output Files
+
+### 데이터 디렉토리 구조 (물체별 분류)
+
+```
+outputs/
+├── logs/<object>/success/            # 시연 CSV 데이터
+├── stiffness_profiles/<object>/      # 강성 프로파일 CSV & 플롯
+├── stiffness_profiles_signaligned/<object>/  # Sign-aligned 프로파일
+├── models/<object>/                  # 학습된 모델 체크포인트
+│   ├── benchmark_sweep/              #   하이퍼파라미터 탐색 결과
+│   └── policy_learning_unified/      #   Unified 학습 결과
+│       ├── artifacts/<timestamp>/    #     모델 파일 (.pt, .pkl)
+│       └── tensorboard/              #     TensorBoard 로그
+├── analysis/<object>/plots/          # Intent mapping 플롯
+└── plots/<object>/full_profiles/     # 전체 프로파일 시각화
+```
+
+### 논문용 Figure (풍선 실험)
+
+```
+outputs/stiffness_comparison/paper_figures/
+├── fig_gt_diffusion_force_comparison.png          # GT vs Diffusion 힘 비교
+├── fig_stiffness_per_model_all_axes.png            # 모델별 전 축 강성 비교
+├── fig_stiffness_per_model_all_axes_unified_y.png  # 통일 Y축 버전
+├── fig_stiffness_per_model_thumb_sorted.png        # Thumb 정렬 비교
+├── fig_stiffness_per_model_optimal_aligned_raw.png # Optimal alignment 비교
+└── fig_stiffness_per_model_optimal_aligned_raw_unified_y.png  # 통일 Y축 버전
+```
+
+---
+
+## 📚 References
+
+- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/)
+- [Implicit Behavior Cloning](https://implicitbc.github.io/)
+- [ROS 2 Humble Documentation](https://docs.ros.org/en/humble/)
+
+---
+
+## 📝 License
+
+MIT License
+
+## 👥 Contact
+
+- Maintainer: Songwoo Kim
