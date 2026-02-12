@@ -1,0 +1,58 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "colcon: build hri_falcon_robot_bridge",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"source /opt/ros/humble/setup.bash && colcon build --packages-select hri_falcon_robot_bridge && source install/setup.bash"
+			]
+		},
+		{
+			"label": "colcon: build hri_falcon_robot_bridge",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"source /opt/ros/humble/setup.bash && colcon build --packages-select hri_falcon_robot_bridge && source install/setup.bash"
+			]
+		},
+		{
+			"label": "colcon: build hri_falcon_robot_bridge",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"source /opt/ros/humble/setup.bash && colcon build --packages-select hri_falcon_robot_bridge --cmake-args -DCMAKE_BUILD_TYPE=Debug && source install/setup.bash"
+			]
+		},
+		{
+			"label": "colcon: build hri_falcon_robot_bridge (debug)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"source /opt/ros/humble/setup.bash && colcon build --packages-select hri_falcon_robot_bridge --cmake-args -DCMAKE_BUILD_TYPE=Debug && source install/setup.bash"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "colcon: build hri_falcon_robot_bridge (debug)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"source /opt/ros/humble/setup.bash && colcon build --packages-select hri_falcon_robot_bridge --cmake-args -DCMAKE_BUILD_TYPE=Debug && source install/setup.bash"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		}
+	]
+}
