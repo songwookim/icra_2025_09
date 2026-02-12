@@ -369,7 +369,30 @@ outputs/stiffness_comparison/paper_figures/
 
 ---
 
-## 📚 References
+## � Data & Model Storage
+
+실험 데이터와 학습된 모델은 **GitHub에 포함되지 않으며**, Google Drive에 비공개로 별도 보관합니다.
+
+| 데이터 | 경로 | 저장 위치 |
+|--------|------|-----------|
+| 학습된 모델 (`.pt`, `.pkl`) | `outputs/models/` | Google Drive |
+| 실험 로그 (CSV) | `outputs/stiffness_logs/` | Google Drive |
+| 분석 결과 | `outputs/analysis/` | Google Drive |
+| EMG 데이터 | `outputs/emg/` | Google Drive |
+| DMP 모델 | `dmp_models/` | Google Drive |
+
+### 데이터 복원 방법
+
+```bash
+# Google Drive에서 outputs/ 폴더를 다운로드한 후:
+cp -r ~/Downloads/outputs ./outputs/
+```
+
+> `.gitignore`에 의해 `outputs/`, `*.pt`, `*.pkl`, `*.log`, `__pycache__/` 등은 자동으로 Git 추적에서 제외됩니다.
+
+---
+
+## �📚 References
 
 - [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/)
 - [Implicit Behavior Cloning](https://implicitbc.github.io/)
