@@ -6,76 +6,93 @@ ROS 2 Humble 기반의 햅틱 로봇 제어 및 강성(Stiffness) 정책 학습 
 
 ---
 
-## 📋 Table of Contents
+## Demo
 
-1. [Features](#-features)
-2. [System Architecture](#-system-architecture)
-3. [Experiment Progress](#-experiment-progress)
-4. [Installation](#-installation)
-5. [Package Structure](#-package-structure)
-6. [Pipeline Overview](#-pipeline-overview)
-7. [Quick Start](#-quick-start)
-8. [Detailed Usage](#-detailed-usage)
-9. [ROS 2 Nodes](#-ros-2-nodes)
-10. [Troubleshooting](#-troubleshooting)
+<table>
+<tr>
+<td align="center"><b>데이터 수집 (컴퓨터 화면)</b></td>
+<td align="center"><b>데이터 수집 (실제 장면)</b></td>
+</tr>
+<tr>
+<td>
+
+<!-- TODO: 데이터 수집 시 컴퓨터 화면 영상 URL -->
+https://github.com/user-attachments/assets/PLACEHOLDER_DATA_COLLECTION_SCREEN
+
+</td>
+<td>
+
+<!-- TODO: 데이터 수집 시 실제 장면 영상 URL -->
+https://github.com/user-attachments/assets/PLACEHOLDER_DATA_COLLECTION_SCENE
+
+</td>
+</tr>
+<tr>
+<td align="center"><b>정책 수행 (컴퓨터 화면)</b></td>
+<td align="center"><b>정책 수행 (실제 장면)</b></td>
+</tr>
+<tr>
+<td>
+
+<!-- TODO: 실제 수행 시 컴퓨터 화면 영상 URL -->
+https://github.com/user-attachments/assets/PLACEHOLDER_DEPLOYMENT_SCREEN
+
+</td>
+<td>
+
+<!-- TODO: 실제 수행 시 실제 장면 영상 URL -->
+https://github.com/user-attachments/assets/PLACEHOLDER_DEPLOYMENT_SCENE
+
+</td>
+</tr>
+</table>
 
 ---
 
-## ✨ Features
+## System Architecture
 
-- **Multi-finger Stiffness Estimation**: 3-finger (Thumb, Index, Middle) × 3-axis (X, Y, Z) 강성 프로파일 생성
-- **Multiple Policy Learning Models**: BC, Diffusion Policy, LSTM-GMM, IBC, GMR 지원
-- **Multi-Object Experiments**: 물체별(풍선, 사과, 귤, 토마토) 시연 데이터 수집 및 정책 학습
-- **Real-time Deployment**: 학습된 모델을 ROS 2 노드로 실시간 배포
-- **Comprehensive Evaluation**: Pearson 상관계수, R², RMSE 기반 비교 분석
-- **Data Augmentation**: Physics-aware 데이터 증강으로 일반화 성능 향상
+<img src="readme_resources/system_architecture.png" alt="System Architecture" width="720" />
 
----
+```mermaid
+flowchart LR
+    subgraph Sensors
+        FS["MMS101 Force Sensor"]
+        SG["SenseGlove"]
+        CAM["Camera (Deformity)"]
+    end
+    subgraph Nodes["ROS 2 Nodes"]
+        FSN["force_sensor_node"]
+        FN["falcon_node (C++)"]
+        RC["robot_controller_node"]
+        DT["deformity_tracker_node"]
+        DL["data_logger_node"]
+        RP["run_policy_node"]
+    end
+    subgraph Actuators
+        FAL["Novint Falcon"]
+        DXL["Dynamixel"]
+    end
 
-## 🏗 System Architecture
-
+    FS --> FSN -->|wrench| FN --> FAL
+    SG --> RC --> DXL
+    CAM --> DT -->|eccentricity| DL
+    FSN -->|wrench| DL
+    RC -->|ee_pose| DL
+    DL -->|CSV| SP["1. Stiffness Profiling"]
+    SP --> DA["2. Data Augmentation"]
+    DA --> ML["3. Model Learning"]
+    ML --> RP -->|stiffness_cmd| RC
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Hardware Layer                                     │
-├─────────────────┬─────────────────┬─────────────────┬───────────────────────┤
-│   Force Sensors │  Falcon Haptic  │   Dynamixel     │      SenseGlove       │
-│   (ATI Mini45)  │    Devices      │    Motors       │   (Hand Tracking)     │
-└────────┬────────┴────────┬────────┴────────┬────────┴───────────┬───────────┘
-         │                 │                 │                     │
-         ▼                 ▼                 ▼                     ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           ROS 2 Node Layer                                   │
-├─────────────────┬─────────────────┬─────────────────┬───────────────────────┤
-│ force_sensor_   │   falcon_node   │ dynamixel_      │  sense_glove_node     │
-│ node            │                 │ control         │                       │
-└────────┬────────┴────────┬────────┴────────┬────────┴───────────┬───────────┘
-         │                 │                 │                     │
-         ▼                 ▼                 ▼                     ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Processing Layer                                      │
-├─────────────────┬─────────────────┬─────────────────────────────────────────┤
-│  data_logger    │  deformity_     │  robot_controller_node                  │
-│  _node          │  tracker_node   │  (Impedance Control)                    │
-└────────┬────────┴────────┬────────┴────────────────────┬────────────────────┘
-         │                 │                              │
-         ▼                 ▼                              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Policy Learning Pipeline                                │
-├───────────────┬───────────────┬───────────────┬───────────────┬─────────────┤
-│ 1. Stiffness  │ 2. Data       │ 3. Model      │ 4. Policy     │ 5. Result   │
-│   Profiling   │   Augment     │   Learning    │   Deploy      │   Analysis  │
-└───────────────┴───────────────┴───────────────┴───────────────┴─────────────┘
-```
 
 ---
 
-## 🧪 Experiment Progress
+## Experiment Progress
 
 ### 실험 대상 물체
 
 | 물체 | 상태 | 시연 수 | 비고 |
 |------|------|---------|------|
-| 🎈 **풍선 (Balloon)** | ✅ 완료 | 10회 (+ 증강 데이터) | 기본 실험 완료, 모델 학습 및 평가 완료 |
+| 🎈 **풍선 (Balloon)** | ✅ 완료 | 10회 (+ 증강 데이터) | 모델 학습 및 평가 완료 |
 | 🍎 **사과 (Apple)** | ⬜ 예정 | - | - |
 | 🍊 **귤 (Tangerine)** | ⬜ 예정 | - | - |
 | 🍅 **토마토 (Tomato)** | ⬜ 예정 | - | - |
@@ -90,7 +107,7 @@ ROS 2 Humble 기반의 햅틱 로봇 제어 및 강성(Stiffness) 정책 학습 
 
 ---
 
-## 📦 Installation
+## Installation
 
 ### Prerequisites
 
@@ -99,32 +116,41 @@ ROS 2 Humble 기반의 햅틱 로봇 제어 및 강성(Stiffness) 정책 학습 
 - Python 3.10+
 - CUDA 11.8+ (GPU 학습 시)
 
+### Conda Environment
+
+본 프로젝트는 `icra_2025_1` conda 환경을 사용합니다. 레포에 포함된 `environment.yml`로 동일 환경을 재현할 수 있습니다.
+
+```bash
+# 환경 생성 (최초 1회)
+conda env create -f environment.yml
+
+# 환경 활성화
+conda activate icra_2025_1
+```
+
+> 환경 업데이트: `conda env update -f environment.yml --prune`
+
 ### Build
 
 ```bash
 # Clone repository
 cd ~/ros2_ws/src
-git clone https://github.com/your-repo/hri_falcon_robot_bridge.git
+git clone https://github.com/songwookim/icra_2025_09.git hri_falcon_robot_bridge
 
-# Install dependencies
+# Install ROS dependencies
 cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
 
 # Build
+source /opt/ros/humble/setup.bash
+conda activate icra_2025_1
 colcon build --packages-select hri_falcon_robot_bridge
 source install/setup.bash
 ```
 
-### Python Dependencies
-
-```bash
-pip install torch torchvision numpy pandas scipy scikit-learn matplotlib seaborn
-pip install gpytorch hydra-core omegaconf tensorboard
-```
-
 ---
 
-## 📁 Package Structure
+## Package Structure
 
 ```
 hri_falcon_robot_bridge/
@@ -150,36 +176,59 @@ hri_falcon_robot_bridge/
 │   └── legacy/                       # 레거시 코드 (DMP 등)
 │
 ├── launch/                           # ROS 2 Launch 파일
-│   └── full_stiffness_pipeline.launch.py
-│
-├── outputs/                          # 출력 데이터 (물체별 정리)
-│   ├── logs/                         # 시연 로그
-│   │   ├── balloon/                  # 풍선 시연 (✅ 완료)
-│   │   │   ├── success/              #   성공 시연 10회 (20251122)
-│   │   │   ├── success_251117/       #   이전 성공 시연 + 증강
-│   │   │   └── 20251122/             #   날짜별 원본
-│   │   ├── apple/success/            # 사과 시연 (⬜ 예정)
-│   │   ├── tangerine/success/        # 귤 시연 (⬜ 예정)
-│   │   └── tomato/success/           # 토마토 시연 (⬜ 예정)
-│   ├── stiffness_profiles/           # 강성 프로파일
-│   │   └── balloon/                  #   풍선 프로파일 (✅)
-│   ├── stiffness_profiles_signaligned/ # Sign-aligned 프로파일
-│   │   └── balloon/                  #   풍선 (✅)
-│   ├── models/                       # 학습 모델
-│   │   └── balloon/                  #   풍선 모델 (✅)
-│   ├── analysis/                     # 분석 결과
-│   │   └── balloon/plots/            #   풍선 intent mapping (✅)
-│   └── plots/                        # 시각화
-│       └── balloon/full_profiles/    #   풍선 프로파일 플롯 (✅)
-│
-└── docs/                             # 문서
+├── resource/                         # 설정 파일
+│   ├── robot_parameter/config.yaml   # Dynamixel 설정
+│   └── sensor_parameter/config.yaml  # Force 센서 설정
+├── readme_resources/                 # README 이미지
+├── environment.yml                   # Conda 환경 파일
+└── outputs/                          # 출력 데이터 (.gitignore)
 ```
 
 ---
 
-## 🔄 Pipeline Overview
+## Resource Parameters
+
+### `resource/robot_parameter/config.yaml`
+
+Dynamixel 모터 및 로봇 컨트롤러 설정.
+
+| Parameter | Default | 설명 |
+|-----------|---------|------|
+| `input_source` | `"hand"` | 입력 소스 (`"hand"` \| `"falcon"`) |
+| `test_mode` | `true` | 테스트 모드 (dry-run) |
+| `arm` | `false` | 팔 사용 여부 |
+| `dynamixel.ids` | `[10,11,12,20,21,22,30,31,32]` | 사용할 Dynamixel ID 리스트 (3-finger × 3-joint) |
+| `dynamixel.device_name` | `"/dev/ttyUSB0"` | USB 시리얼 포트 |
+| `dynamixel.baudrate` | `1000000` | 통신 속도 |
+| `dynamixel.initial_positions` | `[1365,1728,1707,...]` | 초기 관절 위치 (0‒4095) |
+| `dynamixel.current.max_current` | `10` | 최대 전류 제한 |
+
+### `resource/sensor_parameter/config.yaml`
+
+MMS101 Force 센서 설정.
+
+| Parameter | Default | 설명 |
+|-----------|---------|------|
+| `mms101.dest_ip` | `"192.168.0.200"` | 센서 IP 주소 |
+| `mms101.dest_port` | `1366` | 센서 포트 |
+| `mms101.sensors` | `[1, 2, 3]` | 사용할 센서 번호 |
+| `mms101.n_samples` | `10` | 측정 샘플 수 |
+| `mms101.debug` | `false` | 디버그 모드 |
+
+---
+
+## Pipeline Overview
 
 ### 전체 파이프라인 (5단계)
+
+```mermaid
+flowchart TD
+    A["1. Data Collection\ndata_logger_node → CSV"] --> B["2. Stiffness Profiling\ngenerate_stiffness_profiles"]
+    B --> C["3. Data Augmentation\nphysics-aware noise"]
+    C --> D["4. Model Learning\nrun_stiffness_policy_benchmarks"]
+    D --> E["5. Evaluation & Visualization\nevaluate / plot_result"]
+    D --> M["GMM | BC | IBC | Diffusion | LSTM-GMM"]
+```
 
 | 단계 | 스크립트 위치 | 설명 |
 |------|--------------|------|
@@ -201,7 +250,7 @@ hri_falcon_robot_bridge/
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. 시연 데이터 수집
 
@@ -215,15 +264,12 @@ ros2 launch hri_falcon_robot_bridge full_stiffness_pipeline.launch.py
 
 ```bash
 cd ~/ros2_ws/src/hri_falcon_robot_bridge
-
-# Sign-aligned Global T_K 방식으로 강성 프로파일 생성
 python3 scripts/1_stiffness_profiling/generate_stiffness_profiles_global_tk_sign_aligned.py
 ```
 
 ### 3. 모델 학습
 
 ```bash
-# 모든 모델 학습 (Unified + Global T_K) - 추천
 python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
   --mode unified \
   --models all \
@@ -240,7 +286,7 @@ python3 scripts/5_plot_result/compare_stiffness_sessions.py
 
 ---
 
-## 📖 Detailed Usage
+## Detailed Usage
 
 ### 학습 구성 옵션
 
@@ -259,13 +305,6 @@ python3 scripts/5_plot_result/compare_stiffness_sessions.py
 **Action (9D):**
 - Stiffness: 9D (3 손가락 × 3 DOF: K1, K2, K3)
 
-### 배치 학습 실행
-
-```bash
-# Unified 모드 전체 실행
-bash run_all_with_tb.sh
-```
-
 ### 데이터 증강 옵션
 
 ```bash
@@ -279,13 +318,13 @@ python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
 
 ---
 
-## 🤖 ROS 2 Nodes
+## ROS 2 Nodes
 
 ### Core Nodes
 
 | Node | Topic (Pub/Sub) | 설명 |
 |------|-----------------|------|
-| `force_sensor_node` | `/force_sensor/s{1,2,3}/wrench` | ATI 센서 데이터 발행 |
+| `force_sensor_node` | `/force_sensor/s{1,2,3}/wrench` | MMS101 센서 데이터 발행 |
 | `falcon_node` | `/falcon/{position,force}` | Falcon 위치/힘 피드백 |
 | `robot_controller_node` | `/joint_commands` | Dynamixel 제어 |
 | `data_logger_node` | 다수 Subscribe | 시연 데이터 CSV 저장 |
@@ -299,23 +338,26 @@ python3 scripts/3_model_learning/run_stiffness_policy_benchmarks.py \
 ros2 launch hri_falcon_robot_bridge full_stiffness_pipeline.launch.py
 ```
 
-### 유용한 명령어
-
-```bash
-# 토픽 확인
-ros2 topic list -t
-ros2 topic echo /force_sensor/s1/wrench
-
-# 노드 확인
-ros2 node list
-
-# USB 레이턴시 최적화 (Force 센서용)
-sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/ttyUSB0/latency_timer'
-```
-
 ---
 
-## 🔧 Troubleshooting
+## Miscellaneous
+
+### ROS 2 토픽/노드 확인
+
+```bash
+ros2 topic list -t
+ros2 topic echo /force_sensor/s1/wrench
+ros2 node list
+```
+
+### USB 레이턴시 최적화 (Dynamixel)
+
+USB-시리얼 연결 시 기본 레이턴시가 높아 Dynamixel 통신이 느릴 수 있습니다.
+
+```bash
+# ttyUSB0 레이턴시를 1ms로 설정
+sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/ttyUSB0/latency_timer'
+```
 
 ### 프로세스 강제 종료
 
@@ -323,87 +365,25 @@ sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/ttyUSB0/latency_timer'
 pkill -9 -f "ros2|python3.*hri_falcon"
 ```
 
-### USB 레이턴시 최적화 (Force 센서)
+### TensorBoard
 
 ```bash
-sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/ttyUSB0/latency_timer'
+tensorboard --logdir outputs/models/balloon/policy_learning_unified/tensorboard --port 6006
 ```
 
-### TensorBoard 포트 충돌
+> 포트 충돌 시 `--port 6007` 등으로 변경.
 
-```bash
-tensorboard --logdir outputs/models/balloon/policy_learning_unified/tensorboard --port 6007
-```
+### C++ Build Notes
+
+- `CMakeLists.txt`에서 로컬 `libnifalcon` 탐색 → 있으면 실제 장치 모드, 없으면 시뮬레이션
+- RPATH 자동 설정 → `LD_LIBRARY_PATH` export 불필요
 
 ---
 
-## 📊 Output Files
-
-### 데이터 디렉토리 구조 (물체별 분류)
-
-```
-outputs/
-├── logs/<object>/success/            # 시연 CSV 데이터
-├── stiffness_profiles/<object>/      # 강성 프로파일 CSV & 플롯
-├── stiffness_profiles_signaligned/<object>/  # Sign-aligned 프로파일
-├── models/<object>/                  # 학습된 모델 체크포인트
-│   ├── benchmark_sweep/              #   하이퍼파라미터 탐색 결과
-│   └── policy_learning_unified/      #   Unified 학습 결과
-│       ├── artifacts/<timestamp>/    #     모델 파일 (.pt, .pkl)
-│       └── tensorboard/              #     TensorBoard 로그
-├── analysis/<object>/plots/          # Intent mapping 플롯
-└── plots/<object>/full_profiles/     # 전체 프로파일 시각화
-```
-
-### 논문용 Figure (풍선 실험)
-
-```
-outputs/stiffness_comparison/paper_figures/
-├── fig_gt_diffusion_force_comparison.png          # GT vs Diffusion 힘 비교
-├── fig_stiffness_per_model_all_axes.png            # 모델별 전 축 강성 비교
-├── fig_stiffness_per_model_all_axes_unified_y.png  # 통일 Y축 버전
-├── fig_stiffness_per_model_thumb_sorted.png        # Thumb 정렬 비교
-├── fig_stiffness_per_model_optimal_aligned_raw.png # Optimal alignment 비교
-└── fig_stiffness_per_model_optimal_aligned_raw_unified_y.png  # 통일 Y축 버전
-```
-
----
-
-## � Data & Model Storage
-
-실험 데이터와 학습된 모델은 **GitHub에 포함되지 않으며**, Google Drive에 비공개로 별도 보관합니다.
-
-| 데이터 | 경로 | 저장 위치 |
-|--------|------|-----------|
-| 학습된 모델 (`.pt`, `.pkl`) | `outputs/models/` | Google Drive |
-| 실험 로그 (CSV) | `outputs/stiffness_logs/` | Google Drive |
-| 분석 결과 | `outputs/analysis/` | Google Drive |
-| EMG 데이터 | `outputs/emg/` | Google Drive |
-| DMP 모델 | `dmp_models/` | Google Drive |
-
-### 데이터 복원 방법
-
-```bash
-# Google Drive에서 outputs/ 폴더를 다운로드한 후:
-cp -r ~/Downloads/outputs ./outputs/
-```
-
-> `.gitignore`에 의해 `outputs/`, `*.pt`, `*.pkl`, `*.log`, `__pycache__/` 등은 자동으로 Git 추적에서 제외됩니다.
-
----
-
-## �📚 References
-
-- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/)
-- [Implicit Behavior Cloning](https://implicitbc.github.io/)
-- [ROS 2 Humble Documentation](https://docs.ros.org/en/humble/)
-
----
-
-## 📝 License
+## License
 
 MIT License
 
-## 👥 Contact
+## Contact
 
 - Maintainer: Songwoo Kim
