@@ -30,7 +30,7 @@
 | 파라미터 | 타입 | 기본값 | 설명 |
 |---------|------|--------|------|
 | `model_type` | string | `bc` | 모델 타입: bc, diffusion_c, diffusion_t, gmm, gmr |
-| `mode` | string | `unified` | 모드: unified 또는 per-finger |
+| `mode` | string | `unified` | 모드: unified |
 | `artifact_dir` | string | `` | 모델 artifact 경로 (비어있으면 자동 탐지) |
 | `rate_hz` | float | `50.0` | 제어 루프 주파수 (Hz) |
 | `stiffness_scale` | float | `1.0` | Stiffness 스케일 팩터 |
@@ -61,11 +61,10 @@ ros2 run hri_falcon_robot_bridge run_policy_node \
   -p rate_hz:=100.0 \
   -p stiffness_scale:=1.5
 
-# GMR 모델, per-finger 모드
+# GMR 모델
 ros2 run hri_falcon_robot_bridge run_policy_node \
   --ros-args \
   -p model_type:=gmr \
-  -p mode:=per-finger \
   -p smooth_window:=10
 ```
 

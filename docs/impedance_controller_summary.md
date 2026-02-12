@@ -111,7 +111,7 @@ ros2 topic pub /ee_pose_desired_th geometry_msgs/PoseStamped "{
 ### run_policy_node
 ```bash
 model_type: bc          # bc, diffusion_c, diffusion_t, gmm, gmr
-mode: unified           # unified or per-finger
+mode: unified
 rate_hz: 50.0
 stiffness_scale: 1.0
 smooth_window: 5

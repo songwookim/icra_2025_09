@@ -132,9 +132,6 @@ ros2 topic echo /deformity_tracker/eccentricity
 ```bash
 # Unified mode (Global T_K)
 ls -lt /home/songwoo/ros2_ws/icra2025/outputs/policy_learning_global_tk_unified/artifacts/
-
-# Per-Finger mode (Global T_K)
-ls -lt /home/songwoo/ros2_ws/icra2025/outputs/policy_learning_global_tk_per_finger/artifacts/
 ```
 
 가장 최근 디렉토리 (예: `20251119_192314`)를 `artifact_dir`에 사용하세요.

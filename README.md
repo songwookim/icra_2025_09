@@ -59,30 +59,69 @@ flowchart LR
         FS["MMS101 Force Sensor"]
         SG["SenseGlove"]
         CAM["Camera (Deformity)"]
+        MYO["Myo Armband"]
     end
     subgraph Nodes["ROS 2 Nodes"]
         FSN["force_sensor_node"]
         FN["falcon_node (C++)"]
+        SGN["sense_glove_node (C++)"]
         RC["robot_controller_node"]
+        TIC["torque_impedance_controller_node"]
         DT["deformity_tracker_node"]
+        EMG["emg_node"]
         DL["data_logger_node"]
         RP["run_policy_node"]
+        DEP["demo_ee_player_node"]
     end
     subgraph Actuators
         FAL["Novint Falcon"]
         DXL["Dynamixel"]
     end
 
-    FS --> FSN -->|wrench| FN --> FAL
-    SG --> RC --> DXL
-    CAM --> DT -->|eccentricity| DL
+    %% Sensor → Node
+    FS --> FSN
+    SG --> SGN
+    CAM --> DT
+    MYO --> EMG
+
+    %% Force feedback path
+    FSN -->|wrench| FN --> FAL
+    FSN -->|wrench| SGN
+
+    %% Impedance control path
+    SGN -->|joint_state| RC
+    DEP -->|ee_pose_desired| TIC
+    RP -->|target_stiffness| TIC
+    TIC -->|computed_torques, goal_current| RC --> DXL
+    RC -->|joint_state, present_pwm| TIC
+    TIC -->|ee_pose| RP
+    TIC -->|ee_pose| DL
+
+    %% Data logging (subscribes all sensor data)
     FSN -->|wrench| DL
-    RC -->|ee_pose| DL
+    DT -->|eccentricity| DL
+    EMG -->|emg/raw| DL
+    FSN -->|wrench| RP
+    DT -->|eccentricity| RP
+
+    %% Offline pipeline
     DL -->|CSV| SP["1. Stiffness Profiling"]
     SP --> DA["2. Data Augmentation"]
     DA --> ML["3. Model Learning"]
-    ML --> RP -->|stiffness_cmd| RC
+    ML -->|trained model| RP
 ```
+
+### data_logger_node 저장 데이터
+
+| 그룹 | CSV 컬럼 |
+|------|----------|
+| Force Sensor (×3) | `s{1,2,3}_fx`, `s{1,2,3}_fy`, `s{1,2,3}_fz`, `s{1,2,3}_tx`, `s{1,2,3}_ty`, `s{1,2,3}_tz` |
+| EE Pose (×3 finger) | `ee_{if,mf,th}_px`, `ee_{if,mf,th}_py`, `ee_{if,mf,th}_pz` |
+| Deformity | `deform_ecc` |
+| EMG (8ch) | `emg_ch1` ~ `emg_ch8` |
+| Timestamp | `t_sec`, `t_nanosec` |
+
+> 로깅 ON/OFF: 키보드 `s` 키 토글. CSV 저장 경로: `outputs/logs/YYYYMMDD/`
 
 ---
 
@@ -183,37 +222,6 @@ hri_falcon_robot_bridge/
 
 ---
 
-## Resource Parameters
-
-### `resource/robot_parameter/config.yaml`
-
-Dynamixel 모터 및 로봇 컨트롤러 설정.
-
-| Parameter | Default | 설명 |
-|-----------|---------|------|
-| `input_source` | `"hand"` | 입력 소스 (`"hand"` \| `"falcon"`) |
-| `test_mode` | `true` | 테스트 모드 (dry-run) |
-| `arm` | `false` | 팔 사용 여부 |
-| `dynamixel.ids` | `[10,11,12,20,21,22,30,31,32]` | 사용할 Dynamixel ID 리스트 (3-finger × 3-joint) |
-| `dynamixel.device_name` | `"/dev/ttyUSB0"` | USB 시리얼 포트 |
-| `dynamixel.baudrate` | `1000000` | 통신 속도 |
-| `dynamixel.initial_positions` | `[1365,1728,1707,...]` | 초기 관절 위치 (0‒4095) |
-| `dynamixel.current.max_current` | `10` | 최대 전류 제한 |
-
-### `resource/sensor_parameter/config.yaml`
-
-MMS101 Force 센서 설정.
-
-| Parameter | Default | 설명 |
-|-----------|---------|------|
-| `mms101.dest_ip` | `"192.168.0.200"` | 센서 IP 주소 |
-| `mms101.dest_port` | `1366` | 센서 포트 |
-| `mms101.sensors` | `[1, 2, 3]` | 사용할 센서 번호 |
-| `mms101.n_samples` | `10` | 측정 샘플 수 |
-| `mms101.debug` | `false` | 디버그 모드 |
-
----
-
 ## Pipeline Overview
 
 ### 전체 파이프라인 (5단계)
@@ -284,13 +292,6 @@ python3 scripts/5_plot_result/compare_stiffness_sessions.py
 ---
 
 ## Detailed Usage
-
-### 학습 구성 옵션
-
-| 구성 | 설명 | 명령 옵션 |
-|------|------|----------|
-| **Unified + Sign-aligned** | 단일 모델 (20D→9D), Sign-aligned Global T_K ⭐ | `--mode unified` |
-| **Per-Finger** | 손가락별 모델 (8D→3D) | `--mode per-finger` |
 
 ### 데이터 차원
 
